@@ -1,0 +1,430 @@
+console.log('[RP Router] Carregando...');
+
+const EXTENSION_NAME = 'MultiCaller';
+
+const DEFAULT_CONFIG = {
+    apiUrl: 'https://nano-gpt.com/api/v1/chat/completions',
+    apiToken: '',
+    model: 'openai/gpt-oss-120b', // Modelo do ROUTER (não dos personagens)
+    temperature: 0.1,
+    contextMessages: 5,
+    maxTokens: 10,
+    enabled: true,
+    soundEnabled: true,
+    soundCharacter: '',
+    soundUser: '',
+    routerPrompt: `You are a routing controller for a roleplay session.
+Players: GM, Mira, Juliano.
+Last speaker: {{lastSpeaker}}
+
+Read the context and reply with ONE WORD ONLY — the name of who speaks next.
+Valid options: GM, Mira, Juliano
+No explanation. No punctuation. One word.`
+};
+
+// ==========================================
+// CONFIGURAÇÕES DAS PERSONAGENS (HARDCODED)
+// Aqui você coloca exatamente o que quer que cada um use.
+// O modelo aqui é o ID exato que o NanoGPT espera receber no payload.
+// ==========================================
+const CHARACTER_CONFIGS = {
+    'gm': {
+        model: 'moonshotai/kimi-k2.6:thinking', // Exemplo
+        temperature: 0.5,
+        frequency_penalty: 0.1,
+        presence_penalty: 0.1,
+        top_p: 0.9
+    },
+    'mira': {
+        model: 'zai-org/glm-5.1', // Exemplo
+        temperature: 1.1,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        top_p: 1.0
+    }
+    // O Juliano não precisa de config, pois é o usuário.
+};
+
+let config = { ...DEFAULT_CONFIG };
+let isProcessing = false;
+
+// ================= CONFIG =================
+
+function saveConfig() {
+    localStorage.setItem(`st_${EXTENSION_NAME}_settings`, JSON.stringify(config));
+}
+
+function loadConfig() {
+    const saved = localStorage.getItem(`st_${EXTENSION_NAME}_settings`);
+    if (saved) {
+        config = { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
+    }
+}
+
+// ================= SOUND =================
+
+function playSound(url) {
+    if (!config.soundEnabled || !url) return;
+    try {
+        const audio = new Audio(url);
+        audio.volume = 0.5;
+        audio.play().catch(e => console.log('[RP Router] Erro ao tocar som:', e));
+    } catch (error) {
+        console.log('[RP Router] Erro ao criar áudio:', error);
+    }
+}
+
+// ================= APPLY CONFIG (SUPER SIMPLIFICADO) =================
+
+async function applyConfig(role) {
+    const ctx = SillyTavern.getContext();
+    const charConfig = CHARACTER_CONFIGS[role];
+
+    if (!charConfig) {
+        console.warn('[RP Router] Nenhuma config hardcoded para:', role);
+        return;
+    }
+
+    console.log(`[RP Router] Injetando config do [${role}] na memória do ST...`);
+
+    try {
+        // 1. Seta o modelo na variável global do ST
+        if (charConfig.model) {
+            await ctx.executeSlashCommandsWithOptions(`/model quiet=true ${charConfig.model}`);
+        }
+
+        // 2. Seta os samplers na variável global do ST
+        const samplers = [
+            { name: 'temp', value: charConfig.temperature },
+            { name: 'freq_pen', value: charConfig.frequency_penalty },
+            { name: 'pres_pen', value: charConfig.presence_penalty },
+            { name: 'top_p', value: charConfig.top_p }
+        ];
+
+        for (const s of samplers) {
+            if (s.value !== null && s.value !== undefined) {
+                await ctx.executeSlashCommandsWithOptions(`/sampler-set name=${s.name} ${s.value}`);
+            }
+        }
+        console.log('[RP Router] Configs injetadas com sucesso.');
+    } catch (e) {
+        console.error('[RP Router] Falha ao injetar config:', e);
+    }
+}
+
+// ================= ROUTER =================
+
+async function callRouterAgent(chatHistory) {
+    if (!config.enabled || !config.apiToken) {
+        console.log('[RP Router] Desativado ou sem token');
+        return null;
+    }
+
+    // ==========================================
+    // DEBUG: INSPECIONANDO ctx.chat BRUTO
+    // ==========================================
+    console.log('%c[RP Router] === ctx.chat BRUTO ===', 'color: #00ccff; font-weight: bold;');
+    console.log(`${chatHistory}`, chatHistory);
+    const rawSlice = (Array.isArray(chatHistory) ? chatHistory : []).slice(-20);
+    rawSlice.forEach((m, i) => {
+        const flags = [
+            m.is_user    ? 'USER'      : null,
+            m.is_system  ? 'SYSTEM'    : null,
+            m.extra?.type ? `extra.type=${m.extra.type}` : null,
+            m.extra?.isSmallSysPrompt ? 'smallSys' : null,
+        ].filter(Boolean).join(' | ') || 'CHAR';
+        console.log(`  [${rawSlice.length - 20 + i}] ${flags} | name="${m.name}" | mes="${String(m.mes || '').slice(0, 80).replace(/\n/g, '↵')}"`);
+    });
+    console.log('====================================================');
+
+    // Filtra apenas mensagens reais de usuário e personagem
+    const realMessages = chatHistory.filter(m =>
+        !m.is_system &&
+        m.extra?.type !== 'tool_call' &&
+        m.extra?.type !== 'tool_response' &&
+        m.mes != null
+    );
+
+    const lastSpeaker = realMessages[realMessages.length - 1]?.name || 'Unknown';
+
+    console.log('%c[RP Router] === APÓS FILTRO (realMessages) ===', 'color: #ffcc00; font-weight: bold;');
+    console.log(`  Total bruto: ${chatHistory.length} | Após filtro: ${realMessages.length} | Usando últimas: ${config.contextMessages}`);
+    realMessages.slice(-config.contextMessages).forEach((m, i, arr) => {
+        const role = m.is_user ? 'USER' : 'CHAR';
+        console.log(`  [${i - arr.length + 1}] ${role} | name="${m.name}" | mes="${String(m.mes).slice(0, 80).replace(/\n/g, '↵')}"`);
+    });
+    console.log('================================================');
+
+    const context = realMessages
+        .slice(-config.contextMessages)
+        .map(m => `${m.name}: ${m.mes || ''}`)
+        .join('\n');
+
+    const prompt = config.routerPrompt.replace(/{{lastSpeaker}}/gi, lastSpeaker);
+
+    // Monta o objeto do corpo antes de enviar para podermos printar
+    const requestBody = {
+        model: config.model,
+        messages: [
+            { role: 'system', content: prompt },
+            { role: 'user', content: context }
+        ],
+        temperature: config.temperature,
+        max_tokens: config.maxTokens
+    };
+
+    // ==========================================
+    // DEBUG: PRINTANDO O QUE VAI SER ENVIADO
+    // ==========================================
+    console.log('%c[RP Router] === ENVIANDO REQUISIÇÃO ===', 'color: #ff9900; font-weight: bold;');
+    console.log('URL:', config.apiUrl);
+    console.log('Payload:', JSON.stringify(requestBody, null, 2));
+    console.log('=====================================');
+
+    try {
+        const response = await fetch(config.apiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${config.apiToken}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        // Pega o texto puro da resposta primeiro para debug de erros
+        const responseText = await response.text();
+
+        // ==========================================
+        // DEBUG: PRINTANDO A RESPOSTA CRUA DA API
+        // ==========================================
+        console.log('%c[RP Router] === RESPOSTA CRUA DA API ===', 'color: #00ff00; font-weight: bold;');
+        console.log('Status HTTP:', response.status, response.statusText);
+        try {
+            // Tenta formatar como JSON bonitinho se possível
+            console.log('Body:', JSON.stringify(JSON.parse(responseText), null, 2));
+        } catch (e) {
+            // Se não for JSON (ex: erro HTML do Cloudflare), printa como texto
+            console.log('Body (Texto puro):', responseText);
+        }
+        console.log('======================================');
+
+        // Se não deu sucesso (200-299), já para aqui
+        if (!response.ok) {
+            console.error('[RP Router] A requisição falhou.');
+            return null;
+        }
+
+        // Converte o texto de volta para JSON pois a requisição deu certo
+        const data = JSON.parse(responseText);
+        
+        // Extrai a decisão final
+        const decision = data.choices?.[0]?.message?.content?.trim();
+
+        // Extrai o pensamento (se o modelo suportar, tipo DeepSeek R1, o1, etc)
+        const reasoning = data.choices?.[0]?.message?.reasoning_content
+            ?? data.choices?.[0]?.message?.thinking
+            ?? null;
+            
+        if (reasoning) {
+            console.log('%c[RP Router] === PENSAMENTO DO MODELO (REASONING) ===', 'color: #ff00ff; font-weight: bold;');
+            console.log(reasoning);
+            console.log('===============================================');
+        }
+
+        console.log('[RP Router] Decisão final extraída:', decision);
+        return decision || null;
+
+    } catch (error) {
+        console.error('%c[RP Router] Erro de conexão/JavaScript:', 'color: #ff0000; font-weight: bold;', error);
+        return null;
+    }
+}
+
+// ================= EXECUÇÃO =================
+
+async function executeDecision(decision) {
+    const ctx = SillyTavern.getContext();
+    const cleanDecision = decision.toLowerCase().replace(/[^a-záàâãéèêíïóôõöúçñ\s]/g, '').trim();
+
+    if (cleanDecision === 'juliano') {
+        console.log('[RP Router] Vez do Juliano');
+        playSound(config.soundUser);
+        return; // Espera o usuário digitar
+    }
+
+    if (cleanDecision.includes('gm')) {
+        playSound(config.soundCharacter);
+        await applyConfig('gm');       // Injeta as configs do GM
+        await ctx.executeSlashCommandsWithOptions('/trigger gm'); // Dispara mantendo Lorebook
+        return;
+    }
+
+    if (cleanDecision.includes('mira')) {
+        playSound(config.soundCharacter);
+        await applyConfig('mira');     // Injeta as configs da Mira
+        await ctx.executeSlashCommandsWithOptions('/trigger mira'); // Dispara mantendo Lorebook
+        return;
+    }
+
+    console.warn('[RP Router] Decisão desconhecida:', decision);
+}
+
+async function runRouter() {
+    if (isProcessing) return;
+    isProcessing = true;
+
+    try {
+        const ctx = SillyTavern.getContext();
+        const decision = await callRouterAgent(ctx.chat);
+        if (decision) {
+            await executeDecision(decision);
+        }
+    } finally {
+        isProcessing = false;
+    }
+}
+
+// ================= UI =================
+
+function renderSettings() {
+    const html = `
+        <div id="multicaller-settings" class="extension-settings">
+            <div class="inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <b>MultiCaller Router</b>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+
+                    <div class="flex-container flex-gap10 margin-bot-10px">
+                        <label class="checkbox flex-container">
+                            <input type="checkbox" id="router-enabled" ${config.enabled ? 'checked' : ''}>
+                            <span>Router Ativo</span>
+                        </label>
+                        <label class="checkbox flex-container">
+                            <input type="checkbox" id="router-sound-enabled" ${config.soundEnabled ? 'checked' : ''}>
+                            <span>Sons</span>
+                        </label>
+                    </div>
+
+                    <h4>API do Router</h4>
+                    <div class="flex-container flex-column flex-gap5 margin-bot-10px">
+                        <label>URL:</label>
+                        <input type="text" id="router-api-url" class="text_pole" value="${config.apiUrl}">
+                        <label>Token:</label>
+                        <input type="password" id="router-api-token" class="text_pole" value="${config.apiToken}">
+                        <label>Modelo (Router):</label>
+                        <input type="text" id="router-model" class="text_pole" value="${config.model}">
+                        <div class="flex-container flex-gap10">
+                            <div class="flex1">
+                                <label>Temp:</label>
+                                <input type="number" id="router-temperature" class="text_pole" min="0" max="2" step="0.1" value="${config.temperature}">
+                            </div>
+                            <div class="flex1">
+                                <label>Contexto:</label>
+                                <input type="number" id="router-context" class="text_pole" min="1" max="50" value="${config.contextMessages}">
+                            </div>
+                            <div class="flex1">
+                                <label>Max Tokens:</label>
+                                <input type="number" id="router-max-tokens" class="text_pole" min="1" max="100" value="${config.maxTokens}">
+                            </div>
+                        </div>
+                    </div>
+
+                    <h4>Sons</h4>
+                    <div class="flex-container flex-column flex-gap5 margin-bot-10px">
+                        <label>Som Personagens (URL):</label>
+                        <input type="text" id="router-sound-character" class="text_pole" value="${config.soundCharacter}" placeholder="https://...">
+                        <label>Som Usuário (URL):</label>
+                        <input type="text" id="router-sound-user" class="text_pole" value="${config.soundUser}" placeholder="https://...">
+                    </div>
+
+                    <h4>Router Prompt</h4>
+                    <div class="flex-container flex-column flex-gap5 margin-bot-10px">
+                        <textarea id="router-prompt" class="text_pole" rows="8" style="width:100%;min-height:150px;resize:vertical;font-family:monospace;font-size:0.9em;">${config.routerPrompt.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea>
+                    </div>
+
+                    <div class="flex-container justify-center margin-top-10px" style="gap:10px">
+                        <button id="router-save-btn" class="menu_button primary">Salvar</button>
+                        <button id="router-simulate-btn" class="menu_button">Simular Decisão</button>
+                    </div>
+                    
+                    <small style="color:#888; margin-top:10px; display:block; text-align:center;">
+                        Configs de Modelo/Temp dos personagens estão definidas direto no código (CHARACTER_CONFIGS).
+                    </small>
+
+                </div>
+            </div>
+        </div>
+
+        <style>
+            #multicaller-settings .flex-container { display: flex; }
+            #multicaller-settings .flex-column { flex-direction: column; }
+            #multicaller-settings .flex-gap5 { gap: 5px; }
+            #multicaller-settings .flex-gap10 { gap: 10px; }
+            #multicaller-settings .flex1 { flex: 1; }
+            #multicaller-settings .margin-bot-10px { margin-bottom: 10px; }
+            #multicaller-settings .margin-top-10px { margin-top: 10px; }
+            #multicaller-settings .justify-center { justify-content: center; }
+            #multicaller-settings h4 { margin: 15px 0 10px 0; border-bottom: 1px solid #444; padding-bottom: 5px; }
+            #multicaller-settings label { font-size: 0.9em; color: #ccc; }
+            #multicaller-settings .primary { background: #2d7d46; }
+            #multicaller-settings .primary:hover { background: #36a355; }
+        </style>
+    `;
+
+    $('#extensions_settings').append(html);
+}
+
+function attachEvents() {
+    $('#router-save-btn').on('click', () => {
+        config.apiUrl          = $('#router-api-url').val();
+        config.apiToken        = $('#router-api-token').val();
+        config.model           = $('#router-model').val();
+        config.temperature     = parseFloat($('#router-temperature').val());
+        config.contextMessages = parseInt($('#router-context').val());
+        config.maxTokens       = parseInt($('#router-max-tokens').val());
+        config.enabled         = $('#router-enabled').is(':checked');
+        config.soundEnabled    = $('#router-sound-enabled').is(':checked');
+        config.soundCharacter  = $('#router-sound-character').val();
+        config.soundUser       = $('#router-sound-user').val();
+        config.routerPrompt    = $('#router-prompt').val();
+        saveConfig();
+        toastr.success('Configurações salvas!', 'RP Router');
+    });
+
+    $('#router-simulate-btn').on('click', async () => {
+        const ctx = SillyTavern.getContext();
+        toastr.info('Consultando...', 'RP Router');
+        const decision = await callRouterAgent(ctx.chat);
+        toastr.info(decision ? `Decisão: ${decision}` : 'Sem resposta', 'RP Router');
+    });
+}
+
+// ================= MAIN =================
+
+jQuery(document).ready(async () => {
+    console.log('[RP Router] Iniciando...');
+
+    loadConfig();
+    renderSettings();
+    attachEvents();
+
+    const ctx = SillyTavern.getContext();
+
+    ctx.registerSlashCommand?.('router', async () => {
+        await runRouter();
+        return '';
+    }, [], 'Executa o router manualmente');
+
+    // Gatilhos perfeitos: não causam loop e não travam a UI
+    ctx.eventSource.on(ctx.event_types.USER_MESSAGE_RENDERED, () => {
+        setTimeout(() => runRouter(), 300);
+    });
+
+    ctx.eventSource.on(ctx.event_types.CHARACTER_MESSAGE_RENDERED, () => {
+        setTimeout(() => runRouter(), 300);
+    });
+
+    console.log('[RP Router] Pronto! (Modo Hardcoded Ativo)');
+});

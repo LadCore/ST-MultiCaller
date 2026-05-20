@@ -1,0 +1,7 @@
+{
+    "display_name": "RP Router",
+    "loading_order": 10,
+    "js": "index.js",
+    "author": "você",
+    "version": "0.1.0"
+}
