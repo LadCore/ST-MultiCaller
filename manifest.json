@@ -1,7 +1,7 @@
 {
-    "display_name": "RP Router",
+    "display_name": "Backstage",
     "loading_order": 10,
     "js": "index.js",
-    "author": "você",
-    "version": "0.1.0"
+    "author": "Juliano",
+    "version": "0.2.0"
 }
