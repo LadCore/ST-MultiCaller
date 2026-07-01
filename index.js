@@ -5,7 +5,7 @@ const EXTENSION_DISPLAY_NAME = 'Backstage';
 const EXTENSION_LABEL = 'Backstage';
 const ROUTER_LABEL = 'Turn Router';
 const STORY_DIRECTOR_LABEL = 'Story Director';
-const CURRENT_CONFIG_VERSION = 7;
+const CURRENT_CONFIG_VERSION = 9;
 const DEFAULT_WORLD_CONTEXT_CHARS = 0;
 
 const DEFAULT_SCENE_DIRECTOR_PROMPT = `You are the RP Scene Director for a SillyTavern group roleplay.
@@ -171,10 +171,14 @@ const DEFAULT_CONFIG = {
     routerProfileId:   '',
     plannerProfileId:  '',
     contextMessages:   5,
-    maxTokens:         500,
+    routerInputTokenBudget: 0,
     worldContextChars: DEFAULT_WORLD_CONTEXT_CHARS,
     plannerUserTurnInterval: 5,
     plannerWorldInfoBooks: [],
+    routerTimedLorebookBook: '',
+    routerTimedLorebookUid: '',
+    routerTimedLorebookName: '',
+    routerTimedLorebookTriggerRegex: '',
     enabled:           true,
     routerPrompt:      DEFAULT_SCENE_DIRECTOR_PROMPT,
     plannerPrompt:     DEFAULT_STORY_PLANNER_PROMPT,
@@ -208,6 +212,7 @@ let sceneDirectorState = {
     routerOocHistory: [],
     plannerOocDraft: PLANNER_OOC_DEFAULT_DRAFT,
     plannerOocHistory: [],
+    routerTimedLorebookSearch: '',
     persistentIssue: '',
     persistentIssueSource: '',
     persistentIssueAt: null,
@@ -262,9 +267,10 @@ function migrateConfig() {
         if (needsSceneDirectorPromptRefresh(config.routerPrompt)) {
             config.routerPrompt = DEFAULT_SCENE_DIRECTOR_PROMPT;
         }
-        if (!config.maxTokens || config.maxTokens < 200) {
-            config.maxTokens = DEFAULT_CONFIG.maxTokens;
+        if (config.routerInputTokenBudget == null) {
+            config.routerInputTokenBudget = 0;
         }
+        config.routerInputTokenBudget = Math.max(0, parseInt(config.routerInputTokenBudget) || 0);
         if (config.worldContextChars == null) {
             config.worldContextChars = DEFAULT_WORLD_CONTEXT_CHARS;
         }
@@ -277,9 +283,22 @@ function migrateConfig() {
         if (!Array.isArray(config.plannerWorldInfoBooks)) {
             config.plannerWorldInfoBooks = [];
         }
+        if (config.routerTimedLorebookBook == null) {
+            config.routerTimedLorebookBook = DEFAULT_CONFIG.routerTimedLorebookBook;
+        }
+        if (config.routerTimedLorebookUid == null) {
+            config.routerTimedLorebookUid = DEFAULT_CONFIG.routerTimedLorebookUid;
+        }
+        if (config.routerTimedLorebookName == null) {
+            config.routerTimedLorebookName = DEFAULT_CONFIG.routerTimedLorebookName;
+        }
+        if (config.routerTimedLorebookTriggerRegex == null) {
+            config.routerTimedLorebookTriggerRegex = DEFAULT_CONFIG.routerTimedLorebookTriggerRegex;
+        }
         if (needsStoryPlannerPromptRefresh(config.plannerPrompt)) {
             config.plannerPrompt = DEFAULT_STORY_PLANNER_PROMPT;
         }
+        delete config.maxTokens;
         config.configVersion = CURRENT_CONFIG_VERSION;
         saveConfig();
     }
@@ -292,6 +311,9 @@ function loadConfig() {
     }
     migrateConfig();
 }
+
+const routerTimedLorebookEntryCache = new Map();
+let routerTimedLorebookLastTriggerSignature = '';
 
 // ================= SOUND =================
 
@@ -414,7 +436,10 @@ function clearDirectedOocPrompt() {
 }
 
 function normalizePlannerSectionName(name) {
-    return String(name ?? '').trim().toLowerCase();
+    const normalized = String(name ?? '').trim().toLowerCase();
+    if (!normalized) return '';
+    if (normalized === 'gm') return 'gm';
+    return normalized.split(/\s+/)[0] ?? '';
 }
 
 function parseLorebookControlBlock(storyGuide) {
@@ -521,22 +546,25 @@ function selectStoryGuideSectionsForSpeaker(storyGuide, speakerName) {
     const normalizedSpeaker = normalizePlannerSectionName(speakerName);
     if (!normalizedSpeaker) return [];
 
-    return parseStoryGuideBlocks(storyGuide)
+    const blocks = parseStoryGuideBlocks(storyGuide);
+    const selectedSections = blocks
         .map(block => {
-            const section = parseStoryGuideTaggedSections(block.body)
-                .find(item => normalizePlannerSectionName(item.name) === normalizedSpeaker);
+            const sections = parseStoryGuideTaggedSections(block.body);
+            const matchedSection = sections.find(item => normalizePlannerSectionName(item.name) === normalizedSpeaker);
 
-            if (!section || /^-\s*none$/i.test(section.text)) {
+            if (!matchedSection || /^-\s*none$/i.test(matchedSection.text)) {
                 return null;
             }
 
             return {
                 blockName: block.name,
-                sectionName: section.name,
-                text: section.text,
+                sectionName: matchedSection.name,
+                text: matchedSection.text,
             };
         })
         .filter(Boolean);
+
+    return selectedSections;
 }
 
 function buildStoryGuideInjectionPrompt(storyGuide, charName) {
@@ -755,13 +783,6 @@ function applyStoryGuideInjectionForCharacter(charName, storyGuide = getStoryGui
         false,
         EXTENSION_PROMPT_ROLES.SYSTEM,
     );
-    console.log('[SceneDirector] Applied story guide injection prompt', {
-        charName,
-        sections: selectStoryGuideSectionsForSpeaker(storyGuide, charName).map(section => ({
-            blockName: section.blockName,
-            sectionName: section.sectionName,
-        })),
-    });
 }
 
 function buildSceneDirectionPrompt(decision, charName) {
@@ -929,6 +950,55 @@ async function getConnService() {
     return _connService;
 }
 
+function resolveCharacterProfileForSwitch(char, ctx = SillyTavern.getContext()) {
+    const profileId = String(char?.profileId ?? '').trim();
+    const profileName = String(char?.profileName ?? '').trim();
+    const profiles = ctx.extensionSettings?.connectionManager?.profiles ?? [];
+
+    if (profileId) {
+        const matchedProfile = profiles.find(profile => String(profile?.id ?? '') === profileId);
+        if (matchedProfile?.name) {
+            return {
+                profileId,
+                profileName: String(matchedProfile.name),
+                source: 'profileId',
+            };
+        }
+    }
+
+    if (profileName) {
+        return {
+            profileId,
+            profileName,
+            source: 'storedName',
+        };
+    }
+
+    return {
+        profileId,
+        profileName: '',
+        source: 'none',
+    };
+}
+
+async function waitForChatRecovery(ctx, previousChatLength, timeoutMs = 4000) {
+    const expectedMessages = Math.max(1, Number(previousChatLength) || 0);
+    if (expectedMessages <= 0) {
+        return true;
+    }
+
+    const startedAt = Date.now();
+    while ((Date.now() - startedAt) < timeoutMs) {
+        const currentLength = Array.isArray(ctx.chat) ? ctx.chat.length : 0;
+        if (currentLength >= expectedMessages || currentLength > 0) {
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+
+    return false;
+}
+
 // ================= WORLD INFO TEST =================
 
 const WORLD_INFO_SCAN_TIMEOUT_MS = 3000;
@@ -990,6 +1060,103 @@ function getAvailableWorldInfoNames(wi = null) {
         .map((_, option) => String($(option).text() || '').trim())
         .get()
         .filter(Boolean);
+}
+
+function getRouterTimedLorebookConfig() {
+    return {
+        book: String(config.routerTimedLorebookBook ?? '').trim(),
+        uid: Number(config.routerTimedLorebookUid),
+        name: String(config.routerTimedLorebookName ?? '').trim(),
+        triggerRegex: String(config.routerTimedLorebookTriggerRegex ?? '').trim(),
+    };
+}
+
+function getRealChatTurnCount(ctx = SillyTavern.getContext()) {
+    return (ctx.chat ?? []).filter(m =>
+        !m.is_system &&
+        m.extra?.type !== 'tool_call' &&
+        m.extra?.type !== 'tool_response' &&
+        m.mes != null &&
+        String(m.mes).trim() &&
+        !isBackstageOocMessage(m.mes)
+    ).length;
+}
+
+function tryBuildRouterTimedLorebookRegex() {
+    const source = String(config.routerTimedLorebookTriggerRegex ?? '').trim();
+    if (!source) return null;
+
+    const wrappedMatch = source.match(/^\/([\s\S]*)\/([a-z]*)$/i);
+    try {
+        if (wrappedMatch) {
+            return new RegExp(wrappedMatch[1], wrappedMatch[2] || 'i');
+        }
+
+        return new RegExp(source, 'i');
+    } catch (error) {
+        console.warn('[SceneDirector] Invalid timed lorebook regex:', source, error);
+        return null;
+    }
+}
+
+function getRouterTimedLorebookCachedEntry() {
+    const timedConfig = getRouterTimedLorebookConfig();
+    if (!timedConfig.book || !Number.isFinite(timedConfig.uid) || timedConfig.uid <= 0) {
+        return null;
+    }
+
+    const entries = routerTimedLorebookEntryCache.get(timedConfig.book) ?? [];
+    return entries.find(entry => entry.uid === timedConfig.uid) ?? null;
+}
+
+function getRouterTimedLorebookEffectMode(entry) {
+    if (!entry) return '';
+    if (Number(entry.sticky) > 0) return 'sticky';
+    if (Number(entry.cooldown) > 0) return 'cooldown';
+    return '';
+}
+
+async function getRouterTimedLorebookEntries(bookName) {
+    const cleanBookName = String(bookName ?? '').trim();
+    if (!cleanBookName) return [];
+    if (routerTimedLorebookEntryCache.has(cleanBookName)) {
+        return routerTimedLorebookEntryCache.get(cleanBookName) ?? [];
+    }
+
+    const wi = await getWorldInfoModule();
+    if (typeof wi.loadWorldInfo !== 'function') {
+        return [];
+    }
+
+    const data = await wi.loadWorldInfo(cleanBookName);
+    const entries = Object.values(data?.entries ?? {})
+        .map(entry => {
+            const comment = String(entry?.comment ?? '').trim();
+            const keys = Array.isArray(entry?.key) ? entry.key.filter(Boolean).join(', ') : '';
+            const content = String(entry?.content ?? '').replace(/\s+/g, ' ').trim();
+            const preview = content.slice(0, 140);
+            return {
+                uid: Number(entry?.uid),
+                comment,
+                keys,
+                preview,
+                disable: !!entry?.disable,
+                sticky: Number(entry?.sticky) || 0,
+                cooldown: Number(entry?.cooldown) || 0,
+                content,
+                label: comment || preview || `UID ${entry?.uid}`,
+                searchText: [comment, keys, content, String(entry?.uid ?? '')].join(' ').toLowerCase(),
+            };
+        })
+        .filter(entry => Number.isFinite(entry.uid))
+        .sort((a, b) => {
+            const aLabel = a.label.toLowerCase();
+            const bLabel = b.label.toLowerCase();
+            return aLabel.localeCompare(bLabel) || a.uid - b.uid;
+        });
+
+    routerTimedLorebookEntryCache.set(cleanBookName, entries);
+    return entries;
 }
 
 function summarizeWorldInfoEntries(scan) {
@@ -1170,6 +1337,77 @@ async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldIn
             selectedBooks: books,
             entryCount: 0,
         };
+    }
+}
+
+function isRouterTimedLorebookGmMessage(message) {
+    const name = String(message?.name ?? '').trim();
+    return /\bgm\b/i.test(name);
+}
+
+async function maybeTriggerRouterTimedLorebookFromMessage(message, ctx = SillyTavern.getContext()) {
+    const timedConfig = getRouterTimedLorebookConfig();
+    const regex = tryBuildRouterTimedLorebookRegex();
+
+    if (!timedConfig.book || !Number.isFinite(timedConfig.uid) || timedConfig.uid <= 0 || !regex) {
+        return null;
+    }
+
+    if (!isRouterTimedLorebookGmMessage(message)) {
+        return null;
+    }
+
+    const content = String(message?.mes ?? '').trim();
+    if (!content || !regex.test(content)) {
+        return null;
+    }
+
+    const signature = [
+        String(ctx.groupId ?? ctx.characterId ?? ''),
+        (ctx.chat ?? []).length - 1,
+        String(message?.name ?? '').trim(),
+        content,
+        timedConfig.book,
+        timedConfig.uid,
+    ].join('|');
+
+    if (routerTimedLorebookLastTriggerSignature === signature) {
+        return null;
+    }
+
+    try {
+        const entries = await getRouterTimedLorebookEntries(timedConfig.book);
+        const entry = entries.find(item => item.uid === timedConfig.uid);
+        if (!entry) {
+            console.warn('[SceneDirector] Timed lorebook trigger target entry not found:', timedConfig);
+            return null;
+        }
+
+        const effect = getRouterTimedLorebookEffectMode(entry);
+        if (!effect) {
+            console.warn('[SceneDirector] Timed lorebook trigger target has no sticky/cooldown configured:', {
+                book: timedConfig.book,
+                uid: timedConfig.uid,
+                sticky: entry.sticky,
+                cooldown: entry.cooldown,
+            });
+            return null;
+        }
+
+        const escapedBook = timedConfig.book.replace(/"/g, '\\"');
+        await ctx.executeSlashCommandsWithOptions(`/wi-set-timed-effect file="${escapedBook}" uid=${timedConfig.uid} effect=${effect} on`);
+        routerTimedLorebookLastTriggerSignature = signature;
+        console.log('[SceneDirector] Triggered timed lorebook effect from GM message', {
+            book: timedConfig.book,
+            uid: timedConfig.uid,
+            effect,
+            regex: timedConfig.triggerRegex,
+            speaker: message?.name,
+        });
+        return { effect, entry };
+    } catch (error) {
+        console.warn('[SceneDirector] Failed to trigger timed lorebook effect from GM message:', error);
+        return null;
     }
 }
 
@@ -1365,6 +1603,10 @@ function limitText(text, maxChars) {
 
 async function getVectFoxRouterContext(ctx) {
     const maxChars = Number(config.worldContextChars || 0);
+
+    if (maxChars <= 0) {
+        return { text: '', source: 'vectfox-skipped-by-config', entryCount: 0, originalLength: 0, truncated: false };
+    }
 
     try {
         const extensionSettings = await getExtensionSettings();
@@ -1597,6 +1839,197 @@ function ensureRouterPromptHasLorebookBlocks(template, lorebookContext, lorebook
     }
 
     return source;
+}
+
+function buildRouterSystemPrompt(routerContext) {
+    let routerPromptTemplate = ensureRouterPromptHasStoryGuide(config.routerPrompt, routerContext.storyGuide);
+    routerPromptTemplate = ensureRouterPromptHasLorebookBlocks(
+        routerPromptTemplate,
+        routerContext.lorebookContext?.text,
+        routerContext.lorebookCatalog?.text,
+    );
+
+    return renderTemplate(routerPromptTemplate, {
+        lastSpeaker: routerContext.lastSpeaker,
+        players: routerContext.playerNames,
+        recentChat: routerContext.recentChat,
+        worldContext: routerContext.worldContext.text,
+        storyGuide: routerContext.storyGuide,
+        lorebookContext: routerContext.lorebookContext?.text ?? '',
+        lorebookCatalog: routerContext.lorebookCatalog?.text ?? '',
+        user: routerContext.humanName,
+    });
+}
+
+function buildRouterMessages(routerContext, options = {}) {
+    const systemPrompt = buildRouterSystemPrompt(routerContext);
+
+    if (options.mode === 'ooc') {
+        return [
+            {
+                role: 'system',
+                content: systemPrompt,
+            },
+            {
+                role: 'system',
+                content: 'Router workspace mode. Respond directly to the operator in OOC. Do not return runtime-only JSON unless the operator explicitly asks for it. Do not trigger characters or narrate chat prose.',
+            },
+            {
+                role: 'system',
+                content: `Current routing context:
+Last speaker: ${routerContext.lastSpeaker}
+Characters: ${routerContext.playerNames || '(none)'}
+
+Recent chat:
+${routerContext.recentChat || '(empty)'}
+
+World context:
+${routerContext.worldContext.text || '(empty)'}
+
+Selected lorebook context:
+${routerContext.lorebookContext?.text || '(empty)'}
+
+Selected lorebook catalog:
+${routerContext.lorebookCatalog?.text || '(empty)'}
+
+StoryGuide:
+${routerContext.storyGuide || '(empty)'}
+
+Treat the messages that follow as an ongoing OOC conversation with the operator about routing and next-turn direction.`,
+            },
+            ...(Array.isArray(options.priorHistory) ? options.priorHistory : []),
+            {
+                role: 'user',
+                content: String(options.oocRequest ?? '').trim(),
+            },
+        ];
+    }
+
+    const forcedSpeakerInstruction = buildForcedSpeakerInstruction(options.forcedSpeaker);
+    const promptIncludesRecentChat = /{{\s*recentChat\s*}}/i.test(config.routerPrompt);
+
+    return [
+        { role: 'system', content: systemPrompt },
+        ...(forcedSpeakerInstruction ? [{ role: 'user', content: forcedSpeakerInstruction }] : []),
+        { role: 'user', content: promptIncludesRecentChat ? 'Return the SceneDirector JSON now.' : routerContext.recentChat },
+    ];
+}
+
+function serializePromptMessagesForBudget(messages) {
+    return (Array.isArray(messages) ? messages : [])
+        .map((message, index) => `# ${index + 1}. ${String(message?.role ?? 'user').toUpperCase()}\n\n${String(message?.content ?? '')}`)
+        .join('\n\n');
+}
+
+async function estimateRequestInputTokens(profileId, messages, service = null) {
+    const ctx = SillyTavern.getContext();
+    const requestService = service ?? await getConnService();
+    const constructedPrompt = requestService?.constructPrompt
+        ? requestService.constructPrompt(messages, profileId)
+        : messages;
+    const text = typeof constructedPrompt === 'string'
+        ? constructedPrompt
+        : serializePromptMessagesForBudget(constructedPrompt);
+
+    return await ctx.getTokenCountAsync(text);
+}
+
+function shrinkTextBlock(text, options = {}) {
+    const source = String(text ?? '').trim();
+    if (!source) return '';
+
+    const ratio = Math.min(0.5, Math.max(0.05, Number(options.ratio) || 0.18));
+    const dropFromStart = !!options.dropFromStart;
+    const lines = source.split('\n');
+
+    if (lines.length > 1) {
+        const delta = Math.max(1, Math.ceil(lines.length * ratio));
+        const nextLines = dropFromStart
+            ? lines.slice(delta)
+            : lines.slice(0, Math.max(1, lines.length - delta));
+        return nextLines.join('\n').trim();
+    }
+
+    const keepChars = Math.max(80, Math.floor(source.length * (1 - ratio)));
+    if (keepChars >= source.length) {
+        return source;
+    }
+
+    return dropFromStart
+        ? source.slice(source.length - keepChars).trim()
+        : source.slice(0, keepChars).trim();
+}
+
+function shrinkObjectTextField(target, options = {}) {
+    if (!target || typeof target.text !== 'string') return false;
+    const current = String(target.text ?? '').trim();
+    const next = shrinkTextBlock(current, options);
+    if (!next || next === current) return false;
+    target.text = next;
+    return true;
+}
+
+function shrinkPlainTextField(object, fieldName, options = {}) {
+    const current = String(object?.[fieldName] ?? '').trim();
+    const next = shrinkTextBlock(current, options);
+    if (!next || next === current) return false;
+    object[fieldName] = next;
+    return true;
+}
+
+async function fitRouterMessagesToInputBudget(profileId, routerContext, buildMessagesFn) {
+    const budget = Math.max(0, Number(config.routerInputTokenBudget || 0));
+    const requestService = await getConnService();
+    const workingContext = JSON.parse(JSON.stringify(routerContext ?? {}));
+    let messages = buildMessagesFn(workingContext);
+    let inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
+    let trimmed = false;
+
+    if (!budget || inputTokens <= budget) {
+        return {
+            messages,
+            routerContext: workingContext,
+            inputTokens,
+            budget,
+            trimmed,
+        };
+    }
+
+    const shrinkers = [
+        () => shrinkObjectTextField(workingContext.lorebookCatalog, { ratio: 0.25 }),
+        () => shrinkObjectTextField(workingContext.lorebookContext, { ratio: 0.2 }),
+        () => shrinkObjectTextField(workingContext.worldContext, { ratio: 0.2 }),
+        () => shrinkPlainTextField(workingContext, 'storyGuide', { ratio: 0.18 }),
+        () => shrinkPlainTextField(workingContext, 'recentChat', { ratio: 0.2, dropFromStart: true }),
+    ];
+
+    let changed = true;
+    while (inputTokens > budget && changed) {
+        changed = false;
+
+        for (const shrink of shrinkers) {
+            if (!shrink()) {
+                continue;
+            }
+
+            trimmed = true;
+            changed = true;
+            messages = buildMessagesFn(workingContext);
+            inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
+
+            if (inputTokens <= budget) {
+                break;
+            }
+        }
+    }
+
+    return {
+        messages,
+        routerContext: workingContext,
+        inputTokens,
+        budget,
+        trimmed,
+    };
 }
 
 function buildForcedSpeakerInstruction(forcedSpeaker) {
@@ -1917,7 +2350,7 @@ Update the StoryGuide now.`,
         const response = await service.sendRequest(
             config.plannerProfileId,
             messages,
-            Math.max(Number(config.maxTokens || 0), 1400),
+            undefined,
             { stream: false, extractData: true },
         );
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
@@ -2049,7 +2482,7 @@ Treat the messages that follow as an ongoing OOC conversation with the operator 
         const response = await service.sendRequest(
             config.plannerProfileId,
             messages,
-            Math.max(Number(config.maxTokens || 0), 1400),
+            undefined,
             { stream: false, extractData: true },
         );
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
@@ -2126,73 +2559,29 @@ async function runRouterOocRequest() {
 
     try {
         const routerContext = await getRouterContextSnapshot(ctx.chat, ctx);
-        let routerPromptTemplate = ensureRouterPromptHasStoryGuide(config.routerPrompt, routerContext.storyGuide);
-        routerPromptTemplate = ensureRouterPromptHasLorebookBlocks(
-            routerPromptTemplate,
-            routerContext.lorebookContext?.text,
-            routerContext.lorebookCatalog?.text,
-        );
-        const systemPrompt = renderTemplate(routerPromptTemplate, {
-            lastSpeaker: routerContext.lastSpeaker,
-            players: routerContext.playerNames,
-            recentChat: routerContext.recentChat,
-            worldContext: routerContext.worldContext.text,
-            storyGuide: routerContext.storyGuide,
-            lorebookContext: routerContext.lorebookContext?.text ?? '',
-            lorebookCatalog: routerContext.lorebookCatalog?.text ?? '',
-            user: routerContext.humanName,
-        });
         const priorHistory = Array.isArray(sceneDirectorState.routerOocHistory)
             ? sceneDirectorState.routerOocHistory.slice(-12).map(message => ({
                 role: message?.role === 'user' ? 'user' : 'assistant',
                 content: String(message?.content ?? ''),
             }))
             : [];
-        const messages = [
-            {
-                role: 'system',
-                content: systemPrompt,
-            },
-            {
-                role: 'system',
-                content: 'Router workspace mode. Respond directly to the operator in OOC. Do not return runtime-only JSON unless the operator explicitly asks for it. Do not trigger characters or narrate chat prose.',
-            },
-            {
-                role: 'system',
-                content: `Current routing context:
-Last speaker: ${routerContext.lastSpeaker}
-Characters: ${routerContext.playerNames || '(none)'}
-
-Recent chat:
-${routerContext.recentChat || '(empty)'}
-
-World context:
-${routerContext.worldContext.text || '(empty)'}
-
-Selected lorebook context:
-${routerContext.lorebookContext?.text || '(empty)'}
-
-Selected lorebook catalog:
-${routerContext.lorebookCatalog?.text || '(empty)'}
-
-StoryGuide:
-${routerContext.storyGuide || '(empty)'}
-
-Treat the messages that follow as an ongoing OOC conversation with the operator about routing and next-turn direction.`,
-            },
-            ...priorHistory,
-            {
-                role: 'user',
-                content: oocRequest,
-            },
-        ];
+        const budgetedRequest = await fitRouterMessagesToInputBudget(
+            config.routerProfileId,
+            routerContext,
+            currentContext => buildRouterMessages(currentContext, {
+                mode: 'ooc',
+                priorHistory,
+                oocRequest,
+            }),
+        );
+        const messages = budgetedRequest.messages;
 
         updateRouterState({ lastPromptMessages: messages });
         const service = await getConnService();
         const response = await service.sendRequest(
             config.routerProfileId,
             messages,
-            Math.max(Number(config.maxTokens || 0), 1400),
+            undefined,
             { stream: false, extractData: true },
         );
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
@@ -2345,7 +2734,6 @@ async function callRouterAgent(chatHistory) {
 
     const ctx = SillyTavern.getContext();
     const routerContext = await getRouterContextSnapshot(chatHistory, ctx);
-    const forcedSpeakerInstruction = buildForcedSpeakerInstruction(forcedRouterSpeaker);
     const contextSummary = {
         recentMessages: routerContext.recentChat ? routerContext.recentChat.split('\n').filter(Boolean).length : 0,
         worldContextSource: routerContext.worldContext.source,
@@ -2362,32 +2750,22 @@ async function callRouterAgent(chatHistory) {
         lastContext: contextSummary,
         lastError: '',
     });
-    let routerPromptTemplate = ensureRouterPromptHasStoryGuide(config.routerPrompt, routerContext.storyGuide);
-    routerPromptTemplate = ensureRouterPromptHasLorebookBlocks(
-        routerPromptTemplate,
-        routerContext.lorebookContext?.text,
-        routerContext.lorebookCatalog?.text,
+    const budgetedRequest = await fitRouterMessagesToInputBudget(
+        config.routerProfileId,
+        routerContext,
+        currentContext => buildRouterMessages(currentContext, {
+            mode: 'route',
+            forcedSpeaker: forcedRouterSpeaker,
+        }),
     );
-    const systemPrompt = renderTemplate(routerPromptTemplate, {
-        lastSpeaker: routerContext.lastSpeaker,
-        players: routerContext.playerNames,
-        recentChat: routerContext.recentChat,
-        worldContext: routerContext.worldContext.text,
-        storyGuide: routerContext.storyGuide,
-        lorebookContext: routerContext.lorebookContext?.text ?? '',
-        lorebookCatalog: routerContext.lorebookCatalog?.text ?? '',
-        user: routerContext.humanName,
-    });
-    const promptIncludesRecentChat = /{{\s*recentChat\s*}}/i.test(config.routerPrompt);
-
-    const messages = [
-        { role: 'system', content: systemPrompt },
-        ...(forcedSpeakerInstruction ? [{ role: 'user', content: forcedSpeakerInstruction }] : []),
-        { role: 'user',   content: promptIncludesRecentChat ? 'Return the SceneDirector JSON now.' : routerContext.recentChat },
-    ];
+    const messages = budgetedRequest.messages;
+    contextSummary.inputTokenBudget = budgetedRequest.budget;
+    contextSummary.inputTokens = budgetedRequest.inputTokens;
+    contextSummary.inputTrimmed = budgetedRequest.trimmed;
     lastDirectorRequest = cloneDirectorRequestPayload({
         profileId: config.routerProfileId,
-        maxTokens: config.maxTokens,
+        inputTokenBudget: budgetedRequest.budget,
+        inputTokens: budgetedRequest.inputTokens,
         options: { stream: false, extractData: true },
         messages,
     });
@@ -2406,7 +2784,7 @@ async function callRouterAgent(chatHistory) {
         const response = await service.sendRequest(
             lastDirectorRequest.profileId,
             lastDirectorRequest.messages,
-            lastDirectorRequest.maxTokens,
+            undefined,
             lastDirectorRequest.options,
         );
 
@@ -2458,14 +2836,44 @@ async function callRouterAgent(chatHistory) {
 
 async function triggerChar(char, decision = null, options = {}) {
     fl('→ START', 'triggerChar', `char=${char.name} | last=${lastActiveChar} | profile=${char.profileName}`);
-    const ctx = SillyTavern.getContext();
+    let ctx = SillyTavern.getContext();
+    const targetProfile = resolveCharacterProfileForSwitch(char, ctx);
+    const previousChatLength = Array.isArray(ctx.chat) ? ctx.chat.length : 0;
 
-    if (char.name !== lastActiveChar && char.profileName) {
+    if (char.name !== lastActiveChar && targetProfile.profileName) {
         lastActiveChar = char.name;
-        fl('  →', 'triggerChar', `/profile await=true "${char.profileName}"`);
-        await ctx.executeSlashCommandsWithOptions(`/profile await=true "${char.profileName}"`);
-        fl('  ←', 'triggerChar', 'profile switch done — aguardando 250ms');
-        await new Promise(r => setTimeout(r, 250));
+        if (targetProfile.source === 'profileId' && targetProfile.profileName !== char.profileName) {
+            char.profileName = targetProfile.profileName;
+            saveConfig();
+        }
+        fl('  →', 'triggerChar', `/profile await=true "${targetProfile.profileName}" | source=${targetProfile.source}${targetProfile.profileId ? ` | id=${targetProfile.profileId}` : ''}`);
+        await ctx.executeSlashCommandsWithOptions(`/profile await=true "${targetProfile.profileName}"`);
+        ctx = SillyTavern.getContext();
+        let recovered = await waitForChatRecovery(ctx, previousChatLength);
+        let recoveredByReload = false;
+
+        if (!recovered && previousChatLength > 0 && typeof ctx.reloadCurrentChat === 'function') {
+            console.warn('[Backstage] Chat still empty after profile switch; forcing reloadCurrentChat before trigger', {
+                char: char.name,
+                profileName: targetProfile.profileName,
+                previousChatLength,
+                currentChatLength: Array.isArray(ctx.chat) ? ctx.chat.length : 0,
+            });
+            await ctx.reloadCurrentChat();
+            ctx = SillyTavern.getContext();
+            recovered = await waitForChatRecovery(ctx, previousChatLength, 4000);
+            recoveredByReload = recovered;
+        }
+
+        fl('  ←', 'triggerChar', `profile switch done | chatRecovered=${recovered} | recoveredByReload=${recoveredByReload} | chatLength=${Array.isArray(ctx.chat) ? ctx.chat.length : 0}`);
+        if (!recovered) {
+            console.warn('[Backstage] Chat did not recover after profile switch before trigger', {
+                char: char.name,
+                profileName: targetProfile.profileName,
+                previousChatLength,
+                currentChatLength: Array.isArray(ctx.chat) ? ctx.chat.length : 0,
+            });
+        }
     } else {
         lastActiveChar = char.name;
     }
@@ -2476,11 +2884,24 @@ async function triggerChar(char, decision = null, options = {}) {
     setDirectedOocPrompt(char.name, options.directOocText);
     clearSceneDirection();
 
-    fl('  ✓', 'triggerChar', 'direction aplicada — aguardando 250ms');
+    fl('  ✓', 'triggerChar', 'direction aplicada — aguardando settle final de 250ms');
     await new Promise(r => setTimeout(r, 250));
 
-    fl('  →', 'triggerChar', `/trigger ${char.name}`);
-    ctx.executeSlashCommandsWithOptions(`/trigger ${char.name}`);
+    const currentChat = Array.isArray(ctx.chat) ? ctx.chat : [];
+    console.log('[Backstage] triggerChar pre-trigger chat snapshot', {
+        char: char.name,
+        chatLength: currentChat.length,
+        lastMessages: currentChat.slice(-3).map(message => ({
+            name: message?.name,
+            is_user: !!message?.is_user,
+            is_system: !!message?.is_system,
+            type: message?.extra?.type ?? '',
+            mesStart: String(message?.mes ?? '').slice(0, 120),
+        })),
+    });
+
+    fl('  →', 'triggerChar', `/trigger "${char.name}"`);
+    ctx.executeSlashCommandsWithOptions(`/trigger "${char.name}"`);
     fl('← END', 'triggerChar', `char=${char.name}`);
 }
 
@@ -2816,6 +3237,9 @@ function renderContextSummary(context) {
         <div class="sd-kv"><span>world length</span><b>${escapeHtml(context.worldContextLength)}</b></div>
         <div class="sd-kv"><span>original length</span><b>${escapeHtml(context.worldContextOriginalLength)}</b></div>
         <div class="sd-kv"><span>truncated</span><b>${context.worldContextTruncated ? 'true' : 'false'}</b></div>
+        <div class="sd-kv"><span>input budget</span><b>${escapeHtml(context.inputTokenBudget ?? 0)}</b></div>
+        <div class="sd-kv"><span>input tokens</span><b>${escapeHtml(context.inputTokens ?? 0)}</b></div>
+        <div class="sd-kv"><span>budget trim</span><b>${context.inputTrimmed ? 'true' : 'false'}</b></div>
         <div class="sd-source">${escapeHtml(context.worldContextSource || '')}</div>
     `;
 }
@@ -2852,6 +3276,27 @@ function renderRouterInjectionPreview(decision) {
     return `
         <div class="sd-kv"><span>Target</span><b>${escapeHtml(targetName)}</b></div>
         <pre class="sd-console sd-console--tall">${escapeHtml(prompt)}</pre>
+    `;
+}
+
+function renderRouterTimedLorebookStatus() {
+    const timedConfig = getRouterTimedLorebookConfig();
+    const regex = tryBuildRouterTimedLorebookRegex();
+    const entry = getRouterTimedLorebookCachedEntry();
+    const effectMode = getRouterTimedLorebookEffectMode(entry);
+
+    if (!timedConfig.book || !Number.isFinite(timedConfig.uid) || timedConfig.uid <= 0) {
+        return '<div class="sd-muted">No trigger target selected.</div>';
+    }
+
+    return `
+        <div class="sd-kv"><span>Entry</span><b>${escapeHtml(timedConfig.name || `UID ${timedConfig.uid}`)}</b></div>
+        <div class="sd-kv"><span>Book</span><b>${escapeHtml(timedConfig.book)}</b></div>
+        <div class="sd-kv"><span>Regex</span><b>${escapeHtml(timedConfig.triggerRegex || '(empty)')}</b></div>
+        <div class="sd-kv"><span>Regex valid</span><b>${regex ? 'yes' : 'no'}</b></div>
+        <div class="sd-kv"><span>Trigger effect</span><b>${escapeHtml(effectMode || 'none')}</b></div>
+        <div class="sd-kv"><span>Entry sticky</span><b>${escapeHtml(String(Number(entry?.sticky) || 0))}</b></div>
+        <div class="sd-kv"><span>Entry cooldown</span><b>${escapeHtml(String(Number(entry?.cooldown) || 0))}</b></div>
     `;
 }
 
@@ -2934,14 +3379,31 @@ function renderRouterConfigPanel(castCount) {
                         <input type="number" id="router-context" class="text_pole" min="1" max="50" value="${config.contextMessages}">
                     </div>
                     <div>
-                        <label>Max tokens</label>
-                        <input type="number" id="router-max-tokens" class="text_pole" min="50" max="2000" value="${config.maxTokens}">
+                        <label>Input token budget</label>
+                        <input type="number" id="router-input-token-budget" class="text_pole" min="0" max="20000" step="100" value="${config.routerInputTokenBudget}">
                     </div>
                 </div>
 
-                <label>VectFox world context chars (0 = no limit)</label>
+                <label>VectFox world context chars (0 = disabled)</label>
                 <input type="number" id="router-world-context-chars" class="text_pole" min="0" max="30000" step="500" value="${config.worldContextChars}">
-                <div class="sd-footnote">Autosaves on blur or value change.</div>
+                <div class="sd-footnote">0 skips the VectFox dry-run entirely. Values above 0 call VectFox and cap the injected text by character count. Output tokens stay under the active connection profile.</div>
+
+                <hr class="sysHR">
+
+                <label>Trigger lorebook book</label>
+                <select id="router-timed-lorebook-book" class="text_pole"></select>
+
+                <label>Search entry</label>
+                <input type="text" id="router-timed-lorebook-search" class="text_pole" placeholder="Type to filter entries from the selected lorebook" value="${escapeHtml(sceneDirectorState.routerTimedLorebookSearch || '')}">
+
+                <label>Matched entries</label>
+                <select id="router-timed-lorebook-results" class="text_pole" size="8"></select>
+                <div id="router-timed-lorebook-selected" class="sd-footnote">${escapeHtml(config.routerTimedLorebookName || 'No entry selected.')}</div>
+
+                <label>GM trigger regex</label>
+                <input type="text" id="router-timed-lorebook-regex" class="text_pole" placeholder="Example: skill-check|\\[Check\\]|roll" value="${escapeHtml(config.routerTimedLorebookTriggerRegex || '')}">
+                <div class="sd-footnote">When a GM message matches this regex, Backstage applies the ST timed effect to the selected entry. It prefers sticky if the entry has sticky configured; otherwise it uses cooldown.</div>
+                ${renderRouterTimedLorebookStatus()}
             `)}
             ${renderCard('Cast Routing', 'Map each group member to a connection profile before triggering turns.', `
                 <div class="sd-inline-actions">
@@ -3167,6 +3629,7 @@ function refreshSceneDirectorPanel() {
     if (sceneDirectorState.activeTab === 'router') {
         if (sceneDirectorState.routerView === 'config') {
             initRouterProfileDropdown();
+            initRouterTimedLorebookSelect();
             renderGroupMembers();
         }
     } else {
@@ -3256,9 +3719,13 @@ function preserveVisiblePanelDrafts() {
 
 function persistDirectorPanelFields() {
     const routerContext = $('#router-context');
-    const routerMaxTokens = $('#router-max-tokens');
+    const routerInputTokenBudget = $('#router-input-token-budget');
     const routerWorldContextChars = $('#router-world-context-chars');
     const routerPrompt = $('#router-prompt');
+    const timedBook = $('#router-timed-lorebook-book');
+    const timedSearch = $('#router-timed-lorebook-search');
+    const timedResults = $('#router-timed-lorebook-results');
+    const timedRegex = $('#router-timed-lorebook-regex');
 
     if ($('#router-profile-dropdown').length) {
         config.routerProfileId = $('#router-profile-dropdown').val() || config.routerProfileId;
@@ -3266,14 +3733,26 @@ function persistDirectorPanelFields() {
     if (routerContext.length) {
         config.contextMessages = Math.max(1, parseInt(routerContext.val()) || DEFAULT_CONFIG.contextMessages);
     }
-    if (routerMaxTokens.length) {
-        config.maxTokens = Math.max(50, parseInt(routerMaxTokens.val()) || DEFAULT_CONFIG.maxTokens);
+    if (routerInputTokenBudget.length) {
+        config.routerInputTokenBudget = Math.max(0, parseInt(routerInputTokenBudget.val()) || 0);
     }
     if (routerWorldContextChars.length) {
         config.worldContextChars = Math.max(0, parseInt(routerWorldContextChars.val()) || DEFAULT_CONFIG.worldContextChars);
     }
     if (routerPrompt.length) {
         config.routerPrompt = routerPrompt.val();
+    }
+    if (timedBook.length) {
+        config.routerTimedLorebookBook = String(timedBook.val() || '').trim();
+    }
+    if (timedSearch.length) {
+        sceneDirectorState.routerTimedLorebookSearch = String(timedSearch.val() ?? '');
+    }
+    if (timedResults.length) {
+        config.routerTimedLorebookUid = String(timedResults.val() || '').trim();
+    }
+    if (timedRegex.length) {
+        config.routerTimedLorebookTriggerRegex = String(timedRegex.val() ?? '').trim();
     }
     if ($('#router-ooc-request').length) {
         sceneDirectorState.routerOocDraft = String($('#router-ooc-request').val() ?? '');
@@ -3409,11 +3888,47 @@ function attachFloatingPanelEvents() {
         await navigator.clipboard.writeText(getStoryGuide());
         toastr.success('StoryGuide copiado.', EXTENSION_LABEL);
     });
-    $('#scene-director-panel-body').on('focusout', '#router-context, #router-max-tokens, #router-world-context-chars, #router-prompt', () => {
+    $('#scene-director-panel-body').on('focusout', '#router-context, #router-input-token-budget, #router-world-context-chars, #router-prompt', () => {
         persistDirectorPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#router-context, #router-max-tokens, #router-world-context-chars', () => {
+    $('#scene-director-panel-body').on('change', '#router-context, #router-input-token-budget, #router-world-context-chars', () => {
         persistDirectorPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#router-timed-lorebook-book', async () => {
+        config.routerTimedLorebookBook = String($('#router-timed-lorebook-book').val() || '').trim();
+        config.routerTimedLorebookUid = '';
+        config.routerTimedLorebookName = '';
+        routerTimedLorebookLastTriggerSignature = '';
+        saveConfig();
+        await renderRouterTimedLorebookResults();
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('input', '#router-timed-lorebook-search', async () => {
+        sceneDirectorState.routerTimedLorebookSearch = String($('#router-timed-lorebook-search').val() ?? '');
+        await renderRouterTimedLorebookResults();
+    });
+    $('#scene-director-panel-body').on('change', '#router-timed-lorebook-results', async () => {
+        const bookName = String($('#router-timed-lorebook-book').val() || config.routerTimedLorebookBook || '').trim();
+        const selectedUid = String($('#router-timed-lorebook-results').val() || '').trim();
+        config.routerTimedLorebookBook = bookName;
+        config.routerTimedLorebookUid = selectedUid;
+        config.routerTimedLorebookName = '';
+
+        if (bookName && selectedUid) {
+            const entries = await getRouterTimedLorebookEntries(bookName);
+            const selectedEntry = entries.find(entry => String(entry.uid) === selectedUid);
+            config.routerTimedLorebookName = selectedEntry?.label ?? '';
+        }
+
+        saveConfig();
+        routerTimedLorebookLastTriggerSignature = '';
+        await renderRouterTimedLorebookResults();
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('change focusout', '#router-timed-lorebook-regex', async () => {
+        persistDirectorPanelFields();
+        routerTimedLorebookLastTriggerSignature = '';
+        refreshSceneDirectorPanel();
     });
     $('#scene-director-panel-body').on('focusout', '#router-ooc-request', () => {
         persistDirectorPanelFields();
@@ -3481,9 +3996,12 @@ function renderSettings() {
 function loadGroupMembers() {
     const ctx   = SillyTavern.getContext();
     const group = ctx.groups.find(g => g.id === ctx.groupId);
+    const container = $('#router-group-members');
 
     if (!group) {
-        $('#router-group-members').html('<small style="color:#888;">Nenhum grupo ativo.</small>');
+        if (container.length) {
+            container.html('<small style="color:#888;">Nenhum grupo ativo.</small>');
+        }
         return;
     }
 
@@ -3498,12 +4016,19 @@ function loadGroupMembers() {
         return saved ?? { name, profileId: '', profileName: '' };
     });
 
-    renderGroupMembers();
+    if (container.length) {
+        renderGroupMembers();
+    }
 }
 
 function renderGroupMembers() {
+    const container = $('#router-group-members');
+    if (!container.length) {
+        return;
+    }
+
     if (!config.characters.length) {
-        $('#router-group-members').html('<small style="color:#888;">Nenhum personagem carregado.</small>');
+        container.html('<small style="color:#888;">Nenhum personagem carregado.</small>');
         return;
     }
 
@@ -3517,7 +4042,7 @@ function renderGroupMembers() {
         </div>
     `).join('');
 
-    $('#router-group-members').html(`<h4>Personagens</h4>${html}`);
+    container.html(`<h4>Personagens</h4>${html}`);
 
     // Inicializa o dropdown de cada personagem após o HTML estar no DOM
     initCharProfileDropdowns();
@@ -3576,9 +4101,73 @@ async function initPlannerWorldInfoSelect() {
     }
 }
 
+async function renderRouterTimedLorebookResults() {
+    const results = $('#router-timed-lorebook-results');
+    const selectedSummary = $('#router-timed-lorebook-selected');
+    if (!results.length || !selectedSummary.length) return;
+
+    const bookName = String($('#router-timed-lorebook-book').val() || config.routerTimedLorebookBook || '').trim();
+    const search = String($('#router-timed-lorebook-search').val() ?? sceneDirectorState.routerTimedLorebookSearch ?? '').trim().toLowerCase();
+    sceneDirectorState.routerTimedLorebookSearch = String($('#router-timed-lorebook-search').val() ?? sceneDirectorState.routerTimedLorebookSearch ?? '');
+
+    if (!bookName) {
+        results.html('');
+        selectedSummary.text('Select a lorebook first.');
+        return;
+    }
+
+    try {
+        const entries = await getRouterTimedLorebookEntries(bookName);
+        const filtered = entries.filter(entry => !search || entry.searchText.includes(search));
+        const selectedUid = Number(config.routerTimedLorebookUid);
+        const visible = filtered.slice(0, 60);
+        const selectedEntry = entries.find(entry => entry.uid === selectedUid) ?? null;
+
+        results.html(visible.map(entry => `
+            <option value="${escapeHtml(String(entry.uid))}" ${entry.uid === selectedUid ? 'selected' : ''}>
+                ${escapeHtml(`${entry.label} | uid ${entry.uid}${entry.keys ? ` | ${entry.keys}` : ''}`)}
+            </option>
+        `).join(''));
+
+        if (!visible.length) {
+            results.html('<option value="">No matching entries.</option>');
+        }
+
+        selectedSummary.text(selectedEntry
+            ? `${selectedEntry.label} | uid ${selectedEntry.uid}${selectedEntry.disable ? ' | currently disabled' : ''}${selectedEntry.sticky ? ` | sticky ${selectedEntry.sticky}` : ''}${selectedEntry.cooldown ? ` | cooldown ${selectedEntry.cooldown}` : ''}`
+            : 'No entry selected.');
+    } catch (error) {
+        console.warn('[SceneDirector] Failed to render timed lorebook results:', error);
+        results.html('<option value="">Could not load entries.</option>');
+        selectedSummary.text('Could not load entries.');
+    }
+}
+
+async function initRouterTimedLorebookSelect() {
+    const select = $('#router-timed-lorebook-book');
+    if (!select.length) return;
+
+    try {
+        const wi = await getWorldInfoModule();
+        const worldNames = getAvailableWorldInfoNames(wi);
+        const selectedBook = String(config.routerTimedLorebookBook ?? '').trim();
+        const options = ['<option value="">-- none --</option>']
+            .concat(worldNames.map(name => `<option value="${escapeHtml(name)}" ${name === selectedBook ? 'selected' : ''}>${escapeHtml(name)}</option>`));
+        select.html(options.join(''));
+        await renderRouterTimedLorebookResults();
+    } catch (error) {
+        console.warn('[SceneDirector] Failed to initialize timed lorebook select:', error);
+        select.html('<option value="">Could not load lorebooks.</option>');
+    }
+}
+
 async function initCharProfileDropdowns() {
+    if (!$('#router-group-members').length) return;
     const service = await getConnService();
     config.characters.forEach((char, idx) => {
+        if (!$(`#char-profile-${idx}`).length) {
+            return;
+        }
         service.handleDropdown(
             `#char-profile-${idx}`,
             char.profileId,
@@ -3654,7 +4243,7 @@ jQuery(document).ready(async () => {
     });
 
     ctx.eventSource.on(ctx.event_types.CHARACTER_MESSAGE_RENDERED, () => {
-        setTimeout(() => {
+        setTimeout(async () => {
             const c = SillyTavern.getContext();
             const lastMsg = c.chat[c.chat.length - 1];
             if (lastMsg?.extra?.type === 'tool_call' || lastMsg?.extra?.type === 'tool_response') {
@@ -3664,6 +4253,7 @@ jQuery(document).ready(async () => {
                 skipNextCharacterAutoRouter = false;
                 return;
             }
+            await maybeTriggerRouterTimedLorebookFromMessage(lastMsg, c);
             runRouter('CHARACTER_MESSAGE_RENDERED');
         }, 300);
     });
@@ -3723,6 +4313,22 @@ jQuery(document).ready(async () => {
         const match      = noteMsg?.content?.match(/Write the next reply only as (.+?)\./);
         const activeChar = match?.[1];
 
+        const beforeSummary = {
+            total: Array.isArray(chat) ? chat.length : 0,
+            system: Array.isArray(chat) ? chat.filter(m => m.role === 'system').length : 0,
+            user: Array.isArray(chat) ? chat.filter(m => m.role === 'user').length : 0,
+            assistant: Array.isArray(chat) ? chat.filter(m => m.role === 'assistant').length : 0,
+            nonSystemPreview: Array.isArray(chat)
+                ? chat
+                    .filter(m => m.role !== 'system')
+                    .slice(0, 6)
+                    .map(m => ({
+                        role: m.role,
+                        contentStart: String(m.content ?? '').slice(0, 120),
+                    }))
+                : [],
+        };
+
         // Sempre remapeia: só o personagem ativo fica como assistant, todos os outros viram user
         if (activeChar) {
             let remapped = 0;
@@ -3733,7 +4339,34 @@ jQuery(document).ready(async () => {
                     remapped++;
                 }
             }
-            if (remapped > 0) console.log(`[SceneDirector] Role remap: ${remapped} msgs → user (gerando como ${activeChar})`);
+            const afterSummary = {
+                total: Array.isArray(chat) ? chat.length : 0,
+                system: Array.isArray(chat) ? chat.filter(m => m.role === 'system').length : 0,
+                user: Array.isArray(chat) ? chat.filter(m => m.role === 'user').length : 0,
+                assistant: Array.isArray(chat) ? chat.filter(m => m.role === 'assistant').length : 0,
+                nonSystemPreview: Array.isArray(chat)
+                    ? chat
+                        .filter(m => m.role !== 'system')
+                        .slice(0, 6)
+                        .map(m => ({
+                            role: m.role,
+                            contentStart: String(m.content ?? '').slice(0, 120),
+                        }))
+                    : [],
+            };
+            console.log('[Backstage] CHAT_COMPLETION_PROMPT_READY summary', {
+                activeChar,
+                remapped,
+                before: beforeSummary,
+                after: afterSummary,
+            });
+            if (afterSummary.user + afterSummary.assistant === 0) {
+                console.warn('[Backstage] Prompt ready without non-system chat messages for active character', {
+                    activeChar,
+                    before: beforeSummary,
+                    after: afterSummary,
+                });
+            }
         }
 
     });
@@ -3742,6 +4375,31 @@ jQuery(document).ready(async () => {
         fl('← EVT', 'CHAT_CHANGED', `isProcessing=${isProcessing} | lastActiveChar=${lastActiveChar}`);
         lastActiveChar = null;
         loadGroupMembers();
+    });
+
+    ctx.eventSource.on(ctx.event_types.MAIN_API_CHANGED, (payload) => {
+        if (!isProcessing) return;
+        fl('← EVT', 'MAIN_API_CHANGED', `api=${payload?.apiId ?? ''} | lastActiveChar=${lastActiveChar}`);
+    });
+
+    ctx.eventSource.on(ctx.event_types.CHATCOMPLETION_SOURCE_CHANGED, (payload) => {
+        if (!isProcessing) return;
+        fl('← EVT', 'CHATCOMPLETION_SOURCE_CHANGED', `source=${payload?.source ?? payload ?? ''} | lastActiveChar=${lastActiveChar}`);
+    });
+
+    ctx.eventSource.on(ctx.event_types.OAI_PRESET_CHANGED_BEFORE, (payload) => {
+        if (!isProcessing) return;
+        fl('← EVT', 'OAI_PRESET_CHANGED_BEFORE', `payload=${JSON.stringify(payload ?? {})}`);
+    });
+
+    ctx.eventSource.on(ctx.event_types.OAI_PRESET_CHANGED_AFTER, (payload) => {
+        if (!isProcessing) return;
+        fl('← EVT', 'OAI_PRESET_CHANGED_AFTER', `payload=${JSON.stringify(payload ?? {})}`);
+    });
+
+    ctx.eventSource.on(ctx.event_types.CONNECTION_PROFILE_LOADED, (profileName) => {
+        if (!isProcessing) return;
+        fl('← EVT', 'CONNECTION_PROFILE_LOADED', `profile=${profileName ?? ''} | lastActiveChar=${lastActiveChar}`);
     });
 
     loadGroupMembers();
