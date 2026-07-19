@@ -560,6 +560,53 @@
         min-height: 420px;
     }
 
+    #scene-director-panel .sd-editor-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-top: 10px;
+    }
+
+    #scene-director-panel .sd-editor-meta .sd-footnote {
+        margin-top: 0;
+        min-width: 0;
+    }
+
+    #scene-director-panel .sd-token-counter {
+        flex: 0 0 auto;
+        font-size: 12px;
+        color: var(--sd-text-dim);
+        white-space: nowrap;
+    }
+
+    #scene-director-panel .sd-timing-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    #scene-director-panel .sd-timing-row {
+        display: grid;
+        grid-template-columns: 110px minmax(0, 1fr) 90px;
+        gap: 12px;
+        align-items: center;
+    }
+
+    #scene-director-panel .sd-timing-row span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    #scene-director-panel .sd-timing-row--head {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--sd-text-dim);
+    }
+
     #scene-director-panel .sd-footnote {
         margin-top: 10px;
         font-size: 12px;

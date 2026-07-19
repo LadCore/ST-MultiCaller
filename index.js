@@ -7,6 +7,12 @@ const ROUTER_LABEL = 'Turn Router';
 const STORY_DIRECTOR_LABEL = 'Story Director';
 const CURRENT_CONFIG_VERSION = 9;
 const DEFAULT_WORLD_CONTEXT_CHARS = 0;
+const PROFILE_SWITCH_SETTLE_QUIET_MS = 2000;
+const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
+const PROFILE_SWITCH_SETTLE_EVENT_LIMIT = 12;
+const STORY_GUIDE_SNAPSHOT_RETENTION = 3;
+const STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
+const PLANNER_CONTEXT_MESSAGES = 500;
 
 const DEFAULT_SCENE_DIRECTOR_PROMPT = `You are the RP Scene Director for a SillyTavern group roleplay.
 
@@ -68,7 +74,6 @@ Inputs you will receive:
 - Recent chat: the latest visible RP events.
 - World context: active lore/RAG context, when available.
 - Selected lorebook catalog: available lorebook entries from the books selected for planner scope.
-- Last SceneDirector decision: the latest turn-level routing/direction, when available.
 
 Mode A - no current StoryGuide:
 If Current StoryGuide is empty, create a strong plan for the current arc from the available chat and world context.
@@ -170,7 +175,6 @@ const DEFAULT_CONFIG = {
     configVersion:     CURRENT_CONFIG_VERSION,
     routerProfileId:   '',
     plannerProfileId:  '',
-    contextMessages:   5,
     routerInputTokenBudget: 0,
     worldContextChars: DEFAULT_WORLD_CONTEXT_CHARS,
     plannerUserTurnInterval: 5,
@@ -217,11 +221,35 @@ let sceneDirectorState = {
     persistentIssueSource: '',
     persistentIssueAt: null,
     lastError: '',
+    triggerSettle: null,
+    runtimeTiming: {
+        activeKind: '',
+        activeLabel: '',
+        activeStartedAt: null,
+        activeDetail: '',
+        activeModel: '',
+        lastCompletedKind: '',
+        lastCompletedLabel: '',
+        lastCompletedMs: null,
+        lastCompletedAt: null,
+        lastRouterMs: null,
+        lastRouterAt: null,
+        lastRouterModel: '',
+        lastPlannerMs: null,
+        lastPlannerAt: null,
+        lastPlannerModel: '',
+        lastCharacterMs: null,
+        lastCharacterAt: null,
+        lastCharacterModel: '',
+    },
 };
 let lastDirectorRequest = null;
 let forcedRouterSpeaker = null;
 let skipNextCharacterAutoRouter = false;
 let pendingAutoRouter = false;
+let activeTriggerSettleMonitor = null;
+const promptTokenCounterTimers = new Map();
+const promptTokenCounterVersions = new Map();
 
 // ================= FLOW LOG =================
 
@@ -760,10 +788,6 @@ async function applyLorebookInjectionForCharacter(charName, storyGuide = getStor
         false,
         EXTENSION_PROMPT_ROLES.SYSTEM,
     );
-    console.log('[SceneDirector] Applied lorebook injection prompt', {
-        charName,
-        entries: entries.map(entry => ({ book: entry.book, uid: entry.uid, name: entry.name })),
-    });
 }
 
 function applyStoryGuideInjectionForCharacter(charName, storyGuide = getStoryGuide()) {
@@ -887,14 +911,6 @@ function setSceneDirection(decision, charName) {
         false,
         EXTENSION_PROMPT_ROLES.SYSTEM,
     );
-    console.log('[SceneDirector] Applied scene direction prompt', {
-        charName,
-        key: SCENE_DIRECTION_KEY,
-        position: EXTENSION_PROMPT_TYPES.IN_PROMPT,
-        depth: 0,
-        prompt,
-        stored: ctx.extensionPrompts?.[SCENE_DIRECTION_KEY],
-    });
 }
 
 function clearSceneDirection() {
@@ -950,6 +966,31 @@ async function getConnService() {
     return _connService;
 }
 
+async function sendPlannerStreamingRequest(profileId, messages) {
+    const service = await getConnService();
+    const response = await service.sendRequest(
+        profileId,
+        messages,
+        undefined,
+        { stream: true, extractData: true },
+    );
+
+    if (typeof response !== 'function') {
+        return response;
+    }
+
+    let content = '';
+    let reasoning = '';
+    const generator = response();
+
+    for await (const chunk of generator) {
+        content = String(chunk?.text ?? content);
+        reasoning = String(chunk?.state?.reasoning ?? reasoning);
+    }
+
+    return { content, reasoning };
+}
+
 function resolveCharacterProfileForSwitch(char, ctx = SillyTavern.getContext()) {
     const profileId = String(char?.profileId ?? '').trim();
     const profileName = String(char?.profileName ?? '').trim();
@@ -981,22 +1022,152 @@ function resolveCharacterProfileForSwitch(char, ctx = SillyTavern.getContext()) 
     };
 }
 
-async function waitForChatRecovery(ctx, previousChatLength, timeoutMs = 4000) {
-    const expectedMessages = Math.max(1, Number(previousChatLength) || 0);
-    if (expectedMessages <= 0) {
-        return true;
+function buildTriggerSettleSnapshot(monitor, status, note = '') {
+    return {
+        status,
+        note,
+        charName: monitor.charName,
+        profileName: monitor.profileName,
+        quietMs: monitor.quietMs,
+        maxWaitMs: monitor.maxWaitMs,
+        anchorSeen: !!monitor.anchorSeen,
+        anchorEventName: monitor.anchorEventName,
+        startedAt: new Date(monitor.startedAt),
+        deadlineAt: new Date(monitor.deadlineAt),
+        lastEventAt: monitor.lastEventAt ? new Date(monitor.lastEventAt) : null,
+        lastEventName: monitor.lastEventName,
+        events: monitor.events.slice().reverse(),
+    };
+}
+
+function publishTriggerSettleSnapshot(monitor, status, note = '') {
+    const patch = {
+        triggerSettle: buildTriggerSettleSnapshot(monitor, status, note),
+    };
+
+    if (status === 'waiting') {
+        patch.status = 'settling-profile';
     }
 
-    const startedAt = Date.now();
-    while ((Date.now() - startedAt) < timeoutMs) {
-        const currentLength = Array.isArray(ctx.chat) ? ctx.chat.length : 0;
-        if (currentLength >= expectedMessages || currentLength > 0) {
-            return true;
+    updateRouterState(patch);
+}
+
+function clearActiveTriggerSettleMonitor() {
+    if (!activeTriggerSettleMonitor) {
+        return;
+    }
+
+    clearTimeout(activeTriggerSettleMonitor.quietTimer);
+    clearTimeout(activeTriggerSettleMonitor.maxTimer);
+    activeTriggerSettleMonitor = null;
+}
+
+function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWITCH_SETTLE_QUIET_MS, maxWaitMs = PROFILE_SWITCH_SETTLE_MAX_WAIT_MS) {
+    clearActiveTriggerSettleMonitor();
+
+    const monitor = {
+        charName,
+        profileName,
+        quietMs: Math.max(250, Number(quietMs) || PROFILE_SWITCH_SETTLE_QUIET_MS),
+        maxWaitMs: Math.max(1000, Number(maxWaitMs) || PROFILE_SWITCH_SETTLE_MAX_WAIT_MS),
+        startedAt: Date.now(),
+        deadlineAt: Date.now() + Math.max(1000, Number(maxWaitMs) || PROFILE_SWITCH_SETTLE_MAX_WAIT_MS),
+        anchorSeen: false,
+        anchorEventName: '',
+        lastEventAt: null,
+        lastEventName: '',
+        events: [],
+        quietTimer: null,
+        maxTimer: null,
+        finished: false,
+        resolve: null,
+        promise: null,
+    };
+
+    const scheduleQuietTimer = () => {
+        clearTimeout(monitor.quietTimer);
+        monitor.deadlineAt = Date.now() + monitor.quietMs;
+        publishTriggerSettleSnapshot(monitor, 'waiting', `Waiting for ${monitor.quietMs}ms of silence before /trigger.`);
+        monitor.quietTimer = setTimeout(() => {
+            finish('settled', 'Quiet window reached. Proceeding with /trigger.');
+        }, monitor.quietMs);
+    };
+
+    const finish = (status, note) => {
+        if (monitor.finished) {
+            return;
         }
-        await new Promise(resolve => setTimeout(resolve, 50));
+
+        monitor.finished = true;
+        clearTimeout(monitor.quietTimer);
+        clearTimeout(monitor.maxTimer);
+
+        if (activeTriggerSettleMonitor === monitor) {
+            activeTriggerSettleMonitor = null;
+        }
+
+        publishTriggerSettleSnapshot(monitor, status, note);
+        monitor.resolve?.({
+            status,
+            note,
+            events: monitor.events.slice(),
+            quietMs: monitor.quietMs,
+            maxWaitMs: monitor.maxWaitMs,
+        });
+    };
+
+    monitor.noteEvent = (eventName, detail = '') => {
+        if (monitor.finished) {
+            return;
+        }
+
+        const when = Date.now();
+        monitor.lastEventAt = when;
+        monitor.lastEventName = String(eventName ?? '').trim();
+        monitor.events.push({
+            name: String(eventName ?? '').trim(),
+            detail: String(detail ?? '').trim(),
+            at: new Date(when),
+        });
+        if (monitor.events.length > PROFILE_SWITCH_SETTLE_EVENT_LIMIT) {
+            monitor.events.splice(0, monitor.events.length - PROFILE_SWITCH_SETTLE_EVENT_LIMIT);
+        }
+
+        if (!monitor.anchorSeen) {
+            if (String(eventName ?? '').trim() === 'CHAT_CHANGED') {
+                monitor.anchorSeen = true;
+                monitor.anchorEventName = 'CHAT_CHANGED';
+                scheduleQuietTimer();
+            } else {
+                publishTriggerSettleSnapshot(monitor, 'waiting-anchor', 'Observed profile events, but still waiting for CHAT_CHANGED before arming the quiet window.');
+            }
+            return;
+        }
+
+        scheduleQuietTimer();
+    };
+
+    monitor.promise = new Promise(resolve => {
+        monitor.resolve = resolve;
+    });
+
+    monitor.maxTimer = setTimeout(() => {
+        finish('timeout', monitor.anchorSeen
+            ? `Max wait ${monitor.maxWaitMs}ms reached after anchor. Proceeding anyway.`
+            : `Max wait ${monitor.maxWaitMs}ms reached without CHAT_CHANGED. Proceeding anyway.`);
+    }, monitor.maxWaitMs);
+
+    activeTriggerSettleMonitor = monitor;
+    publishTriggerSettleSnapshot(monitor, 'waiting-anchor', 'Waiting for CHAT_CHANGED before starting the quiet window.');
+    return monitor;
+}
+
+function noteTriggerSettleEvent(eventName, detail = '') {
+    if (!activeTriggerSettleMonitor || activeTriggerSettleMonitor.finished) {
+        return;
     }
 
-    return false;
+    activeTriggerSettleMonitor.noteEvent(eventName, detail);
 }
 
 // ================= WORLD INFO TEST =================
@@ -1601,10 +1772,13 @@ function limitText(text, maxChars) {
     return `${value.slice(0, limit)}\n\n[Context truncated to ${limit} characters.]`;
 }
 
-async function getVectFoxRouterContext(ctx) {
-    const maxChars = Number(config.worldContextChars || 0);
+async function getVectFoxRouterContext(ctx, options = {}) {
+    const maxChars = options.maxChars == null
+        ? Number(config.worldContextChars || 0)
+        : Math.max(0, Number(options.maxChars || 0));
+    const forceEnabled = options.forceEnabled === true;
 
-    if (maxChars <= 0) {
+    if (!forceEnabled && maxChars <= 0) {
         return { text: '', source: 'vectfox-skipped-by-config', entryCount: 0, originalLength: 0, truncated: false };
     }
 
@@ -1934,6 +2108,60 @@ async function estimateRequestInputTokens(profileId, messages, service = null) {
     return await ctx.getTokenCountAsync(text);
 }
 
+async function resolveConnectionInputTokenBudget(profileId, explicitBudget = 0) {
+    const configuredBudget = Math.max(0, Number(explicitBudget || 0));
+    if (configuredBudget > 0) {
+        return {
+            budget: configuredBudget,
+            source: 'configured',
+            maxContext: null,
+            maxOutput: null,
+        };
+    }
+
+    try {
+        const service = await getConnService();
+        const profile = service.getProfile(profileId);
+        const api = service.validateProfile(profile);
+
+        if (api.selected === 'openai' && profile?.preset) {
+            const { getPresetManager } = await import('/scripts/preset-manager.js');
+            const preset = getPresetManager('openai')?.getCompletionPresetByName(profile.preset);
+            const maxContext = Math.max(0, Number(preset?.openai_max_context || 0));
+            const maxOutput = Math.max(0, Number(preset?.openai_max_tokens || 0));
+
+            if (maxContext > 0) {
+                return {
+                    budget: Math.max(1, maxContext - Math.min(maxOutput, maxContext - 1)),
+                    source: 'profile-preset',
+                    maxContext,
+                    maxOutput,
+                };
+            }
+        }
+    } catch (error) {
+        console.warn('[SceneDirector] Could not resolve input budget from connection profile:', error);
+    }
+
+    const context = SillyTavern.getContext();
+    const maxContext = Math.max(0, Number(context.maxContext || 0));
+    if (maxContext > 0) {
+        return {
+            budget: maxContext,
+            source: 'active-context-fallback',
+            maxContext,
+            maxOutput: null,
+        };
+    }
+
+    return {
+        budget: 0,
+        source: 'unbounded-fallback',
+        maxContext: null,
+        maxOutput: null,
+    };
+}
+
 function shrinkTextBlock(text, options = {}) {
     const source = String(text ?? '').trim();
     if (!source) return '';
@@ -1950,6 +2178,10 @@ function shrinkTextBlock(text, options = {}) {
         return nextLines.join('\n').trim();
     }
 
+    if (source.length <= 80) {
+        return '';
+    }
+
     const keepChars = Math.max(80, Math.floor(source.length * (1 - ratio)));
     if (keepChars >= source.length) {
         return source;
@@ -1964,7 +2196,7 @@ function shrinkObjectTextField(target, options = {}) {
     if (!target || typeof target.text !== 'string') return false;
     const current = String(target.text ?? '').trim();
     const next = shrinkTextBlock(current, options);
-    if (!next || next === current) return false;
+    if (next === current) return false;
     target.text = next;
     return true;
 }
@@ -1972,15 +2204,20 @@ function shrinkObjectTextField(target, options = {}) {
 function shrinkPlainTextField(object, fieldName, options = {}) {
     const current = String(object?.[fieldName] ?? '').trim();
     const next = shrinkTextBlock(current, options);
-    if (!next || next === current) return false;
+    if (next === current) return false;
     object[fieldName] = next;
     return true;
 }
 
-async function fitRouterMessagesToInputBudget(profileId, routerContext, buildMessagesFn) {
-    const budget = Math.max(0, Number(config.routerInputTokenBudget || 0));
+async function fitContextMessagesToInputBudget(profileId, sourceContext, buildMessagesFn, options = {}) {
+    const budgetResult = await resolveConnectionInputTokenBudget(profileId, options.explicitBudget);
+    const budget = budgetResult.budget;
     const requestService = await getConnService();
-    const workingContext = JSON.parse(JSON.stringify(routerContext ?? {}));
+    const workingContext = JSON.parse(JSON.stringify(sourceContext ?? {}));
+    const originalChatEntries = Array.isArray(workingContext.recentChatEntries)
+        ? [...workingContext.recentChatEntries]
+        : (workingContext.recentChat ? [String(workingContext.recentChat)] : []);
+    setRecentChatEntries(workingContext, originalChatEntries);
     let messages = buildMessagesFn(workingContext);
     let inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
     let trimmed = false;
@@ -1988,46 +2225,77 @@ async function fitRouterMessagesToInputBudget(profileId, routerContext, buildMes
     if (!budget || inputTokens <= budget) {
         return {
             messages,
-            routerContext: workingContext,
+            context: workingContext,
             inputTokens,
             budget,
+            budgetSource: budgetResult.source,
+            maxContext: budgetResult.maxContext,
+            maxOutput: budgetResult.maxOutput,
             trimmed,
         };
     }
 
+    // VectFox is the durable RP summary, so remove raw chat before touching it.
+    setRecentChatEntries(workingContext, []);
+    messages = buildMessagesFn(workingContext);
+    inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
+    trimmed = originalChatEntries.length > 0;
+
     const shrinkers = [
         () => shrinkObjectTextField(workingContext.lorebookCatalog, { ratio: 0.25 }),
         () => shrinkObjectTextField(workingContext.lorebookContext, { ratio: 0.2 }),
-        () => shrinkObjectTextField(workingContext.worldContext, { ratio: 0.2 }),
         () => shrinkPlainTextField(workingContext, 'storyGuide', { ratio: 0.18 }),
-        () => shrinkPlainTextField(workingContext, 'recentChat', { ratio: 0.2, dropFromStart: true }),
+        () => shrinkPlainTextField(workingContext, 'currentGuide', { ratio: 0.18 }),
+        () => shrinkObjectTextField(workingContext.worldContext, { ratio: 0.2 }),
     ];
 
-    let changed = true;
-    while (inputTokens > budget && changed) {
-        changed = false;
-
-        for (const shrink of shrinkers) {
-            if (!shrink()) {
-                continue;
-            }
-
+    for (const shrink of shrinkers) {
+        while (inputTokens > budget && shrink()) {
             trimmed = true;
-            changed = true;
             messages = buildMessagesFn(workingContext);
             inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
+        }
 
-            if (inputTokens <= budget) {
-                break;
+        if (inputTokens <= budget) break;
+    }
+
+    if (inputTokens <= budget && originalChatEntries.length) {
+        let low = 0;
+        let high = originalChatEntries.length;
+        let bestCount = 0;
+        let bestMessages = messages;
+        let bestTokens = inputTokens;
+
+        while (low <= high) {
+            const count = Math.floor((low + high) / 2);
+            setRecentChatEntries(workingContext, count > 0 ? originalChatEntries.slice(-count) : []);
+            const candidateMessages = buildMessagesFn(workingContext);
+            const candidateTokens = await estimateRequestInputTokens(profileId, candidateMessages, requestService);
+
+            if (candidateTokens <= budget) {
+                bestCount = count;
+                bestMessages = candidateMessages;
+                bestTokens = candidateTokens;
+                low = count + 1;
+            } else {
+                high = count - 1;
             }
         }
+
+        setRecentChatEntries(workingContext, bestCount > 0 ? originalChatEntries.slice(-bestCount) : []);
+        messages = bestMessages;
+        inputTokens = bestTokens;
+        trimmed = bestCount < originalChatEntries.length || trimmed;
     }
 
     return {
         messages,
-        routerContext: workingContext,
+        context: workingContext,
         inputTokens,
         budget,
+        budgetSource: budgetResult.source,
+        maxContext: budgetResult.maxContext,
+        maxOutput: budgetResult.maxOutput,
         trimmed,
     };
 }
@@ -2169,6 +2437,116 @@ function clearBackstageIssue() {
     refreshSceneDirectorPanel();
 }
 
+function cloneRuntimeTiming() {
+    const current = sceneDirectorState.runtimeTiming ?? {};
+    return {
+        activeKind: String(current.activeKind ?? ''),
+        activeLabel: String(current.activeLabel ?? ''),
+        activeStartedAt: current.activeStartedAt ? new Date(current.activeStartedAt) : null,
+        activeDetail: String(current.activeDetail ?? ''),
+        activeModel: String(current.activeModel ?? ''),
+        lastCompletedKind: String(current.lastCompletedKind ?? ''),
+        lastCompletedLabel: String(current.lastCompletedLabel ?? ''),
+        lastCompletedMs: Number.isFinite(Number(current.lastCompletedMs)) ? Number(current.lastCompletedMs) : null,
+        lastCompletedAt: current.lastCompletedAt ? new Date(current.lastCompletedAt) : null,
+        lastRouterMs: Number.isFinite(Number(current.lastRouterMs)) ? Number(current.lastRouterMs) : null,
+        lastRouterAt: current.lastRouterAt ? new Date(current.lastRouterAt) : null,
+        lastRouterModel: String(current.lastRouterModel ?? ''),
+        lastPlannerMs: Number.isFinite(Number(current.lastPlannerMs)) ? Number(current.lastPlannerMs) : null,
+        lastPlannerAt: current.lastPlannerAt ? new Date(current.lastPlannerAt) : null,
+        lastPlannerModel: String(current.lastPlannerModel ?? ''),
+        lastCharacterMs: Number.isFinite(Number(current.lastCharacterMs)) ? Number(current.lastCharacterMs) : null,
+        lastCharacterAt: current.lastCharacterAt ? new Date(current.lastCharacterAt) : null,
+        lastCharacterModel: String(current.lastCharacterModel ?? ''),
+    };
+}
+
+function getConnectionProfile(profileId, ctx = SillyTavern.getContext()) {
+    const cleanId = String(profileId ?? '').trim();
+    if (!cleanId) {
+        return null;
+    }
+
+    const profiles = ctx.extensionSettings?.connectionManager?.profiles ?? [];
+    return profiles.find(profile => String(profile?.id ?? '') === cleanId) ?? null;
+}
+
+function getTimingModelLabel(profileId, fallbackName = '', ctx = SillyTavern.getContext()) {
+    const profile = getConnectionProfile(profileId, ctx);
+    const model = String(profile?.model ?? '').trim();
+    const name = String(profile?.name ?? '').trim();
+    const fallback = String(fallbackName ?? '').trim();
+    return model || name || fallback || '-';
+}
+
+function beginRuntimePhase(kind, label, detail = '', model = '') {
+    const current = cloneRuntimeTiming();
+    const now = new Date();
+
+    sceneDirectorState = {
+        ...sceneDirectorState,
+        runtimeTiming: {
+            ...current,
+            activeKind: String(kind ?? '').trim(),
+            activeLabel: String(label ?? '').trim(),
+            activeStartedAt: now,
+            activeDetail: String(detail ?? '').trim(),
+            activeModel: String(model ?? '').trim(),
+        },
+    };
+    refreshSceneDirectorPanel();
+}
+
+function finishRuntimePhase(expectedKinds = null) {
+    const current = cloneRuntimeTiming();
+    if (!current.activeKind || !current.activeStartedAt) {
+        return;
+    }
+
+    if (Array.isArray(expectedKinds) && expectedKinds.length && !expectedKinds.includes(current.activeKind)) {
+        return;
+    }
+
+    const finishedAt = new Date();
+    const durationMs = Math.max(0, finishedAt.getTime() - current.activeStartedAt.getTime());
+    const nextTiming = {
+        ...current,
+        activeKind: '',
+        activeLabel: '',
+        activeStartedAt: null,
+        activeDetail: '',
+        activeModel: '',
+        lastCompletedKind: current.activeKind,
+        lastCompletedLabel: current.activeLabel,
+        lastCompletedMs: durationMs,
+        lastCompletedAt: finishedAt,
+    };
+
+    if (current.activeKind === 'router-request' || current.activeKind === 'router-ooc') {
+        nextTiming.lastRouterMs = durationMs;
+        nextTiming.lastRouterAt = finishedAt;
+        nextTiming.lastRouterModel = current.activeModel;
+    }
+
+    if (current.activeKind === 'planner-update' || current.activeKind === 'planner-ooc') {
+        nextTiming.lastPlannerMs = durationMs;
+        nextTiming.lastPlannerAt = finishedAt;
+        nextTiming.lastPlannerModel = current.activeModel;
+    }
+
+    if (current.activeKind === 'character-turn') {
+        nextTiming.lastCharacterMs = durationMs;
+        nextTiming.lastCharacterAt = finishedAt;
+        nextTiming.lastCharacterModel = current.activeModel;
+    }
+
+    sceneDirectorState = {
+        ...sceneDirectorState,
+        runtimeTiming: nextTiming,
+    };
+    refreshSceneDirectorPanel();
+}
+
 function cloneDirectorRequestPayload(payload) {
     return JSON.parse(JSON.stringify(payload));
 }
@@ -2187,6 +2565,179 @@ function saveStoryGuide(value, ctx = SillyTavern.getContext()) {
     metadata.storyGuide = String(value ?? '');
     metadata.storyGuideUpdatedAt = new Date().toISOString();
     ctx.saveMetadata?.();
+}
+
+function normalizeStoryGuideSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+        return null;
+    }
+
+    const savedAt = String(snapshot.savedAt ?? '').trim();
+    const path = String(snapshot.path ?? '').trim();
+    const fileName = String(snapshot.fileName ?? '').trim();
+    const content = String(snapshot.content ?? '');
+    if (!savedAt || !path || !fileName || !content.trim()) {
+        return null;
+    }
+
+    return { savedAt, path, fileName, content };
+}
+
+function getStoryGuideSnapshots(ctx = SillyTavern.getContext()) {
+    const rawSnapshots = getSceneDirectorMetadata(ctx).storyGuideSnapshots;
+    if (!Array.isArray(rawSnapshots)) {
+        return [];
+    }
+
+    return rawSnapshots
+        .map(normalizeStoryGuideSnapshot)
+        .filter(Boolean)
+        .slice(0, STORY_GUIDE_SNAPSHOT_RETENTION);
+}
+
+function saveStoryGuideSnapshots(snapshots, ctx = SillyTavern.getContext()) {
+    const metadata = getSceneDirectorMetadata(ctx);
+    const normalized = Array.isArray(snapshots)
+        ? snapshots
+            .map(normalizeStoryGuideSnapshot)
+            .filter(Boolean)
+            .slice(0, STORY_GUIDE_SNAPSHOT_RETENTION)
+        : [];
+
+    metadata.storyGuideSnapshots = normalized;
+    metadata.lastStoryGuideSnapshotAt = normalized[0]?.savedAt ?? '';
+    ctx.saveMetadata?.();
+    return normalized;
+}
+
+function getLastStoryGuideSnapshotAt(ctx = SillyTavern.getContext()) {
+    const metadata = getSceneDirectorMetadata(ctx);
+    return String(metadata.lastStoryGuideSnapshotAt ?? '').trim();
+}
+
+function shouldPersistStoryGuideSnapshot(now = new Date(), ctx = SillyTavern.getContext()) {
+    const lastSavedAt = getLastStoryGuideSnapshotAt(ctx);
+    if (!lastSavedAt) {
+        return true;
+    }
+
+    const lastSavedMs = Date.parse(lastSavedAt);
+    if (!Number.isFinite(lastSavedMs)) {
+        return true;
+    }
+
+    return now.getTime() - lastSavedMs >= STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS;
+}
+
+function encodeBase64Utf8(value) {
+    const bytes = new TextEncoder().encode(String(value ?? ''));
+    let binary = '';
+    const chunkSize = 0x8000;
+
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+    }
+
+    return btoa(binary);
+}
+
+function buildStoryGuideSnapshotFileName(savedAt = new Date()) {
+    const stamp = savedAt.toISOString().replace(/[:.]/g, '-');
+    const suffix = Math.random().toString(36).slice(2, 8);
+    return `backstage-storyguide-${stamp}-${suffix}.md`;
+}
+
+async function getStRequestHeaders() {
+    const { getRequestHeaders } = await import('/script.js');
+    return getRequestHeaders();
+}
+
+async function uploadUserFile(name, content) {
+    const response = await fetch('/api/files/upload', {
+        method: 'POST',
+        headers: await getStRequestHeaders(),
+        body: JSON.stringify({
+            name,
+            data: encodeBase64Utf8(content),
+        }),
+    });
+
+    if (!response.ok) {
+        throw new Error((await response.text()) || `Upload failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const path = String(payload?.path ?? '').trim();
+    if (!path) {
+        throw new Error('Upload succeeded without a returned file path.');
+    }
+
+    return path;
+}
+
+async function deleteUserFile(path) {
+    const targetPath = String(path ?? '').trim();
+    if (!targetPath) {
+        return;
+    }
+
+    const response = await fetch('/api/files/delete', {
+        method: 'POST',
+        headers: await getStRequestHeaders(),
+        body: JSON.stringify({ path: targetPath }),
+    });
+
+    if (!response.ok && response.status !== 404) {
+        throw new Error((await response.text()) || `Delete failed with status ${response.status}`);
+    }
+}
+
+async function maybePersistStoryGuideSnapshot(value, ctx = SillyTavern.getContext()) {
+    const storyGuide = String(value ?? '');
+    if (!storyGuide.trim()) {
+        return null;
+    }
+
+    const now = new Date();
+    if (!shouldPersistStoryGuideSnapshot(now, ctx)) {
+        return null;
+    }
+
+    const fileName = buildStoryGuideSnapshotFileName(now);
+    const path = await uploadUserFile(fileName, storyGuide);
+    const snapshot = {
+        savedAt: now.toISOString(),
+        path,
+        fileName,
+        content: storyGuide,
+    };
+    const existing = getStoryGuideSnapshots(ctx);
+    const nextSnapshots = [snapshot, ...existing].slice(0, STORY_GUIDE_SNAPSHOT_RETENTION);
+    const prunedSnapshots = existing.slice(Math.max(0, STORY_GUIDE_SNAPSHOT_RETENTION - 1));
+
+    saveStoryGuideSnapshots(nextSnapshots, ctx);
+
+    await Promise.allSettled(
+        prunedSnapshots
+            .map(entry => entry?.path)
+            .filter(Boolean)
+            .map(pathToDelete => deleteUserFile(pathToDelete)),
+    );
+
+    return snapshot;
+}
+
+async function copyStoryGuideSnapshot(index, ctx = SillyTavern.getContext()) {
+    const snapshots = getStoryGuideSnapshots(ctx);
+    const snapshot = snapshots[index];
+    if (!snapshot) {
+        toastr.info(`Snapshot ${index + 1} indisponivel.`, EXTENSION_LABEL);
+        return false;
+    }
+
+    await navigator.clipboard.writeText(snapshot.content);
+    toastr.success(`Snapshot ${index + 1} copiado.`, EXTENSION_LABEL);
+    return true;
 }
 
 function getPlannerUserTurnCounter(ctx = SillyTavern.getContext()) {
@@ -2217,28 +2768,19 @@ function stripMarkdownFence(text) {
 }
 
 async function getPlannerContextSnapshot(ctx = SillyTavern.getContext()) {
-    const realMessages = (ctx.chat ?? []).filter(m =>
-        !m.is_system &&
-        m.extra?.type !== 'tool_call' &&
-        m.extra?.type !== 'tool_response' &&
-        m.mes != null &&
-        !isBackstageOocMessage(m.mes)
-    );
+    const realMessages = getRpContextMessages(ctx.chat).slice(-PLANNER_CONTEXT_MESSAGES);
     const humanName = ctx.name1 || '';
-    const sanitize = (text) => humanName ? String(text ?? '').replace(/{{user}}/gi, humanName) : String(text ?? '');
-    const recentChat = realMessages
-        .slice(-Math.max(config.contextMessages, 20))
-        .map(m => `${m.name || 'Unknown'}: ${sanitize(m.mes || '')}`)
-        .join('\n');
+    const recentChatEntries = formatRpContextMessages(realMessages, humanName);
     const [worldContext, lorebookContext] = await Promise.all([
-        getVectFoxRouterContext(ctx),
+        getVectFoxRouterContext(ctx, { forceEnabled: true, maxChars: 0 }),
         getSelectedWorldInfoContext(ctx),
     ]);
     const lorebookCatalog = await getSelectedWorldInfoCatalog();
 
     return {
         humanName,
-        recentChat,
+        recentChatEntries,
+        recentChat: recentChatEntries.join('\n'),
         worldContext,
         lorebookContext,
         lorebookCatalog,
@@ -2246,21 +2788,35 @@ async function getPlannerContextSnapshot(ctx = SillyTavern.getContext()) {
     };
 }
 
-async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.getContext()) {
-    const sourceChat = Array.isArray(chatHistory) ? chatHistory : (ctx.chat ?? []);
-    const realMessages = sourceChat.filter(m =>
+function getRpContextMessages(chat) {
+    return (Array.isArray(chat) ? chat : []).filter(m =>
         !m.is_system &&
         m.extra?.type !== 'tool_call' &&
         m.extra?.type !== 'tool_response' &&
         m.mes != null &&
         !isBackstageOocMessage(m.mes)
     );
+}
+
+function formatRpContextMessages(messages, humanName = '') {
+    const sanitize = (text) => humanName ? String(text ?? '').replace(/{{user}}/gi, humanName) : String(text ?? '');
+    return (Array.isArray(messages) ? messages : [])
+        .map(message => `${message?.name || 'Unknown'}: ${sanitize(message?.mes || '')}`);
+}
+
+function setRecentChatEntries(target, entries) {
+    const normalized = Array.isArray(entries) ? entries.map(entry => String(entry ?? '')) : [];
+    target.recentChatEntries = normalized;
+    target.recentChat = normalized.join('\n');
+}
+
+async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.getContext()) {
+    const sourceChat = Array.isArray(chatHistory) ? chatHistory : (ctx.chat ?? []);
+    const realMessages = getRpContextMessages(sourceChat);
     const lastSpeaker = realMessages[realMessages.length - 1]?.name || 'Unknown';
-    const contextMessages = realMessages.slice(-config.contextMessages);
     const playerNames = config.characters.map(c => c.name).join(', ');
     const humanName = ctx.name1 || '';
-    const sanitize = (text) => humanName ? String(text ?? '').replace(/{{user}}/gi, humanName) : String(text ?? '');
-    const recentChat = contextMessages.map(m => `${m.name}: ${sanitize(m.mes || '')}`).join('\n');
+    const recentChatEntries = formatRpContextMessages(realMessages, humanName);
     const storyGuide = getStoryGuide(ctx);
     const [worldContext, lorebookContext, lorebookCatalog] = await Promise.all([
         getVectFoxRouterContext(ctx),
@@ -2272,12 +2828,82 @@ async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.ge
         lastSpeaker,
         playerNames,
         humanName,
-        recentChat,
+        recentChatEntries,
+        recentChat: recentChatEntries.join('\n'),
         storyGuide,
         worldContext,
         lorebookContext,
         lorebookCatalog,
     };
+}
+
+function buildPlannerMessages(plannerContext, options = {}) {
+    const plannerPrompt = renderTemplate(config.plannerPrompt || DEFAULT_STORY_PLANNER_PROMPT, {
+        user: plannerContext.humanName,
+    });
+    const contextBlock = `Current StoryGuide:
+${plannerContext.currentGuide || '(empty)'}
+
+Recent chat:
+${plannerContext.recentChat || '(empty)'}
+
+World context:
+${plannerContext.worldContext?.text || '(empty)'}
+
+Selected lorebook context:
+${plannerContext.lorebookContext?.text || '(empty)'}
+
+Selected lorebook catalog:
+${plannerContext.lorebookCatalog?.text || '(empty)'}`;
+
+    if (options.mode === 'ooc') {
+        return [
+            { role: 'system', content: plannerPrompt },
+            {
+                role: 'system',
+                content: 'Planner workspace mode. Respond directly to the operator in OOC. Do not rewrite or replace the StoryGuide unless the operator explicitly asks for that. Do not narrate in-character prose.',
+            },
+            {
+                role: 'system',
+                content: `${contextBlock}
+
+Treat the messages that follow as an ongoing OOC conversation with the operator about this current RP state.`,
+            },
+            ...(Array.isArray(options.priorHistory) ? options.priorHistory : []),
+            { role: 'user', content: String(options.oocRequest ?? '').trim() },
+        ];
+    }
+
+    return [
+        { role: 'system', content: plannerPrompt },
+        {
+            role: 'user',
+            content: `${contextBlock}
+
+Update the StoryGuide now.`,
+        },
+    ];
+}
+
+function logPlannerRequestBudget(mode, profileId, budgetedRequest) {
+    const context = budgetedRequest?.context ?? {};
+    console.log('[SceneDirector] Planner request context', {
+        mode,
+        profileId,
+        budgetSource: budgetedRequest?.budgetSource ?? 'unknown',
+        profileMaxContext: budgetedRequest?.maxContext ?? null,
+        profileMaxOutput: budgetedRequest?.maxOutput ?? null,
+        inputTokenBudget: budgetedRequest?.budget ?? 0,
+        estimatedInputTokens: budgetedRequest?.inputTokens ?? 0,
+        rpMessagesIncluded: context.recentChatEntries?.length ?? 0,
+        vectFoxSource: context.worldContext?.source ?? 'unknown',
+        vectFoxCharacters: context.worldContext?.text?.length ?? 0,
+        vectFoxOriginalCharacters: context.worldContext?.originalLength ?? 0,
+        selectedLorebookCharacters: context.lorebookContext?.text?.length ?? 0,
+        lorebookCatalogCharacters: context.lorebookCatalog?.text?.length ?? 0,
+        storyGuideCharacters: String(context.currentGuide ?? '').length,
+        trimmed: !!budgetedRequest?.trimmed,
+    });
 }
 
 async function updateStoryGuideFromContext(options = {}) {
@@ -2310,49 +2936,18 @@ async function updateStoryGuideFromContext(options = {}) {
         lastError: '',
     });
 
-    const plannerContext = await getPlannerContextSnapshot(ctx);
-    const plannerPrompt = renderTemplate(config.plannerPrompt || DEFAULT_STORY_PLANNER_PROMPT, {
-        user: plannerContext.humanName,
-    });
-
-    const messages = [
-        {
-            role: 'system',
-            content: plannerPrompt,
-        },
-        {
-            role: 'user',
-            content: `Current StoryGuide:
-${plannerContext.currentGuide || '(empty)'}
-
-Recent chat:
-${plannerContext.recentChat || '(empty)'}
-
-World context:
-${plannerContext.worldContext.text || '(empty)'}
-
-Selected lorebook context:
-${plannerContext.lorebookContext.text || '(empty)'}
-
-Selected lorebook catalog:
-${plannerContext.lorebookCatalog.text || '(empty)'}
-
-Last SceneDirector decision:
-${JSON.stringify(sceneDirectorState.lastDecision ?? null, null, 2)}
-
-Update the StoryGuide now.`,
-        },
-    ];
-
     try {
-        updateStoryDirectorState({ lastPlannerPromptMessages: messages });
-        const service = await getConnService();
-        const response = await service.sendRequest(
+        beginRuntimePhase('planner-update', 'StoryGuide update', source, getTimingModelLabel(config.plannerProfileId));
+        const plannerContext = await getPlannerContextSnapshot(ctx);
+        const budgetedRequest = await fitContextMessagesToInputBudget(
             config.plannerProfileId,
-            messages,
-            undefined,
-            { stream: false, extractData: true },
+            plannerContext,
+            currentContext => buildPlannerMessages(currentContext, { mode: 'update' }),
         );
+        const messages = budgetedRequest.messages;
+        logPlannerRequestBudget('update', config.plannerProfileId, budgetedRequest);
+        updateStoryDirectorState({ lastPlannerPromptMessages: messages });
+        const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = extractResponseText(response);
         const updatedGuide = stripMarkdownFence(responseText);
@@ -2371,6 +2966,12 @@ Update the StoryGuide now.`,
         }
 
         saveStoryGuide(updatedGuide, ctx);
+        try {
+            await maybePersistStoryGuideSnapshot(updatedGuide, ctx);
+        } catch (snapshotError) {
+            console.error('[SceneDirector] StoryGuide updated, but snapshot persistence failed:', snapshotError);
+            toastr.warning('StoryGuide atualizado, mas o snapshot nao foi salvo. Veja o console.', EXTENSION_LABEL);
+        }
         setPlannerUserTurnCounter(0, ctx);
         clearBackstageIssue();
         updateStoryDirectorState({
@@ -2397,6 +2998,7 @@ Update the StoryGuide now.`,
         }
         return null;
     } finally {
+        finishRuntimePhase(['planner-update']);
         isStoryGuideUpdateInProgress = false;
     }
 }
@@ -2429,62 +3031,28 @@ async function runPlannerOocRequest() {
     });
 
     try {
+        beginRuntimePhase('planner-ooc', 'Planner OOC', 'Direct planner workspace request', getTimingModelLabel(config.plannerProfileId));
         const plannerContext = await getPlannerContextSnapshot(ctx);
-        const plannerPrompt = renderTemplate(config.plannerPrompt || DEFAULT_STORY_PLANNER_PROMPT, {
-            user: plannerContext.humanName,
-        });
         const priorHistory = Array.isArray(sceneDirectorState.plannerOocHistory)
             ? sceneDirectorState.plannerOocHistory.slice(-12).map(message => ({
                 role: message?.role === 'user' ? 'user' : 'assistant',
                 content: String(message?.content ?? ''),
             }))
             : [];
-        const messages = [
-            {
-                role: 'system',
-                content: plannerPrompt,
-            },
-            {
-                role: 'system',
-                content: 'Planner workspace mode. Respond directly to the operator in OOC. Do not rewrite or replace the StoryGuide unless the operator explicitly asks for that. Do not narrate in-character prose.',
-            },
-            {
-                role: 'system',
-                content: `Current StoryGuide:
-${plannerContext.currentGuide || '(empty)'}
-
-Recent chat:
-${plannerContext.recentChat || '(empty)'}
-
-World context:
-${plannerContext.worldContext.text || '(empty)'}
-
-Selected lorebook context:
-${plannerContext.lorebookContext.text || '(empty)'}
-
-Selected lorebook catalog:
-${plannerContext.lorebookCatalog.text || '(empty)'}
-
-Last SceneDirector decision:
-${JSON.stringify(sceneDirectorState.lastDecision ?? null, null, 2)}
-
-Treat the messages that follow as an ongoing OOC conversation with the operator about this current RP state.`,
-            },
-            ...priorHistory,
-            {
-                role: 'user',
-                content: oocRequest,
-            },
-        ];
+        const budgetedRequest = await fitContextMessagesToInputBudget(
+            config.plannerProfileId,
+            plannerContext,
+            currentContext => buildPlannerMessages(currentContext, {
+                mode: 'ooc',
+                priorHistory,
+                oocRequest,
+            }),
+        );
+        const messages = budgetedRequest.messages;
+        logPlannerRequestBudget('ooc', config.plannerProfileId, budgetedRequest);
 
         updateStoryDirectorState({ lastPlannerPromptMessages: messages });
-        const service = await getConnService();
-        const response = await service.sendRequest(
-            config.plannerProfileId,
-            messages,
-            undefined,
-            { stream: false, extractData: true },
-        );
+        const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
 
@@ -2528,6 +3096,7 @@ Treat the messages that follow as an ongoing OOC conversation with the operator 
         toastr.error('Erro ao falar com o planner. Veja o console.', EXTENSION_LABEL);
         return null;
     } finally {
+        finishRuntimePhase(['planner-ooc']);
         isStoryGuideUpdateInProgress = false;
     }
 }
@@ -2558,6 +3127,7 @@ async function runRouterOocRequest() {
     });
 
     try {
+        beginRuntimePhase('router-ooc', 'Router OOC', 'Direct router workspace request', getTimingModelLabel(config.routerProfileId));
         const routerContext = await getRouterContextSnapshot(ctx.chat, ctx);
         const priorHistory = Array.isArray(sceneDirectorState.routerOocHistory)
             ? sceneDirectorState.routerOocHistory.slice(-12).map(message => ({
@@ -2565,7 +3135,7 @@ async function runRouterOocRequest() {
                 content: String(message?.content ?? ''),
             }))
             : [];
-        const budgetedRequest = await fitRouterMessagesToInputBudget(
+        const budgetedRequest = await fitContextMessagesToInputBudget(
             config.routerProfileId,
             routerContext,
             currentContext => buildRouterMessages(currentContext, {
@@ -2573,6 +3143,7 @@ async function runRouterOocRequest() {
                 priorHistory,
                 oocRequest,
             }),
+            { explicitBudget: config.routerInputTokenBudget },
         );
         const messages = budgetedRequest.messages;
 
@@ -2626,6 +3197,8 @@ async function runRouterOocRequest() {
         });
         toastr.error('Erro ao falar com o router. Veja o console.', EXTENSION_LABEL);
         return null;
+    } finally {
+        finishRuntimePhase(['router-ooc']);
     }
 }
 
@@ -2686,6 +3259,7 @@ async function runDirectedCharacterOoc(targetName, oocText) {
         clearLorebookInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
+        finishRuntimePhase(['character-turn']);
         isProcessing = false;
         unlockChat();
         updateRouterState({
@@ -2709,11 +3283,6 @@ async function handleUserTurnPipeline() {
     const shouldAutoUpdateStoryGuide = !!config.plannerProfileId && userTurnsSincePlannerUpdate >= plannerInterval;
 
     if (shouldAutoUpdateStoryGuide) {
-        console.log('[Backstage] Auto-updating StoryGuide before router run', {
-            userTurnsSincePlannerUpdate,
-            plannerInterval,
-        });
-
         await updateStoryGuideFromContext({
             source: 'auto',
             showMissingProfileToast: false,
@@ -2735,7 +3304,7 @@ async function callRouterAgent(chatHistory) {
     const ctx = SillyTavern.getContext();
     const routerContext = await getRouterContextSnapshot(chatHistory, ctx);
     const contextSummary = {
-        recentMessages: routerContext.recentChat ? routerContext.recentChat.split('\n').filter(Boolean).length : 0,
+        recentMessages: routerContext.recentChatEntries?.length ?? 0,
         worldContextSource: routerContext.worldContext.source,
         worldContextEntries: routerContext.worldContext.entryCount,
         worldContextOriginalLength: routerContext.worldContext.originalLength,
@@ -2750,16 +3319,19 @@ async function callRouterAgent(chatHistory) {
         lastContext: contextSummary,
         lastError: '',
     });
-    const budgetedRequest = await fitRouterMessagesToInputBudget(
+    const budgetedRequest = await fitContextMessagesToInputBudget(
         config.routerProfileId,
         routerContext,
         currentContext => buildRouterMessages(currentContext, {
             mode: 'route',
             forcedSpeaker: forcedRouterSpeaker,
         }),
+        { explicitBudget: config.routerInputTokenBudget },
     );
     const messages = budgetedRequest.messages;
+    contextSummary.recentMessages = budgetedRequest.context?.recentChatEntries?.length ?? 0;
     contextSummary.inputTokenBudget = budgetedRequest.budget;
+    contextSummary.inputTokenBudgetSource = budgetedRequest.budgetSource;
     contextSummary.inputTokens = budgetedRequest.inputTokens;
     contextSummary.inputTrimmed = budgetedRequest.trimmed;
     lastDirectorRequest = cloneDirectorRequestPayload({
@@ -2777,7 +3349,7 @@ async function callRouterAgent(chatHistory) {
     });
 
     try {
-        console.log('[SceneDirector] Router context', contextSummary);
+        beginRuntimePhase('router-request', 'Router request', forcedRouterSpeaker ? `Forced speaker: ${forcedRouterSpeaker}` : 'Normal routing', getTimingModelLabel(config.routerProfileId));
         updateRouterState({ status: 'calling-director' });
 
         const service  = await getConnService();
@@ -2789,7 +3361,6 @@ async function callRouterAgent(chatHistory) {
         );
 
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? null;
-        if (reasoning) console.log('[SceneDirector] Reasoning:', reasoning);
 
         const responseText = extractResponseText(response);
         if (!responseText) {
@@ -2806,7 +3377,6 @@ async function callRouterAgent(chatHistory) {
         }
 
         const decision = parseSceneDirectorDecision(responseText);
-        console.log('[SceneDirector] Decision', decision);
         updateRouterState({
             status: decision.nextSpeaker ? 'decision-ready' : 'no-decision',
             lastReasoning: reasoning ?? '',
@@ -2827,6 +3397,7 @@ async function callRouterAgent(chatHistory) {
         });
         return null;
     } finally {
+        finishRuntimePhase(['router-request']);
         forcedRouterSpeaker = null;
     }
 }
@@ -2838,7 +3409,6 @@ async function triggerChar(char, decision = null, options = {}) {
     fl('→ START', 'triggerChar', `char=${char.name} | last=${lastActiveChar} | profile=${char.profileName}`);
     let ctx = SillyTavern.getContext();
     const targetProfile = resolveCharacterProfileForSwitch(char, ctx);
-    const previousChatLength = Array.isArray(ctx.chat) ? ctx.chat.length : 0;
 
     if (char.name !== lastActiveChar && targetProfile.profileName) {
         lastActiveChar = char.name;
@@ -2846,36 +3416,45 @@ async function triggerChar(char, decision = null, options = {}) {
             char.profileName = targetProfile.profileName;
             saveConfig();
         }
-        fl('  →', 'triggerChar', `/profile await=true "${targetProfile.profileName}" | source=${targetProfile.source}${targetProfile.profileId ? ` | id=${targetProfile.profileId}` : ''}`);
-        await ctx.executeSlashCommandsWithOptions(`/profile await=true "${targetProfile.profileName}"`);
-        ctx = SillyTavern.getContext();
-        let recovered = await waitForChatRecovery(ctx, previousChatLength);
-        let recoveredByReload = false;
 
-        if (!recovered && previousChatLength > 0 && typeof ctx.reloadCurrentChat === 'function') {
-            console.warn('[Backstage] Chat still empty after profile switch; forcing reloadCurrentChat before trigger', {
-                char: char.name,
-                profileName: targetProfile.profileName,
-                previousChatLength,
-                currentChatLength: Array.isArray(ctx.chat) ? ctx.chat.length : 0,
-            });
-            await ctx.reloadCurrentChat();
+        const settleMonitor = beginTriggerSettleMonitor(char.name, targetProfile.profileName);
+        try {
+            fl('  →', 'triggerChar', `/profile await=true "${targetProfile.profileName}" | source=${targetProfile.source}${targetProfile.profileId ? ` | id=${targetProfile.profileId}` : ''}`);
+            await ctx.executeSlashCommandsWithOptions(`/profile await=true "${targetProfile.profileName}"`);
+            const settleResult = await settleMonitor.promise;
             ctx = SillyTavern.getContext();
-            recovered = await waitForChatRecovery(ctx, previousChatLength, 4000);
-            recoveredByReload = recovered;
-        }
 
-        fl('  ←', 'triggerChar', `profile switch done | chatRecovered=${recovered} | recoveredByReload=${recoveredByReload} | chatLength=${Array.isArray(ctx.chat) ? ctx.chat.length : 0}`);
-        if (!recovered) {
-            console.warn('[Backstage] Chat did not recover after profile switch before trigger', {
-                char: char.name,
-                profileName: targetProfile.profileName,
-                previousChatLength,
-                currentChatLength: Array.isArray(ctx.chat) ? ctx.chat.length : 0,
-            });
+            fl('  ←', 'triggerChar', `profile settled | status=${settleResult.status} | events=${settleResult.events.length} | chatLength=${Array.isArray(ctx.chat) ? ctx.chat.length : 0}`);
+            if (settleResult.status === 'timeout') {
+                console.warn('[Backstage] Profile switch settle reached max wait before trigger', {
+                    char: char.name,
+                    profileName: targetProfile.profileName,
+                    quietMs: settleResult.quietMs,
+                    maxWaitMs: settleResult.maxWaitMs,
+                    events: settleResult.events,
+                });
+            }
+        } catch (error) {
+            clearActiveTriggerSettleMonitor();
+            throw error;
         }
     } else {
         lastActiveChar = char.name;
+        updateRouterState({
+            triggerSettle: {
+                status: 'skipped',
+                note: 'Profile already active. No settle wait was needed.',
+                charName: char.name,
+                profileName: targetProfile.profileName || char.profileName || '',
+                quietMs: PROFILE_SWITCH_SETTLE_QUIET_MS,
+                maxWaitMs: PROFILE_SWITCH_SETTLE_MAX_WAIT_MS,
+                startedAt: new Date(),
+                deadlineAt: new Date(),
+                lastEventAt: null,
+                lastEventName: '',
+                events: [],
+            },
+        });
     }
 
     setCharacterNote(char.name);
@@ -2883,22 +3462,13 @@ async function triggerChar(char, decision = null, options = {}) {
     await applyLorebookInjectionForCharacter(char.name);
     setDirectedOocPrompt(char.name, options.directOocText);
     clearSceneDirection();
-
-    fl('  ✓', 'triggerChar', 'direction aplicada — aguardando settle final de 250ms');
-    await new Promise(r => setTimeout(r, 250));
-
-    const currentChat = Array.isArray(ctx.chat) ? ctx.chat : [];
-    console.log('[Backstage] triggerChar pre-trigger chat snapshot', {
-        char: char.name,
-        chatLength: currentChat.length,
-        lastMessages: currentChat.slice(-3).map(message => ({
-            name: message?.name,
-            is_user: !!message?.is_user,
-            is_system: !!message?.is_system,
-            type: message?.extra?.type ?? '',
-            mesStart: String(message?.mes ?? '').slice(0, 120),
-        })),
-    });
+    beginRuntimePhase(
+        'character-turn',
+        `Character turn: ${char.name}`,
+        targetProfile.profileName ? `Profile ${targetProfile.profileName}` : '',
+        getTimingModelLabel(char.profileId, targetProfile.profileName || char.profileName || ''),
+    );
+    updateRouterState({ status: 'executing' });
 
     fl('  →', 'triggerChar', `/trigger "${char.name}"`);
     ctx.executeSlashCommandsWithOptions(`/trigger "${char.name}"`);
@@ -2909,20 +3479,7 @@ async function triggerChar(char, decision = null, options = {}) {
 
 async function executeDecision(decision, caller = 'unknown') {
     const nextSpeaker = typeof decision === 'string' ? decision : decision?.nextSpeaker;
-    const direction = typeof decision === 'object' ? decision?.direction : '';
-    const scenePressure = typeof decision === 'object' ? decision?.scenePressure : '';
-    const avoid = typeof decision === 'object' ? decision?.avoid : '';
-
     fl('→ START', 'executeDecision', `caller=${caller} | nextSpeaker="${nextSpeaker}"`);
-    if (direction || scenePressure || avoid) {
-        console.log('[SceneDirector] Direction for next turn', {
-            nextSpeaker,
-            reason: decision?.reason ?? '',
-            direction,
-            scenePressure,
-            avoid,
-        });
-    }
     updateRouterState({
         status: 'executing',
         lastDecision: typeof decision === 'string'
@@ -3017,6 +3574,57 @@ function formatPanelTime(value) {
     return value.toLocaleTimeString();
 }
 
+function formatDurationMs(value) {
+    const ms = Math.max(0, Number(value) || 0);
+    if (!ms) return '0.0s';
+
+    const totalSeconds = ms / 1000;
+    if (totalSeconds < 60) {
+        return `${totalSeconds.toFixed(1)}s`;
+    }
+
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}m ${seconds.toFixed(1)}s`;
+}
+
+function getRuntimeTimingView(now = new Date()) {
+    const timing = cloneRuntimeTiming();
+    const activeElapsedMs = timing.activeStartedAt ? Math.max(0, now.getTime() - timing.activeStartedAt.getTime()) : null;
+    const activeRouter = timing.activeKind === 'router-request' || timing.activeKind === 'router-ooc';
+    const activePlanner = timing.activeKind === 'planner-update' || timing.activeKind === 'planner-ooc';
+    const activeCharacter = timing.activeKind === 'character-turn';
+
+    return {
+        activeLabel: timing.activeLabel || 'Idle',
+        activeDetail: timing.activeDetail || '',
+        activeElapsedText: activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : 'Idle',
+        lastCompletedLabel: timing.lastCompletedLabel || 'None yet',
+        lastCompletedDurationText: timing.lastCompletedMs != null ? formatDurationMs(timing.lastCompletedMs) : 'n/a',
+        lastCompletedAtText: timing.lastCompletedAt ? formatPanelTime(timing.lastCompletedAt) : 'never',
+        lastRouterText: timing.lastRouterMs != null ? formatDurationMs(timing.lastRouterMs) : 'n/a',
+        lastPlannerText: timing.lastPlannerMs != null ? formatDurationMs(timing.lastPlannerMs) : 'n/a',
+        lastCharacterText: timing.lastCharacterMs != null ? formatDurationMs(timing.lastCharacterMs) : 'n/a',
+        rows: [
+            {
+                step: 'Router',
+                model: activeRouter ? (timing.activeModel || '-') : (timing.lastRouterModel || '-'),
+                time: activeRouter ? (activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : '0.0s') : (timing.lastRouterMs != null ? formatDurationMs(timing.lastRouterMs) : 'n/a'),
+            },
+            {
+                step: 'Planner',
+                model: activePlanner ? (timing.activeModel || '-') : (timing.lastPlannerModel || '-'),
+                time: activePlanner ? (activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : '0.0s') : (timing.lastPlannerMs != null ? formatDurationMs(timing.lastPlannerMs) : 'n/a'),
+            },
+            {
+                step: 'Character',
+                model: activeCharacter ? (timing.activeModel || '-') : (timing.lastCharacterModel || '-'),
+                time: activeCharacter ? (activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : '0.0s') : (timing.lastCharacterMs != null ? formatDurationMs(timing.lastCharacterMs) : 'n/a'),
+            },
+        ],
+    };
+}
+
 function formatStateLabel(value) {
     const normalized = String(value ?? 'idle').trim();
     if (!normalized) return 'idle';
@@ -3035,13 +3643,16 @@ function getStatusTone(value) {
         normalized.includes('running')
         || normalized.includes('calling')
         || normalized.includes('building')
+        || normalized.includes('settling')
         || normalized.includes('executing')
         || normalized.includes('updating')
     ) {
         return 'info';
     }
+    if (normalized.includes('timeout')) return 'warning';
     if (
         normalized.includes('ready')
+        || normalized.includes('settled')
         || normalized.includes('updated')
         || normalized.includes('decision')
     ) {
@@ -3080,6 +3691,7 @@ function isActiveStatus(value) {
         'running',
         'building-context',
         'calling-director',
+        'settling-profile',
         'executing',
         'direct-ooc',
         'blocked-processing',
@@ -3090,9 +3702,12 @@ function isActiveStatus(value) {
 }
 
 function getTogglePipelineStatus() {
+    const runtimeView = getRuntimeTimingView();
     const directorStatus = String(sceneDirectorState.directorStatus ?? '').toLowerCase();
     if (isActiveStatus(directorStatus)) {
-        return 'Director';
+        return runtimeView.activeElapsedText !== 'Idle'
+            ? `Director ${runtimeView.activeElapsedText}`
+            : 'Director';
     }
 
     const routerStatus = String(sceneDirectorState.routerStatus ?? '').toLowerCase();
@@ -3111,15 +3726,20 @@ function getTogglePipelineStatus() {
             String(SillyTavern.getContext()?.name1 ?? '').trim().toLowerCase(),
         ].filter(Boolean);
 
-        return playerNames.includes(lowered) ? 'Your turn' : nextSpeaker;
+        const base = playerNames.includes(lowered) ? 'Your turn' : nextSpeaker;
+        return runtimeView.activeElapsedText !== 'Idle'
+            ? `${base} ${runtimeView.activeElapsedText}`
+            : base;
     }
 
-    if (routerStatus === 'calling-director') return 'Router';
-    if (routerStatus === 'building-context' || routerStatus === 'running') return 'Routing';
-    if (routerStatus === 'blocked-processing') return lastActiveChar || 'Busy';
+    if (routerStatus === 'calling-director') return runtimeView.activeElapsedText !== 'Idle' ? `Router ${runtimeView.activeElapsedText}` : 'Router';
+    if (routerStatus === 'building-context' || routerStatus === 'running') return runtimeView.activeElapsedText !== 'Idle' ? `Routing ${runtimeView.activeElapsedText}` : 'Routing';
+    if (routerStatus === 'blocked-processing') return runtimeView.activeElapsedText !== 'Idle' ? `${lastActiveChar || 'Busy'} ${runtimeView.activeElapsedText}` : (lastActiveChar || 'Busy');
 
     if (isProcessing && lastActiveChar) {
-        return lastActiveChar;
+        return runtimeView.activeElapsedText !== 'Idle'
+            ? `${lastActiveChar} ${runtimeView.activeElapsedText}`
+            : lastActiveChar;
     }
 
     if (String(sceneDirectorState.persistentIssue ?? '').trim()) {
@@ -3139,6 +3759,26 @@ function renderStatCard(label, value, note = '') {
     `;
 }
 
+function renderRuntimeTimingCard() {
+    const view = getRuntimeTimingView();
+    return renderCard('Turn Timing', 'Step, model and time.', `
+        <div class="sd-timing-list">
+            <div class="sd-timing-row sd-timing-row--head">
+                <span>Step</span>
+                <span>Model</span>
+                <span>Time</span>
+            </div>
+            ${view.rows.map((row, index) => `
+                <div class="sd-timing-row" data-runtime-row="${index}">
+                    <span id="sd-runtime-step-${index}">${escapeHtml(row.step)}</span>
+                    <span id="sd-runtime-model-${index}">${escapeHtml(row.model)}</span>
+                    <span id="sd-runtime-time-${index}">${escapeHtml(row.time)}</span>
+                </div>
+            `).join('')}
+        </div>
+    `);
+}
+
 function renderCard(title, subtitle, body, options = {}) {
     const extraClass = options.extraClass ? ` ${options.extraClass}` : '';
     const actions = options.actions ? `<div class="sd-card-actions">${options.actions}</div>` : '';
@@ -3156,6 +3796,15 @@ function renderCard(title, subtitle, body, options = {}) {
                 ${body}
             </div>
         </section>
+    `;
+}
+
+function renderEditorMeta(note, counterId) {
+    return `
+        <div class="sd-editor-meta">
+            <div class="sd-footnote">${escapeHtml(note)}</div>
+            <div id="${escapeHtml(counterId)}" class="sd-token-counter">-</div>
+        </div>
     `;
 }
 
@@ -3241,6 +3890,34 @@ function renderContextSummary(context) {
         <div class="sd-kv"><span>input tokens</span><b>${escapeHtml(context.inputTokens ?? 0)}</b></div>
         <div class="sd-kv"><span>budget trim</span><b>${context.inputTrimmed ? 'true' : 'false'}</b></div>
         <div class="sd-source">${escapeHtml(context.worldContextSource || '')}</div>
+    `;
+}
+
+function renderTriggerSettleSummary(state) {
+    if (!state) {
+        return '<div class="sd-muted">No trigger settle recorded yet.</div>';
+    }
+
+    const events = Array.isArray(state.events) ? state.events : [];
+    const eventLines = events.length
+        ? events.map((event) => {
+            const when = event?.at ? formatPanelTime(new Date(event.at)) : '--:--';
+            const detail = String(event?.detail ?? '').trim();
+            return `${when} | ${String(event?.name ?? '').trim()}${detail ? ` | ${detail}` : ''}`;
+        }).join('\n')
+        : 'No settle-reset events captured.';
+
+    return `
+        <div class="sd-kv"><span>Status</span><b>${escapeHtml(formatStateLabel(state.status || 'idle'))}</b></div>
+        <div class="sd-kv"><span>Character</span><b>${escapeHtml(state.charName || '')}</b></div>
+        <div class="sd-kv"><span>Profile</span><b>${escapeHtml(state.profileName || '')}</b></div>
+        <div class="sd-kv"><span>Anchor</span><b>${state.anchorSeen ? escapeHtml(state.anchorEventName || 'seen') : 'waiting for CHAT_CHANGED'}</b></div>
+        <div class="sd-kv"><span>Quiet window</span><b>${escapeHtml(`${Number(state.quietMs) || 0} ms`)}</b></div>
+        <div class="sd-kv"><span>Max wait</span><b>${escapeHtml(`${Number(state.maxWaitMs) || 0} ms`)}</b></div>
+        <div class="sd-kv"><span>Started</span><b>${escapeHtml(formatPanelTime(state.startedAt))}</b></div>
+        <div class="sd-kv"><span>Last event</span><b>${escapeHtml(state.lastEventName || 'none')}</b></div>
+        <div class="sd-footnote">${escapeHtml(state.note || '')}</div>
+        <pre class="sd-console">${escapeHtml(eventLines)}</pre>
     `;
 }
 
@@ -3348,6 +4025,8 @@ function renderRouterWorkspacePanel(capturedPrompt) {
                 ${renderCard('Context Snapshot', 'What the router used when building the request.', renderContextSummary(sceneDirectorState.lastContext))}
             </div>
 
+            ${renderCard('Trigger Settle', 'After a profile switch, Backstage waits for a quiet event window before /trigger.', renderTriggerSettleSummary(sceneDirectorState.triggerSettle))}
+
             ${renderCard('Router Injection', 'Preview of the private directive that will be injected into the selected character.', renderRouterInjectionPreview(sceneDirectorState.lastDecision))}
 
             ${renderDisclosure('Router Response', 'Resposta direta da ultima chamada OOC ao router ou da ultima execucao capturada.', `
@@ -3373,16 +4052,9 @@ function renderRouterConfigPanel(castCount) {
                 <label>Connection profile</label>
                 <select id="router-profile-dropdown" class="text_pole"></select>
 
-                <div class="sd-row">
-                    <div>
-                        <label>Context messages</label>
-                        <input type="number" id="router-context" class="text_pole" min="1" max="50" value="${config.contextMessages}">
-                    </div>
-                    <div>
-                        <label>Input token budget</label>
-                        <input type="number" id="router-input-token-budget" class="text_pole" min="0" max="20000" step="100" value="${config.routerInputTokenBudget}">
-                    </div>
-                </div>
+                <label>Input token budget (0 = connection preset)</label>
+                <input type="number" id="router-input-token-budget" class="text_pole" min="0" max="2000000" step="1000" value="${config.routerInputTokenBudget}">
+                <div class="sd-footnote">The newest RP messages fill the available input after the planner/router prompt and VectFox context.</div>
 
                 <label>VectFox world context chars (0 = disabled)</label>
                 <input type="number" id="router-world-context-chars" class="text_pole" min="0" max="30000" step="500" value="${config.worldContextChars}">
@@ -3416,7 +4088,7 @@ function renderRouterConfigPanel(castCount) {
         </div>
         ${renderCard('Router Prompt Template', 'Editable system prompt used by the turn router.', `
             <textarea id="router-prompt" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(config.routerPrompt)}</textarea>
-            <div class="sd-footnote">Autosaves when focus leaves the field.</div>
+            ${renderEditorMeta('Autosaves when focus leaves the field.', 'router-prompt-token-counter')}
         `)}
     `;
 }
@@ -3462,6 +4134,8 @@ function renderRouterWorkspace() {
                 ${renderStatCard('Captured Prompt', sceneDirectorState.lastPromptMessages?.length ? 'Yes' : 'No', 'Latest router request payload')}
             </div>
 
+            ${renderRuntimeTimingCard()}
+
             ${routerView === 'config'
                 ? renderRouterConfigPanel(castCount)
                 : renderRouterWorkspacePanel(capturedPrompt)}
@@ -3497,7 +4171,7 @@ function renderStoryDirectorWorkspacePanel(storyGuide, capturedPrompt) {
 
             ${renderDisclosure('StoryGuide', 'Estado privado persistido em chat metadata para este chat.', `
                 <textarea id="scene-director-story-guide" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(storyGuide)}</textarea>
-                <div class="sd-footnote">Autosaves when focus leaves the field.</div>
+                ${renderEditorMeta('Autosaves when focus leaves the field.', 'scene-director-story-guide-token-counter')}
             `)}
         </div>
     `;
@@ -3529,7 +4203,7 @@ function renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, 
             `)}
             ${renderCard('Template', 'Editable system prompt used by the Story Director planner.', `
                 <textarea id="planner-prompt" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(config.plannerPrompt)}</textarea>
-                <div class="sd-footnote">Autosaves when focus leaves the field.</div>
+                ${renderEditorMeta('Autosaves when focus leaves the field.', 'planner-prompt-token-counter')}
             `)}
         </div>
     `;
@@ -3537,6 +4211,7 @@ function renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, 
 
 function renderStoryDirectorWorkspace() {
     const storyGuide = getStoryGuide();
+    const storyGuideSnapshots = getStoryGuideSnapshots();
     const selectedCount = Array.isArray(config.plannerWorldInfoBooks) ? config.plannerWorldInfoBooks.length : 0;
     const capturedPrompt = formatPromptMessages(sceneDirectorState.lastPlannerPromptMessages);
     const plannerTurnsSinceUpdate = getPlannerUserTurnCounter();
@@ -3565,6 +4240,8 @@ function renderStoryDirectorWorkspace() {
                 <button id="planner-send-ooc-toolbar" class="menu_button primary">Send OOC</button>
                 <button id="scene-director-update-story-guide" class="menu_button primary">Update StoryGuide</button>
                 <button id="scene-director-copy-story-guide" class="menu_button">Copy StoryGuide</button>
+                <button id="scene-director-copy-story-guide-snapshot-1" class="menu_button" ${storyGuideSnapshots.length < 1 ? 'disabled' : ''}>Copy Snapshot 1</button>
+                <button id="scene-director-copy-story-guide-snapshot-2" class="menu_button" ${storyGuideSnapshots.length < 2 ? 'disabled' : ''}>Copy Snapshot 2</button>
                 <button id="scene-director-clear-director" class="menu_button">Clear Director Console</button>
             </div>
 
@@ -3582,6 +4259,8 @@ function renderStoryDirectorWorkspace() {
                 ${renderStatCard('Auto Update In', String(turnsUntilAutoUpdate), `Every ${plannerInterval} user turns`)}
                 ${renderStatCard('Last StoryGuide Save', storyGuideUpdatedAt, 'Timestamp from chat metadata')}
             </div>
+
+            ${renderRuntimeTimingCard()}
 
             ${directorView === 'config'
                 ? renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, turnsUntilAutoUpdate, storyGuideUpdatedAt)
@@ -3638,6 +4317,9 @@ function refreshSceneDirectorPanel() {
             initPlannerWorldInfoSelect();
         }
     }
+
+    refreshVisiblePromptTokenCounters();
+    updateRuntimeTimingUi();
 }
 
 function startToggleStatusTicker() {
@@ -3650,6 +4332,7 @@ function startToggleStatusTicker() {
         $('#scene-director-toggle-status')
             .text(toggleStatusText)
             .attr('title', sceneDirectorState.persistentIssue ? `${sceneDirectorState.persistentIssueSource || 'Issue'}: ${sceneDirectorState.persistentIssue}` : toggleStatusText);
+        updateRuntimeTimingUi();
     }, 400);
 }
 
@@ -3717,8 +4400,92 @@ function preserveVisiblePanelDrafts() {
     }
 }
 
+function setPromptTokenCounterText(counterId, text) {
+    const counter = document.getElementById(counterId);
+    if (counter) {
+        counter.textContent = text;
+    }
+}
+
+function schedulePromptTokenCounterUpdate(textareaId, counterId) {
+    if (!textareaId || !counterId) {
+        return;
+    }
+
+    const textarea = document.getElementById(textareaId);
+    const counter = document.getElementById(counterId);
+    if (!textarea || !counter) {
+        return;
+    }
+
+    const currentVersion = (promptTokenCounterVersions.get(counterId) || 0) + 1;
+    promptTokenCounterVersions.set(counterId, currentVersion);
+
+    const existingTimer = promptTokenCounterTimers.get(counterId);
+    if (existingTimer) {
+        clearTimeout(existingTimer);
+    }
+
+    setPromptTokenCounterText(counterId, '...');
+
+    const timerId = window.setTimeout(async () => {
+        const value = String(textarea.value ?? '');
+        const latestVersion = promptTokenCounterVersions.get(counterId);
+        if (latestVersion !== currentVersion) {
+            return;
+        }
+
+        if (!value.trim()) {
+            setPromptTokenCounterText(counterId, '0 tokens');
+            return;
+        }
+
+        try {
+            const tokens = await SillyTavern.getContext().getTokenCountAsync(value);
+            if (promptTokenCounterVersions.get(counterId) !== currentVersion) {
+                return;
+            }
+
+            setPromptTokenCounterText(counterId, `${Number(tokens) || 0} tokens`);
+        } catch {
+            if (promptTokenCounterVersions.get(counterId) !== currentVersion) {
+                return;
+            }
+
+            setPromptTokenCounterText(counterId, '? tokens');
+        }
+    }, 180);
+
+    promptTokenCounterTimers.set(counterId, timerId);
+}
+
+function refreshVisiblePromptTokenCounters() {
+    schedulePromptTokenCounterUpdate('router-prompt', 'router-prompt-token-counter');
+    schedulePromptTokenCounterUpdate('planner-prompt', 'planner-prompt-token-counter');
+    schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
+}
+
+function updateRuntimeTimingUi() {
+    const view = getRuntimeTimingView();
+
+    view.rows.forEach((row, index) => {
+        const stepElement = document.getElementById(`sd-runtime-step-${index}`);
+        const modelElement = document.getElementById(`sd-runtime-model-${index}`);
+        const timeElement = document.getElementById(`sd-runtime-time-${index}`);
+
+        if (stepElement) {
+            stepElement.textContent = row.step;
+        }
+        if (modelElement) {
+            modelElement.textContent = row.model;
+        }
+        if (timeElement) {
+            timeElement.textContent = row.time;
+        }
+    });
+}
+
 function persistDirectorPanelFields() {
-    const routerContext = $('#router-context');
     const routerInputTokenBudget = $('#router-input-token-budget');
     const routerWorldContextChars = $('#router-world-context-chars');
     const routerPrompt = $('#router-prompt');
@@ -3729,9 +4496,6 @@ function persistDirectorPanelFields() {
 
     if ($('#router-profile-dropdown').length) {
         config.routerProfileId = $('#router-profile-dropdown').val() || config.routerProfileId;
-    }
-    if (routerContext.length) {
-        config.contextMessages = Math.max(1, parseInt(routerContext.val()) || DEFAULT_CONFIG.contextMessages);
     }
     if (routerInputTokenBudget.length) {
         config.routerInputTokenBudget = Math.max(0, parseInt(routerInputTokenBudget.val()) || 0);
@@ -3791,6 +4555,25 @@ function attachFloatingPanelEvents() {
     $('#scene-director-close').on('click', () => {
         updateSceneDirectorState({ panelOpen: false });
     });
+    $(document).off('mousedown.backstagePanelDismiss').on('mousedown.backstagePanelDismiss', (event) => {
+        if (!sceneDirectorState.panelOpen) {
+            return;
+        }
+
+        const root = document.getElementById('scene-director-floating-root');
+        if (!root) {
+            return;
+        }
+
+        if (root.contains(event.target)) {
+            return;
+        }
+
+        preserveVisiblePanelDrafts();
+        persistDirectorPanelFields();
+        persistPlannerPanelFields();
+        updateSceneDirectorState({ panelOpen: false });
+    });
     $('#scene-director-panel-body').on('click', '[data-stage]', function () {
         preserveVisiblePanelDrafts();
         updateSceneDirectorState({ activeTab: $(this).data('stage') || 'router' });
@@ -3804,9 +4587,11 @@ function attachFloatingPanelEvents() {
         updateStoryDirectorState({ directorView: $(this).data('director-view') || 'workspace' });
     });
     $('#scene-director-panel-body').on('click', '#scene-director-run', async () => {
+        persistDirectorPanelFields();
         await runRouter('floating-panel');
     });
     $('#scene-director-panel-body').on('click', '#scene-director-test-director', async () => {
+        persistDirectorPanelFields();
         const ctx = SillyTavern.getContext();
         toastr.info('Running router test...', EXTENSION_LABEL);
         const decision = await callRouterAgent(ctx.chat);
@@ -3820,6 +4605,7 @@ function attachFloatingPanelEvents() {
         await copyDirectorPromptToClipboard();
     });
     $('#scene-director-panel-body').on('click', '#scene-director-clear-router', () => {
+        clearActiveTriggerSettleMonitor();
         updateRouterState({
             status: 'idle',
             lastContext: null,
@@ -3830,6 +4616,7 @@ function attachFloatingPanelEvents() {
             routerOocDraft: ROUTER_OOC_DEFAULT_DRAFT,
             routerOocHistory: [],
             lastError: '',
+            triggerSettle: null,
         });
         clearBackstageIssue();
     });
@@ -3888,10 +4675,21 @@ function attachFloatingPanelEvents() {
         await navigator.clipboard.writeText(getStoryGuide());
         toastr.success('StoryGuide copiado.', EXTENSION_LABEL);
     });
-    $('#scene-director-panel-body').on('focusout', '#router-context, #router-input-token-budget, #router-world-context-chars, #router-prompt', () => {
+    $('#scene-director-panel-body').on('click', '#scene-director-copy-story-guide-snapshot-1', async () => {
+        persistPlannerPanelFields();
+        await copyStoryGuideSnapshot(0);
+    });
+    $('#scene-director-panel-body').on('click', '#scene-director-copy-story-guide-snapshot-2', async () => {
+        persistPlannerPanelFields();
+        await copyStoryGuideSnapshot(1);
+    });
+    $('#scene-director-panel-body').on('focusout', '#router-input-token-budget, #router-world-context-chars, #router-prompt', () => {
         persistDirectorPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#router-context, #router-input-token-budget, #router-world-context-chars', () => {
+    $('#scene-director-panel-body').on('input', '#router-prompt', () => {
+        schedulePromptTokenCounterUpdate('router-prompt', 'router-prompt-token-counter');
+    });
+    $('#scene-director-panel-body').on('change', '#router-input-token-budget, #router-world-context-chars', () => {
         persistDirectorPanelFields();
     });
     $('#scene-director-panel-body').on('change', '#router-timed-lorebook-book', async () => {
@@ -3938,6 +4736,12 @@ function attachFloatingPanelEvents() {
     });
     $('#scene-director-panel-body').on('focusout', '#planner-user-turn-interval, #planner-prompt, #scene-director-story-guide', () => {
         persistPlannerPanelFields();
+    });
+    $('#scene-director-panel-body').on('input', '#planner-prompt', () => {
+        schedulePromptTokenCounterUpdate('planner-prompt', 'planner-prompt-token-counter');
+    });
+    $('#scene-director-panel-body').on('input', '#scene-director-story-guide', () => {
+        schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
     });
     $('#scene-director-panel-body').on('change', '#planner-user-turn-interval', () => {
         persistPlannerPanelFields();
@@ -4275,6 +5079,8 @@ jQuery(document).ready(async () => {
         clearLorebookInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
+        clearActiveTriggerSettleMonitor();
+        finishRuntimePhase(['character-turn']);
         skipNextCharacterAutoRouter = false;
         isProcessing = false;
         fl('  ✓', 'GENERATION_ENDED', 'isProcessing liberado');
@@ -4294,6 +5100,8 @@ jQuery(document).ready(async () => {
         clearLorebookInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
+        clearActiveTriggerSettleMonitor();
+        finishRuntimePhase(['character-turn']);
         skipNextCharacterAutoRouter = false;
         pendingAutoRouter = false;
         isProcessing = false;
@@ -4301,108 +5109,61 @@ jQuery(document).ready(async () => {
     });
 
     ctx.eventSource.on(ctx.event_types.GROUP_MEMBER_DRAFTED, (charName) => {
-        fl('← EVT', 'GROUP_MEMBER_DRAFTED', `char=${charName}`);
         lastActiveChar = charName;
     });
 
     ctx.eventSource.on(ctx.event_types.CHAT_COMPLETION_PROMPT_READY, ({ chat, dryRun }) => {
         if (dryRun) return;
 
-
         const noteMsg    = chat.findLast(m => m.role === 'system' && m.content?.includes('Write the next reply only as '));
         const match      = noteMsg?.content?.match(/Write the next reply only as (.+?)\./);
         const activeChar = match?.[1];
 
-        const beforeSummary = {
-            total: Array.isArray(chat) ? chat.length : 0,
-            system: Array.isArray(chat) ? chat.filter(m => m.role === 'system').length : 0,
-            user: Array.isArray(chat) ? chat.filter(m => m.role === 'user').length : 0,
-            assistant: Array.isArray(chat) ? chat.filter(m => m.role === 'assistant').length : 0,
-            nonSystemPreview: Array.isArray(chat)
-                ? chat
-                    .filter(m => m.role !== 'system')
-                    .slice(0, 6)
-                    .map(m => ({
-                        role: m.role,
-                        contentStart: String(m.content ?? '').slice(0, 120),
-                    }))
-                : [],
-        };
-
-        // Sempre remapeia: só o personagem ativo fica como assistant, todos os outros viram user
         if (activeChar) {
-            let remapped = 0;
+            const normalizedActiveChar = String(activeChar).trim().toLocaleLowerCase();
             for (const msg of chat) {
                 if (msg.role !== 'assistant') continue;
-                if (!String(msg.content ?? '').startsWith(activeChar + ':')) {
+                const messageName = String(msg.name ?? '').trim().toLocaleLowerCase();
+                const contentHasActivePrefix = String(msg.content ?? '')
+                    .trimStart()
+                    .toLocaleLowerCase()
+                    .startsWith(`${normalizedActiveChar}:`);
+                const belongsToActiveCharacter = messageName
+                    ? messageName === normalizedActiveChar
+                    : contentHasActivePrefix;
+
+                if (!belongsToActiveCharacter) {
                     msg.role = 'user';
-                    remapped++;
                 }
             }
-            const afterSummary = {
-                total: Array.isArray(chat) ? chat.length : 0,
-                system: Array.isArray(chat) ? chat.filter(m => m.role === 'system').length : 0,
-                user: Array.isArray(chat) ? chat.filter(m => m.role === 'user').length : 0,
-                assistant: Array.isArray(chat) ? chat.filter(m => m.role === 'assistant').length : 0,
-                nonSystemPreview: Array.isArray(chat)
-                    ? chat
-                        .filter(m => m.role !== 'system')
-                        .slice(0, 6)
-                        .map(m => ({
-                            role: m.role,
-                            contentStart: String(m.content ?? '').slice(0, 120),
-                        }))
-                    : [],
-            };
-            console.log('[Backstage] CHAT_COMPLETION_PROMPT_READY summary', {
-                activeChar,
-                remapped,
-                before: beforeSummary,
-                after: afterSummary,
-            });
-            if (afterSummary.user + afterSummary.assistant === 0) {
-                console.warn('[Backstage] Prompt ready without non-system chat messages for active character', {
-                    activeChar,
-                    before: beforeSummary,
-                    after: afterSummary,
-                });
-            }
         }
-
     });
 
     ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, () => {
-        fl('← EVT', 'CHAT_CHANGED', `isProcessing=${isProcessing} | lastActiveChar=${lastActiveChar}`);
+        noteTriggerSettleEvent('CHAT_CHANGED', `isProcessing=${isProcessing}`);
         lastActiveChar = null;
         loadGroupMembers();
     });
 
     ctx.eventSource.on(ctx.event_types.MAIN_API_CHANGED, (payload) => {
-        if (!isProcessing) return;
-        fl('← EVT', 'MAIN_API_CHANGED', `api=${payload?.apiId ?? ''} | lastActiveChar=${lastActiveChar}`);
+        noteTriggerSettleEvent('MAIN_API_CHANGED', payload?.apiId ?? '');
     });
 
     ctx.eventSource.on(ctx.event_types.CHATCOMPLETION_SOURCE_CHANGED, (payload) => {
-        if (!isProcessing) return;
-        fl('← EVT', 'CHATCOMPLETION_SOURCE_CHANGED', `source=${payload?.source ?? payload ?? ''} | lastActiveChar=${lastActiveChar}`);
+        noteTriggerSettleEvent('CHATCOMPLETION_SOURCE_CHANGED', payload?.source ?? payload ?? '');
     });
 
     ctx.eventSource.on(ctx.event_types.OAI_PRESET_CHANGED_BEFORE, (payload) => {
-        if (!isProcessing) return;
-        fl('← EVT', 'OAI_PRESET_CHANGED_BEFORE', `payload=${JSON.stringify(payload ?? {})}`);
+        noteTriggerSettleEvent('OAI_PRESET_CHANGED_BEFORE', payload?.preset ?? payload?.name ?? '');
     });
 
     ctx.eventSource.on(ctx.event_types.OAI_PRESET_CHANGED_AFTER, (payload) => {
-        if (!isProcessing) return;
-        fl('← EVT', 'OAI_PRESET_CHANGED_AFTER', `payload=${JSON.stringify(payload ?? {})}`);
+        noteTriggerSettleEvent('OAI_PRESET_CHANGED_AFTER', payload?.preset ?? payload?.name ?? '');
     });
 
     ctx.eventSource.on(ctx.event_types.CONNECTION_PROFILE_LOADED, (profileName) => {
-        if (!isProcessing) return;
-        fl('← EVT', 'CONNECTION_PROFILE_LOADED', `profile=${profileName ?? ''} | lastActiveChar=${lastActiveChar}`);
+        noteTriggerSettleEvent('CONNECTION_PROFILE_LOADED', profileName ?? '');
     });
 
     loadGroupMembers();
-
-    console.log('[SceneDirector] Pronto!');
 });
