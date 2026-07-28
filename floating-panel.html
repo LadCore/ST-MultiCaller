@@ -238,6 +238,29 @@
         font-weight: 800;
     }
 
+    #scene-director-panel .sd-stage-title-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        width: 100%;
+    }
+
+    #scene-director-panel .sd-stage-alert {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 22px;
+        height: 22px;
+        padding: 0 6px;
+        border: 1px solid rgba(255, 142, 120, 0.28);
+        border-radius: 999px;
+        background: rgba(255, 142, 120, 0.14);
+        color: #ffd0c6;
+        font-size: 11px;
+        font-weight: 800;
+    }
+
     #scene-director-panel .sd-stage-copy {
         color: var(--sd-text-dim);
         line-height: 1.4;
@@ -580,31 +603,129 @@
         white-space: nowrap;
     }
 
-    #scene-director-panel .sd-timing-list {
+    #scene-director-panel .sd-template-tags {
         display: flex;
-        flex-direction: column;
+        flex-wrap: wrap;
         gap: 6px;
+        margin-top: 12px;
     }
 
-    #scene-director-panel .sd-timing-row {
+    #scene-director-panel .sd-template-tags code {
+        padding: 4px 7px;
+        border: 1px solid rgba(108, 196, 255, 0.18);
+        border-radius: 5px;
+        background: rgba(108, 196, 255, 0.07);
+        color: #d7efff;
+        font-size: 11px;
+        line-height: 1.2;
+    }
+
+    #scene-director-panel .sd-log-table {
+        overflow-x: auto;
+    }
+
+    #scene-director-panel .sd-log-row {
         display: grid;
-        grid-template-columns: 110px minmax(0, 1fr) 90px;
+        grid-template-columns: 76px minmax(150px, 1.2fr) minmax(160px, 1fr) 90px 118px;
         gap: 12px;
         align-items: center;
+        min-width: 720px;
+        padding: 10px 12px;
     }
 
-    #scene-director-panel .sd-timing-row span {
+    #scene-director-panel .sd-log-row > span {
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
     }
 
-    #scene-director-panel .sd-timing-row--head {
+    #scene-director-panel .sd-log-row--head {
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.08em;
         color: var(--sd-text-dim);
+    }
+
+    #scene-director-panel .sd-log-entry {
+        min-width: 720px;
+        border-top: 1px solid rgba(255, 255, 255, 0.07);
+    }
+
+    #scene-director-panel .sd-log-entry > summary {
+        cursor: pointer;
+        list-style: none;
+    }
+
+    #scene-director-panel .sd-log-entry > summary::-webkit-details-marker {
+        display: none;
+    }
+
+    #scene-director-panel .sd-log-entry[data-empty="true"] > summary {
+        cursor: default;
+    }
+
+    #scene-director-panel .sd-log-entry[open] {
+        background: rgba(255, 255, 255, 0.025);
+    }
+
+    #scene-director-panel .sd-log-status-cell {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+
+    #scene-director-panel .sd-log-expand {
+        flex: 0 0 auto;
+        color: var(--sd-text-dim);
+        font-size: 17px;
+        line-height: 1;
+        transition: transform 140ms ease, color 140ms ease;
+    }
+
+    #scene-director-panel .sd-log-entry[open] .sd-log-expand {
+        transform: rotate(45deg);
+        color: #d9ffea;
+    }
+
+    #scene-director-panel .sd-log-entry-body {
+        display: grid;
+        gap: 12px;
+        min-width: 720px;
+        padding: 4px 12px 14px;
+    }
+
+    #scene-director-panel .sd-log-context {
+        padding: 10px 12px;
+        border-left: 3px solid rgba(108, 196, 255, 0.32);
+        background: rgba(108, 196, 255, 0.06);
+        color: var(--sd-text-dim);
+        line-height: 1.45;
+    }
+
+    #scene-director-panel .sd-log-detail {
+        display: grid;
+        gap: 7px;
+    }
+
+    #scene-director-panel .sd-log-detail-title {
+        color: var(--sd-text-dim);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    #scene-director-panel .sd-log-detail .sd-console {
+        min-height: 0;
+        max-height: 360px;
+    }
+
+    #scene-director-panel .sd-log-empty {
+        padding: 24px 12px;
+        color: var(--sd-text-dim);
+        text-align: center;
     }
 
     #scene-director-panel .sd-footnote {

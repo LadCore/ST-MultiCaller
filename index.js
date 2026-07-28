@@ -5,14 +5,15 @@ const EXTENSION_DISPLAY_NAME = 'Backstage';
 const EXTENSION_LABEL = 'Backstage';
 const ROUTER_LABEL = 'Turn Router';
 const STORY_DIRECTOR_LABEL = 'Story Director';
-const CURRENT_CONFIG_VERSION = 9;
+const CURRENT_CONFIG_VERSION = 10;
 const DEFAULT_WORLD_CONTEXT_CHARS = 0;
 const PROFILE_SWITCH_SETTLE_QUIET_MS = 2000;
 const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
 const PROFILE_SWITCH_SETTLE_EVENT_LIMIT = 12;
 const STORY_GUIDE_SNAPSHOT_RETENTION = 3;
 const STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
-const PLANNER_CONTEXT_MESSAGES = 500;
+const DEFAULT_PLANNER_CONTEXT_MESSAGES = 500;
+const MAX_OPERATION_LOGS = 100;
 
 const DEFAULT_SCENE_DIRECTOR_PROMPT = `You are the RP Scene Director for a SillyTavern group roleplay.
 
@@ -178,6 +179,7 @@ const DEFAULT_CONFIG = {
     routerInputTokenBudget: 0,
     worldContextChars: DEFAULT_WORLD_CONTEXT_CHARS,
     plannerUserTurnInterval: 5,
+    plannerContextMessages: DEFAULT_PLANNER_CONTEXT_MESSAGES,
     plannerWorldInfoBooks: [],
     routerTimedLorebookBook: '',
     routerTimedLorebookUid: '',
@@ -194,6 +196,9 @@ let config = { ...DEFAULT_CONFIG };
 let isProcessing = false;
 let lastActiveChar = null;
 let isStoryGuideUpdateInProgress = false;
+let contextSnapshotQueue = Promise.resolve();
+const backgroundCalls = new Map();
+const activeOperationLogIds = new Map();
 let sceneDirectorState = {
     panelOpen: false,
     activeTab: 'router',
@@ -222,6 +227,7 @@ let sceneDirectorState = {
     persistentIssueAt: null,
     lastError: '',
     triggerSettle: null,
+    operationLogs: [],
     runtimeTiming: {
         activeKind: '',
         activeLabel: '',
@@ -308,6 +314,10 @@ function migrateConfig() {
         if (config.plannerUserTurnInterval == null) {
             config.plannerUserTurnInterval = DEFAULT_CONFIG.plannerUserTurnInterval;
         }
+        if (config.plannerContextMessages == null) {
+            config.plannerContextMessages = DEFAULT_CONFIG.plannerContextMessages;
+        }
+        config.plannerContextMessages = Math.min(5000, Math.max(1, parseInt(config.plannerContextMessages) || DEFAULT_CONFIG.plannerContextMessages));
         if (!Array.isArray(config.plannerWorldInfoBooks)) {
             config.plannerWorldInfoBooks = [];
         }
@@ -1434,10 +1444,11 @@ async function getSelectedWorldInfoContext(ctx, selectedBooks = config.plannerWo
     }
 }
 
-async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldInfoBooks) {
+async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldInfoBooks, options = {}) {
     const books = (Array.isArray(selectedBooks) ? selectedBooks : [])
         .map(name => String(name ?? '').trim())
         .filter(Boolean);
+    const fullContent = !!options.fullContent;
 
     if (!books.length) {
         return {
@@ -1476,18 +1487,29 @@ async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldIn
                 const keys = Array.isArray(entry?.key)
                     ? entry.key.map(value => String(value ?? '').trim()).filter(Boolean)
                     : [];
-                const content = String(entry?.content ?? '').replace(/\s+/g, ' ').trim();
+                const content = String(entry?.content ?? '').trim();
                 const flags = [
                     entry?.disable ? 'disabled' : 'enabled',
                     entry?.constant ? 'constant' : '',
                 ].filter(Boolean);
 
+                if (fullContent) {
+                    return [
+                        `### ${comment || `UID ${uid || '?'}`}`,
+                        `UID: ${uid || '?'}`,
+                        keys.length ? `Keys: ${keys.join(', ')}` : '',
+                        flags.length ? `Flags: ${flags.join(', ')}` : '',
+                        content ? `Content:\n${content}` : 'Content: (empty)',
+                    ].filter(Boolean).join('\n');
+                }
+
+                const compactContent = content.replace(/\s+/g, ' ');
                 return [
                     `- UID: ${uid || '?'}`,
                     comment ? `Name: ${comment}` : '',
                     keys.length ? `Keys: ${keys.join(', ')}` : '',
                     flags.length ? `Flags: ${flags.join(', ')}` : '',
-                    content ? `Content: ${content.slice(0, 220)}${content.length > 220 ? '...' : ''}` : '',
+                    compactContent ? `Content: ${compactContent.slice(0, 220)}${compactContent.length > 220 ? '...' : ''}` : '',
                 ].filter(Boolean).join(' | ');
             });
 
@@ -1974,56 +1996,12 @@ function renderTemplate(template, values) {
     });
 }
 
-function ensureRouterPromptHasStoryGuide(template, storyGuide) {
-    const source = String(template ?? '');
-    if (!String(storyGuide ?? '').trim()) {
-        return source;
-    }
-
-    if (/{{\s*storyGuide\s*}}/i.test(source)) {
-        return source;
-    }
-
-    const storyGuideBlock = `StoryGuide:\n{{storyGuide}}\n\n`;
-    const returnMarker = /\nReturn:\s*/i;
-
-    if (returnMarker.test(source)) {
-        return source.replace(returnMarker, `\n${storyGuideBlock}Return:\n`);
-    }
-
-    return `${source.trim()}\n\n${storyGuideBlock}`.trim();
-}
-
-function ensureRouterPromptHasLorebookBlocks(template, lorebookContext, lorebookCatalog) {
-    let source = String(template ?? '');
-    const returnMarker = /\nReturn:\s*/i;
-
-    if (String(lorebookContext ?? '').trim() && !/{{\s*lorebookContext\s*}}/i.test(source)) {
-        const block = `Selected lorebook context:\n{{lorebookContext}}\n\n`;
-        source = returnMarker.test(source)
-            ? source.replace(returnMarker, `\n${block}Return:\n`)
-            : `${source.trim()}\n\n${block}`.trim();
-    }
-
-    if (String(lorebookCatalog ?? '').trim() && !/{{\s*lorebookCatalog\s*}}/i.test(source)) {
-        const block = `Selected lorebook catalog:\n{{lorebookCatalog}}\n\n`;
-        source = returnMarker.test(source)
-            ? source.replace(returnMarker, `\n${block}Return:\n`)
-            : `${source.trim()}\n\n${block}`.trim();
-    }
-
-    return source;
+function routerPromptUsesTag(tag, template = config.routerPrompt) {
+    return new RegExp(`{{\\s*${String(tag ?? '').trim()}\\s*}}`, 'i').test(String(template ?? ''));
 }
 
 function buildRouterSystemPrompt(routerContext) {
-    let routerPromptTemplate = ensureRouterPromptHasStoryGuide(config.routerPrompt, routerContext.storyGuide);
-    routerPromptTemplate = ensureRouterPromptHasLorebookBlocks(
-        routerPromptTemplate,
-        routerContext.lorebookContext?.text,
-        routerContext.lorebookCatalog?.text,
-    );
-
-    return renderTemplate(routerPromptTemplate, {
+    return renderTemplate(config.routerPrompt, {
         lastSpeaker: routerContext.lastSpeaker,
         players: routerContext.playerNames,
         recentChat: routerContext.recentChat,
@@ -2048,29 +2026,6 @@ function buildRouterMessages(routerContext, options = {}) {
                 role: 'system',
                 content: 'Router workspace mode. Respond directly to the operator in OOC. Do not return runtime-only JSON unless the operator explicitly asks for it. Do not trigger characters or narrate chat prose.',
             },
-            {
-                role: 'system',
-                content: `Current routing context:
-Last speaker: ${routerContext.lastSpeaker}
-Characters: ${routerContext.playerNames || '(none)'}
-
-Recent chat:
-${routerContext.recentChat || '(empty)'}
-
-World context:
-${routerContext.worldContext.text || '(empty)'}
-
-Selected lorebook context:
-${routerContext.lorebookContext?.text || '(empty)'}
-
-Selected lorebook catalog:
-${routerContext.lorebookCatalog?.text || '(empty)'}
-
-StoryGuide:
-${routerContext.storyGuide || '(empty)'}
-
-Treat the messages that follow as an ongoing OOC conversation with the operator about routing and next-turn direction.`,
-            },
             ...(Array.isArray(options.priorHistory) ? options.priorHistory : []),
             {
                 role: 'user',
@@ -2080,12 +2035,11 @@ Treat the messages that follow as an ongoing OOC conversation with the operator 
     }
 
     const forcedSpeakerInstruction = buildForcedSpeakerInstruction(options.forcedSpeaker);
-    const promptIncludesRecentChat = /{{\s*recentChat\s*}}/i.test(config.routerPrompt);
 
     return [
         { role: 'system', content: systemPrompt },
         ...(forcedSpeakerInstruction ? [{ role: 'user', content: forcedSpeakerInstruction }] : []),
-        { role: 'user', content: promptIncludesRecentChat ? 'Return the SceneDirector JSON now.' : routerContext.recentChat },
+        { role: 'user', content: 'Return the SceneDirector JSON now.' },
     ];
 }
 
@@ -2222,7 +2176,7 @@ async function fitContextMessagesToInputBudget(profileId, sourceContext, buildMe
     let inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
     let trimmed = false;
 
-    if (!budget || inputTokens <= budget) {
+    if (options.trimContext === false || !budget || inputTokens <= budget) {
         return {
             messages,
             context: workingContext,
@@ -2417,11 +2371,352 @@ function updateStoryDirectorState(patch) {
     refreshSceneDirectorPanel();
 }
 
-function recordBackstageIssue(source, message) {
+function createOperationLogId() {
+    return `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function appendOperationLog(entry) {
+    const normalized = {
+        id: String(entry?.id ?? createOperationLogId()),
+        kind: String(entry?.kind ?? 'event'),
+        step: String(entry?.step ?? 'Event'),
+        model: String(entry?.model ?? '-'),
+        detail: String(entry?.detail ?? ''),
+        status: String(entry?.status ?? 'running'),
+        startedAt: entry?.startedAt ? new Date(entry.startedAt) : new Date(),
+        completedAt: entry?.completedAt ? new Date(entry.completedAt) : null,
+        durationMs: Number.isFinite(Number(entry?.durationMs)) ? Number(entry.durationMs) : null,
+        request: String(entry?.request ?? ''),
+        response: String(entry?.response ?? ''),
+        reasoning: String(entry?.reasoning ?? ''),
+        error: String(entry?.error ?? ''),
+    };
+
     sceneDirectorState = {
         ...sceneDirectorState,
-        persistentIssue: String(message ?? '').trim(),
-        persistentIssueSource: String(source ?? '').trim(),
+        operationLogs: [
+            normalized,
+            ...(Array.isArray(sceneDirectorState.operationLogs) ? sceneDirectorState.operationLogs : []),
+        ].slice(0, MAX_OPERATION_LOGS),
+    };
+    refreshSceneDirectorPanel();
+    return normalized.id;
+}
+
+function updateOperationLog(logId, patch) {
+    const cleanId = String(logId ?? '').trim();
+    if (!cleanId) return null;
+
+    let updated = null;
+    const logs = (Array.isArray(sceneDirectorState.operationLogs) ? sceneDirectorState.operationLogs : [])
+        .map(log => {
+            if (log.id !== cleanId) return log;
+            updated = {
+                ...log,
+                ...patch,
+            };
+            return updated;
+        });
+
+    if (!updated) return null;
+
+    sceneDirectorState = {
+        ...sceneDirectorState,
+        operationLogs: logs,
+    };
+    refreshSceneDirectorPanel();
+    return updated;
+}
+
+function completeOperationLog(logId, status = 'success', completedAt = new Date()) {
+    const cleanId = String(logId ?? '').trim();
+    const current = (sceneDirectorState.operationLogs ?? []).find(log => log.id === cleanId);
+    if (!current) return null;
+
+    const finishedAt = completedAt instanceof Date ? completedAt : new Date(completedAt);
+    const startedAt = current.startedAt ? new Date(current.startedAt) : finishedAt;
+    const finalStatus = current.error ? 'error' : status;
+    const updated = updateOperationLog(cleanId, {
+        status: finalStatus,
+        completedAt: finishedAt,
+        durationMs: Math.max(0, finishedAt.getTime() - startedAt.getTime()),
+    });
+
+    if (activeOperationLogIds.get(current.kind) === cleanId) {
+        activeOperationLogIds.delete(current.kind);
+    }
+    return updated;
+}
+
+function beginOperationLog(kind, step, detail = '', model = '') {
+    const normalizedKind = String(kind ?? '').trim() || 'event';
+    const existingId = activeOperationLogIds.get(normalizedKind);
+    if (existingId) {
+        completeOperationLog(existingId, 'interrupted');
+    }
+
+    const id = appendOperationLog({
+        kind: normalizedKind,
+        step,
+        detail,
+        model: model || '-',
+        status: 'running',
+        startedAt: new Date(),
+    });
+    activeOperationLogIds.set(normalizedKind, id);
+    return id;
+}
+
+function getActiveOperationLogId(kind) {
+    return activeOperationLogIds.get(String(kind ?? '').trim()) ?? '';
+}
+
+function updateActiveOperationLog(kind, patch) {
+    const id = getActiveOperationLogId(kind);
+    return id ? updateOperationLog(id, patch) : null;
+}
+
+function appendOperationLogDetail(logId, detail) {
+    const cleanDetail = String(detail ?? '').trim();
+    const current = (sceneDirectorState.operationLogs ?? []).find(log => log.id === logId);
+    if (!current || !cleanDetail) {
+        return null;
+    }
+
+    return updateOperationLog(logId, {
+        detail: current.detail ? `${current.detail}\n\n${cleanDetail}` : cleanDetail,
+    });
+}
+
+function summarizeCompletionMessagesForLog(messages) {
+    const source = Array.isArray(messages) ? messages : [];
+    const roleCounts = source.reduce((counts, message) => {
+        const role = String(message?.role ?? 'unknown').trim() || 'unknown';
+        counts[role] = (counts[role] || 0) + 1;
+        return counts;
+    }, {});
+    const roles = Object.entries(roleCounts)
+        .map(([role, count]) => `${role}=${count}`)
+        .join(', ') || 'none';
+
+    return {
+        total: source.length,
+        nonSystem: source.filter(message => message?.role !== 'system').length,
+        roles,
+    };
+}
+
+function summarizeHostChatForLog(ctx = SillyTavern.getContext()) {
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    const userCount = chat.filter(message => message?.is_user && !message?.is_system).length;
+    const characterCount = chat.filter(message => !message?.is_user && !message?.is_system).length;
+    const systemCount = chat.filter(message => message?.is_system).length;
+    const toolCount = chat.filter(isToolInvocationChatMessage).length;
+    const lastMessages = chat
+        .slice(-3)
+        .map(message => {
+            const name = String(message?.name ?? 'Unknown').trim() || 'Unknown';
+            const kind = message?.is_system ? 'system' : (message?.is_user ? 'user' : 'character');
+            const type = String(message?.extra?.type ?? '').trim();
+            const length = String(message?.mes ?? '').length;
+            return `${name}/${kind}${type ? `/${type}` : ''}/${length} chars`;
+        })
+        .join(' | ') || 'none';
+
+    return {
+        total: chat.length,
+        userCount,
+        characterCount,
+        systemCount,
+        toolCount,
+        lastMessages,
+    };
+}
+
+function formatHostChatSummaryForLog(label, snapshot) {
+    return [
+        label,
+        `Host chat: total=${snapshot.total}, user=${snapshot.userCount}, character=${snapshot.characterCount}, system=${snapshot.systemCount}, tools=${snapshot.toolCount}`,
+        `Host chat tail: ${snapshot.lastMessages}`,
+    ].join('\n');
+}
+
+function formatTriggerSettleForLog(state) {
+    if (!state) {
+        return 'Profile settle: no snapshot';
+    }
+
+    const events = (Array.isArray(state.events) ? state.events : [])
+        .slice()
+        .reverse()
+        .map(event => {
+            const name = String(event?.name ?? '').trim() || 'unknown';
+            const detail = String(event?.detail ?? '').trim();
+            return detail ? `${name} (${detail})` : name;
+        })
+        .join(' -> ') || 'none';
+
+    return [
+        `Profile settle: ${String(state.status ?? 'unknown')}`,
+        `Settle anchor: ${state.anchorSeen ? String(state.anchorEventName ?? 'seen') : 'not seen'}`,
+        `Settle last event: ${String(state.lastEventName ?? 'none')}`,
+        `Settle events: ${events}`,
+    ].join('\n');
+}
+
+function sanitizeRequestPayloadForLog(value, seen = new WeakSet()) {
+    if (value == null || typeof value !== 'object') {
+        return value;
+    }
+
+    if (seen.has(value)) {
+        return '[Circular]';
+    }
+
+    seen.add(value);
+    if (Array.isArray(value)) {
+        return value.map(item => sanitizeRequestPayloadForLog(item, seen));
+    }
+
+    const sanitized = {};
+    for (const [key, item] of Object.entries(value)) {
+        if (/^(?:api[_-]?key|authorization|proxy_password|password|secret|access[_-]?token)$/i.test(key)) {
+            sanitized[key] = '[REDACTED]';
+            continue;
+        }
+
+        sanitized[key] = sanitizeRequestPayloadForLog(item, seen);
+    }
+    return sanitized;
+}
+
+function formatCharacterRequestSummary(payload, requestNumber, messageCharacters, tokenMarker) {
+    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+    const roleCounts = messages.reduce((counts, message) => {
+        const role = String(message?.role ?? 'unknown').trim() || 'unknown';
+        counts[role] = (counts[role] || 0) + 1;
+        return counts;
+    }, {});
+    const roleSummary = Object.entries(roleCounts)
+        .map(([role, count]) => `${role}=${count}`)
+        .join(', ') || 'none';
+    const toolCount = Array.isArray(payload?.tools) ? payload.tools.length : 0;
+
+    return [
+        `API request ${requestNumber}`,
+        `Messages: ${messages.length} (${roleSummary})`,
+        `Message characters: ${messageCharacters}`,
+        `Estimated input tokens: ${tokenMarker}`,
+        `Model: ${String(payload?.model ?? '-')}`,
+        `Source: ${String(payload?.chat_completion_source ?? '-')}`,
+        `Max output tokens: ${String(payload?.max_tokens ?? '-')}`,
+        `Streaming: ${String(!!payload?.stream)}`,
+        `Tools: ${toolCount}`,
+    ].join('\n');
+}
+
+function replaceCharacterRequestTokenMarker(operationLogId, tokenMarker, value) {
+    const latest = (sceneDirectorState.operationLogs ?? []).find(log => log.id === operationLogId);
+    if (!latest || !String(latest.detail ?? '').includes(tokenMarker)) {
+        return;
+    }
+
+    updateOperationLog(operationLogId, {
+        detail: String(latest.detail).replace(tokenMarker, String(value)),
+    });
+}
+
+function captureCharacterApiRequest(payload) {
+    const operationLogId = getActiveOperationLogId('character-turn');
+    if (!operationLogId || !payload || typeof payload !== 'object') {
+        return;
+    }
+
+    const current = (sceneDirectorState.operationLogs ?? []).find(log => log.id === operationLogId);
+    if (!current) {
+        return;
+    }
+
+    const requestNumber = Math.max(0, Number(current.requestCount) || 0) + 1;
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    const serializedMessages = JSON.stringify(messages);
+    const messageCharacters = serializedMessages.length;
+    const tokenMarker = `[calculating request ${requestNumber}]`;
+    const sanitizedPayload = sanitizeRequestPayloadForLog(payload);
+    const serializedPayload = JSON.stringify(sanitizedPayload, null, 2);
+    const requestBlock = `# Character API Request ${requestNumber}\n${serializedPayload}`;
+    const summaryBlock = formatCharacterRequestSummary(payload, requestNumber, messageCharacters, tokenMarker);
+
+    updateOperationLog(operationLogId, {
+        model: String(payload.model ?? current.model ?? '-'),
+        requestCount: requestNumber,
+        request: current.request ? `${current.request}\n\n${requestBlock}` : requestBlock,
+        detail: current.detail ? `${current.detail}\n\n${summaryBlock}` : summaryBlock,
+    });
+
+    let tokenCountPromise;
+    try {
+        tokenCountPromise = SillyTavern.getContext().getTokenCountAsync(serializedMessages);
+    } catch (error) {
+        replaceCharacterRequestTokenMarker(
+            operationLogId,
+            tokenMarker,
+            `unavailable (${error?.message ?? String(error)})`,
+        );
+        return;
+    }
+
+    Promise.resolve(tokenCountPromise)
+        .then(tokenCount => {
+            replaceCharacterRequestTokenMarker(operationLogId, tokenMarker, tokenCount);
+        })
+        .catch(error => {
+            replaceCharacterRequestTokenMarker(
+                operationLogId,
+                tokenMarker,
+                `unavailable (${error?.message ?? String(error)})`,
+            );
+        });
+}
+
+function resolveIssueOperationKind(source) {
+    const normalized = String(source ?? '').trim().toLowerCase();
+    if (normalized.includes('planner ooc')) return 'planner-ooc';
+    if (normalized.includes('story director') || normalized.includes('planner')) return 'planner-update';
+    if (normalized.includes('router ooc')) return 'router-ooc';
+    if (normalized.includes('router')) return 'router-request';
+    if (normalized.includes('direct ooc') || normalized.includes('character')) return 'character-turn';
+    return '';
+}
+
+function recordBackstageIssue(source, message) {
+    const issueSource = String(source ?? '').trim();
+    const issueMessage = String(message ?? '').trim();
+    const operationKind = resolveIssueOperationKind(issueSource);
+    const operationLogId = getActiveOperationLogId(operationKind);
+
+    if (operationLogId) {
+        updateOperationLog(operationLogId, {
+            status: 'error',
+            error: issueMessage,
+        });
+    } else {
+        const now = new Date();
+        appendOperationLog({
+            kind: operationKind || 'error',
+            step: issueSource || 'Error',
+            status: 'error',
+            startedAt: now,
+            completedAt: now,
+            durationMs: 0,
+            error: issueMessage,
+        });
+    }
+
+    sceneDirectorState = {
+        ...sceneDirectorState,
+        persistentIssue: issueMessage,
+        persistentIssueSource: issueSource,
         persistentIssueAt: new Date(),
     };
     refreshSceneDirectorPanel();
@@ -2482,6 +2777,7 @@ function getTimingModelLabel(profileId, fallbackName = '', ctx = SillyTavern.get
 function beginRuntimePhase(kind, label, detail = '', model = '') {
     const current = cloneRuntimeTiming();
     const now = new Date();
+    beginOperationLog(kind, label, detail, model);
 
     sceneDirectorState = {
         ...sceneDirectorState,
@@ -2497,13 +2793,23 @@ function beginRuntimePhase(kind, label, detail = '', model = '') {
     refreshSceneDirectorPanel();
 }
 
-function finishRuntimePhase(expectedKinds = null) {
+function finishRuntimePhase(expectedKinds = null, status = 'success') {
     const current = cloneRuntimeTiming();
+    const fallbackKind = Array.isArray(expectedKinds)
+        ? expectedKinds.find(kind => getActiveOperationLogId(kind))
+        : '';
+
     if (!current.activeKind || !current.activeStartedAt) {
+        if (fallbackKind) {
+            completeOperationLog(getActiveOperationLogId(fallbackKind), status);
+        }
         return;
     }
 
     if (Array.isArray(expectedKinds) && expectedKinds.length && !expectedKinds.includes(current.activeKind)) {
+        if (fallbackKind) {
+            completeOperationLog(getActiveOperationLogId(fallbackKind), status);
+        }
         return;
     }
 
@@ -2545,6 +2851,81 @@ function finishRuntimePhase(expectedKinds = null) {
         runtimeTiming: nextTiming,
     };
     refreshSceneDirectorPanel();
+    completeOperationLog(getActiveOperationLogId(current.activeKind), status, finishedAt);
+}
+
+function finishBackgroundPlannerTiming(startedAt, label, model, operationLogId = '') {
+    const finishedAt = new Date();
+    const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+    const current = cloneRuntimeTiming();
+
+    sceneDirectorState = {
+        ...sceneDirectorState,
+        runtimeTiming: {
+            ...current,
+            lastPlannerMs: durationMs,
+            lastPlannerAt: finishedAt,
+            lastPlannerModel: String(model ?? '').trim(),
+            ...(!current.activeKind ? {
+                lastCompletedKind: 'planner-update',
+                lastCompletedLabel: String(label ?? '').trim(),
+                lastCompletedMs: durationMs,
+                lastCompletedAt: finishedAt,
+            } : {}),
+        },
+    };
+    refreshSceneDirectorPanel();
+    completeOperationLog(operationLogId, 'success', finishedAt);
+}
+
+function runBackgroundCall(key, operation) {
+    const normalizedKey = String(key ?? '').trim();
+    if (!normalizedKey || typeof operation !== 'function') {
+        return Promise.resolve(null);
+    }
+
+    const running = backgroundCalls.get(normalizedKey);
+    if (running) {
+        return running;
+    }
+
+    const promise = Promise.resolve()
+        .then(operation)
+        .catch(error => {
+            console.error(`[SceneDirector] Background call "${normalizedKey}" failed:`, error);
+            recordBackstageIssue(`Background: ${normalizedKey}`, error?.message ?? String(error));
+            return null;
+        })
+        .finally(() => {
+            if (backgroundCalls.get(normalizedKey) === promise) {
+                backgroundCalls.delete(normalizedKey);
+            }
+        });
+
+    backgroundCalls.set(normalizedKey, promise);
+    return promise;
+}
+
+async function withContextSnapshotLock(operation) {
+    const previous = contextSnapshotQueue;
+    let release;
+    contextSnapshotQueue = new Promise(resolve => {
+        release = resolve;
+    });
+
+    await previous.catch(() => {});
+    try {
+        return await operation();
+    } finally {
+        release();
+    }
+}
+
+function getChatContextKey(ctx = SillyTavern.getContext()) {
+    return [
+        String(ctx?.groupId ?? ctx?.characterId ?? ''),
+        String(ctx?.chatId ?? ''),
+    ].join(':');
 }
 
 function cloneDirectorRequestPayload(payload) {
@@ -2767,15 +3148,114 @@ function stripMarkdownFence(text) {
         .trim();
 }
 
-async function getPlannerContextSnapshot(ctx = SillyTavern.getContext()) {
-    const realMessages = getRpContextMessages(ctx.chat).slice(-PLANNER_CONTEXT_MESSAGES);
+function collectPlannerBlockTags(text) {
+    const tags = new Map();
+    const pattern = /\[([^\[\]\r\n]+)\]/g;
+    let match;
+
+    while ((match = pattern.exec(String(text ?? ''))) !== null) {
+        const rawTag = String(match[1] ?? '').trim();
+        const closing = rawTag.startsWith('/');
+        const name = rawTag
+            .replace(/^\/\s*/, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLocaleUpperCase();
+
+        if (!name) continue;
+
+        const current = tags.get(name) ?? {
+            name,
+            label: rawTag.replace(/^\/\s*/, '').trim(),
+            open: 0,
+            close: 0,
+        };
+        if (closing) {
+            current.close += 1;
+        } else {
+            current.open += 1;
+        }
+        tags.set(name, current);
+    }
+
+    return tags;
+}
+
+function validatePlannerOutputFormat(plannerPrompt, output) {
+    const prompt = String(plannerPrompt ?? '');
+    const markers = [...prompt.matchAll(/\bOUTPUT\s+FORMAT\b/gi)];
+    const marker = markers[markers.length - 1];
+    if (!marker) {
+        return {
+            valid: false,
+            error: 'Planner format validation failed: the system prompt has no OUTPUT FORMAT section.',
+        };
+    }
+
+    const formatSection = prompt.slice(Number(marker.index) + marker[0].length);
+    const formatTags = collectPlannerBlockTags(formatSection);
+    const requirements = [...formatTags.values()].filter(tag => tag.close > 0);
+    if (!requirements.length) {
+        return {
+            valid: false,
+            error: 'Planner format validation failed: OUTPUT FORMAT contains no [TAG]...[/TAG] blocks.',
+        };
+    }
+
+    const invalidTemplateTags = requirements.filter(tag => tag.open !== tag.close);
+    if (invalidTemplateTags.length) {
+        const details = invalidTemplateTags
+            .map(tag => `[${tag.label}] ${tag.open} open / ${tag.close} close`)
+            .join(', ');
+        return {
+            valid: false,
+            error: `Planner format validation failed: OUTPUT FORMAT has unbalanced blocks: ${details}.`,
+        };
+    }
+
+    const outputTags = collectPlannerBlockTags(output);
+    const mismatches = [];
+
+    for (const expected of requirements) {
+        const actual = outputTags.get(expected.name) ?? { open: 0, close: 0 };
+        if (actual.open !== expected.open || actual.close !== expected.close) {
+            mismatches.push(
+                `[${expected.label}] expected ${expected.open}/${expected.close}, received ${actual.open}/${actual.close}`,
+            );
+        }
+    }
+
+    const expectedNames = new Set(requirements.map(tag => tag.name));
+    for (const actual of outputTags.values()) {
+        if (!expectedNames.has(actual.name) && actual.open > 0 && actual.close > 0) {
+            mismatches.push(`[${actual.label}] is not declared in OUTPUT FORMAT`);
+        }
+    }
+
+    if (mismatches.length) {
+        return {
+            valid: false,
+            error: `Planner output format mismatch: ${mismatches.join('; ')}.`,
+        };
+    }
+
+    return {
+        valid: true,
+        error: '',
+        blockCount: requirements.reduce((total, tag) => total + tag.open, 0),
+    };
+}
+
+async function buildPlannerContextSnapshot(ctx) {
+    const messageLimit = Math.min(5000, Math.max(1, parseInt(config.plannerContextMessages) || DEFAULT_CONFIG.plannerContextMessages));
+    const realMessages = getRpContextMessages(ctx.chat).slice(-messageLimit);
     const humanName = ctx.name1 || '';
     const recentChatEntries = formatRpContextMessages(realMessages, humanName);
     const [worldContext, lorebookContext] = await Promise.all([
         getVectFoxRouterContext(ctx, { forceEnabled: true, maxChars: 0 }),
         getSelectedWorldInfoContext(ctx),
     ]);
-    const lorebookCatalog = await getSelectedWorldInfoCatalog();
+    const lorebookCatalog = await getSelectedWorldInfoCatalog(config.plannerWorldInfoBooks, { fullContent: true });
 
     return {
         humanName,
@@ -2788,6 +3268,10 @@ async function getPlannerContextSnapshot(ctx = SillyTavern.getContext()) {
     };
 }
 
+async function getPlannerContextSnapshot(ctx = SillyTavern.getContext()) {
+    return withContextSnapshotLock(() => buildPlannerContextSnapshot(ctx));
+}
+
 function getRpContextMessages(chat) {
     return (Array.isArray(chat) ? chat : []).filter(m =>
         !m.is_system &&
@@ -2796,6 +3280,13 @@ function getRpContextMessages(chat) {
         m.mes != null &&
         !isBackstageOocMessage(m.mes)
     );
+}
+
+function isToolInvocationChatMessage(message) {
+    const type = message?.extra?.type;
+    return type === 'tool_call'
+        || type === 'tool_response'
+        || (Array.isArray(message?.extra?.tool_invocations) && message.extra.tool_invocations.length > 0);
 }
 
 function formatRpContextMessages(messages, humanName = '') {
@@ -2810,18 +3301,45 @@ function setRecentChatEntries(target, entries) {
     target.recentChat = normalized.join('\n');
 }
 
-async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.getContext()) {
+async function buildRouterContextSnapshot(chatHistory, ctx) {
     const sourceChat = Array.isArray(chatHistory) ? chatHistory : (ctx.chat ?? []);
     const realMessages = getRpContextMessages(sourceChat);
     const lastSpeaker = realMessages[realMessages.length - 1]?.name || 'Unknown';
     const playerNames = config.characters.map(c => c.name).join(', ');
     const humanName = ctx.name1 || '';
-    const recentChatEntries = formatRpContextMessages(realMessages, humanName);
-    const storyGuide = getStoryGuide(ctx);
+    const recentChatEntries = routerPromptUsesTag('recentChat')
+        ? formatRpContextMessages(realMessages, humanName)
+        : [];
+    const storyGuide = routerPromptUsesTag('storyGuide') ? getStoryGuide(ctx) : '';
     const [worldContext, lorebookContext, lorebookCatalog] = await Promise.all([
-        getVectFoxRouterContext(ctx),
-        getSelectedWorldInfoContext(ctx),
-        getSelectedWorldInfoCatalog(),
+        routerPromptUsesTag('worldContext')
+            ? getVectFoxRouterContext(ctx)
+            : Promise.resolve({
+                text: '',
+                source: 'router-template-tag-not-used',
+                entryCount: 0,
+                originalLength: 0,
+                truncated: false,
+            }),
+        routerPromptUsesTag('lorebookContext')
+            ? getSelectedWorldInfoContext(ctx)
+            : Promise.resolve({
+                text: '',
+                source: 'router-template-tag-not-used',
+                selectedBooks: [],
+                activatedEntries: [],
+                length: 0,
+            }),
+        routerPromptUsesTag('lorebookCatalog')
+            ? getSelectedWorldInfoCatalog()
+            : Promise.resolve({
+                text: '',
+                source: 'router-template-tag-not-used',
+                selectedBooks: [],
+                entries: [],
+                entryCount: 0,
+                length: 0,
+            }),
     ]);
 
     return {
@@ -2835,6 +3353,10 @@ async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.ge
         lorebookContext,
         lorebookCatalog,
     };
+}
+
+async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.getContext()) {
+    return withContextSnapshotLock(() => buildRouterContextSnapshot(chatHistory, ctx));
 }
 
 function buildPlannerMessages(plannerContext, options = {}) {
@@ -2895,6 +3417,7 @@ function logPlannerRequestBudget(mode, profileId, budgetedRequest) {
         profileMaxOutput: budgetedRequest?.maxOutput ?? null,
         inputTokenBudget: budgetedRequest?.budget ?? 0,
         estimatedInputTokens: budgetedRequest?.inputTokens ?? 0,
+        rpMessageLimit: config.plannerContextMessages,
         rpMessagesIncluded: context.recentChatEntries?.length ?? 0,
         vectFoxSource: context.worldContext?.source ?? 'unknown',
         vectFoxCharacters: context.worldContext?.text?.length ?? 0,
@@ -2912,7 +3435,14 @@ async function updateStoryGuideFromContext(options = {}) {
     const showSuccessToast = options.showSuccessToast ?? (source !== 'auto');
     const showErrorToast = options.showErrorToast ?? true;
     const activateDirectorTab = options.activateDirectorTab ?? (source !== 'auto');
+    const background = !!options.background;
     const ctx = SillyTavern.getContext();
+    const originChatKey = getChatContextKey(ctx);
+    const originStoryGuide = getStoryGuide(ctx);
+    const phaseStartedAt = new Date();
+    const phaseLabel = 'StoryGuide update';
+    const phaseModel = getTimingModelLabel(config.plannerProfileId);
+    let operationLogId = '';
     if (!config.plannerProfileId) {
         if (showMissingProfileToast) {
             toastr.warning('Configure um perfil do Planner primeiro.', EXTENSION_LABEL);
@@ -2937,20 +3467,33 @@ async function updateStoryGuideFromContext(options = {}) {
     });
 
     try {
-        beginRuntimePhase('planner-update', 'StoryGuide update', source, getTimingModelLabel(config.plannerProfileId));
+        if (background) {
+            operationLogId = beginOperationLog('planner-update', phaseLabel, source, phaseModel);
+        } else {
+            beginRuntimePhase('planner-update', phaseLabel, source, phaseModel);
+            operationLogId = getActiveOperationLogId('planner-update');
+        }
         const plannerContext = await getPlannerContextSnapshot(ctx);
         const budgetedRequest = await fitContextMessagesToInputBudget(
             config.plannerProfileId,
             plannerContext,
             currentContext => buildPlannerMessages(currentContext, { mode: 'update' }),
+            { trimContext: false },
         );
         const messages = budgetedRequest.messages;
         logPlannerRequestBudget('update', config.plannerProfileId, budgetedRequest);
         updateStoryDirectorState({ lastPlannerPromptMessages: messages });
+        updateOperationLog(operationLogId, {
+            request: formatPromptMessages(messages),
+        });
         const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = extractResponseText(response);
         const updatedGuide = stripMarkdownFence(responseText);
+        updateOperationLog(operationLogId, {
+            response: responseText,
+            reasoning,
+        });
 
         if (!updatedGuide) {
             recordBackstageIssue('Story Director', 'StoryGuide updater returned empty output.');
@@ -2965,15 +3508,62 @@ async function updateStoryGuideFromContext(options = {}) {
             return null;
         }
 
-        saveStoryGuide(updatedGuide, ctx);
+        const plannerSystemPrompt = messages.find(message => message?.role === 'system')?.content ?? '';
+        const formatValidation = validatePlannerOutputFormat(plannerSystemPrompt, updatedGuide);
+        if (!formatValidation.valid) {
+            recordBackstageIssue('Story Director', formatValidation.error);
+            updateStoryDirectorState({
+                status: 'story-guide-format-error',
+                plannerReasoning: reasoning,
+                plannerRawOutput: responseText,
+                plannerError: formatValidation.error,
+                lastError: formatValidation.error,
+            });
+            toastr.error('Planner retornou um StoryGuide fora do OUTPUT FORMAT.', EXTENSION_LABEL);
+            return null;
+        }
+
+        let saveContext = ctx;
+        if (background) {
+            const activeContext = SillyTavern.getContext();
+            const activeChatKey = getChatContextKey(activeContext);
+            if (activeChatKey !== originChatKey) {
+                const message = 'Background Planner result was discarded because the active chat changed.';
+                recordBackstageIssue('Story Director', message);
+                updateStoryDirectorState({
+                    status: 'story-guide-stale-result',
+                    plannerReasoning: reasoning,
+                    plannerRawOutput: responseText,
+                    plannerError: message,
+                    lastError: message,
+                });
+                return null;
+            }
+
+            if (getStoryGuide(activeContext) !== originStoryGuide) {
+                const message = 'Background Planner result was discarded because the StoryGuide changed while it was running.';
+                recordBackstageIssue('Story Director', message);
+                updateStoryDirectorState({
+                    status: 'story-guide-stale-result',
+                    plannerReasoning: reasoning,
+                    plannerRawOutput: responseText,
+                    plannerError: message,
+                    lastError: message,
+                });
+                return null;
+            }
+
+            saveContext = activeContext;
+        }
+
+        saveStoryGuide(updatedGuide, saveContext);
         try {
-            await maybePersistStoryGuideSnapshot(updatedGuide, ctx);
+            await maybePersistStoryGuideSnapshot(updatedGuide, saveContext);
         } catch (snapshotError) {
             console.error('[SceneDirector] StoryGuide updated, but snapshot persistence failed:', snapshotError);
             toastr.warning('StoryGuide atualizado, mas o snapshot nao foi salvo. Veja o console.', EXTENSION_LABEL);
         }
-        setPlannerUserTurnCounter(0, ctx);
-        clearBackstageIssue();
+        setPlannerUserTurnCounter(0, saveContext);
         updateStoryDirectorState({
             status: 'story-guide-updated',
             ...(activateDirectorTab ? { activeTab: 'director' } : {}),
@@ -2998,7 +3588,11 @@ async function updateStoryGuideFromContext(options = {}) {
         }
         return null;
     } finally {
-        finishRuntimePhase(['planner-update']);
+        if (background) {
+            finishBackgroundPlannerTiming(phaseStartedAt, phaseLabel, phaseModel, operationLogId);
+        } else {
+            finishRuntimePhase(['planner-update']);
+        }
         isStoryGuideUpdateInProgress = false;
     }
 }
@@ -3047,14 +3641,22 @@ async function runPlannerOocRequest() {
                 priorHistory,
                 oocRequest,
             }),
+            { trimContext: false },
         );
         const messages = budgetedRequest.messages;
         logPlannerRequestBudget('ooc', config.plannerProfileId, budgetedRequest);
 
         updateStoryDirectorState({ lastPlannerPromptMessages: messages });
+        updateActiveOperationLog('planner-ooc', {
+            request: formatPromptMessages(messages),
+        });
         const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
+        updateActiveOperationLog('planner-ooc', {
+            response: responseText,
+            reasoning,
+        });
 
         if (!responseText) {
             recordBackstageIssue('Planner OOC', 'Planner workspace returned empty output.');
@@ -3083,7 +3685,6 @@ async function runPlannerOocRequest() {
             plannerOocHistory: nextHistory,
             plannerError: '',
         });
-        clearBackstageIssue();
         return responseText;
     } catch (error) {
         console.error('[SceneDirector] Failed to run planner workspace request:', error);
@@ -3148,6 +3749,9 @@ async function runRouterOocRequest() {
         const messages = budgetedRequest.messages;
 
         updateRouterState({ lastPromptMessages: messages });
+        updateActiveOperationLog('router-ooc', {
+            request: formatPromptMessages(messages),
+        });
         const service = await getConnService();
         const response = await service.sendRequest(
             config.routerProfileId,
@@ -3157,6 +3761,10 @@ async function runRouterOocRequest() {
         );
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
+        updateActiveOperationLog('router-ooc', {
+            response: responseText,
+            reasoning,
+        });
 
         if (!responseText) {
             recordBackstageIssue('Router OOC', 'Router workspace returned empty output.');
@@ -3186,7 +3794,6 @@ async function runRouterOocRequest() {
             lastDecision: sceneDirectorState.lastDecision,
             lastError: '',
         });
-        clearBackstageIssue();
         return responseText;
     } catch (error) {
         console.error('[SceneDirector] Failed to run router workspace request:', error);
@@ -3259,7 +3866,7 @@ async function runDirectedCharacterOoc(targetName, oocText) {
         clearLorebookInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
-        finishRuntimePhase(['character-turn']);
+        finishRuntimePhase(['character-turn'], 'error');
         isProcessing = false;
         unlockChat();
         updateRouterState({
@@ -3283,13 +3890,14 @@ async function handleUserTurnPipeline() {
     const shouldAutoUpdateStoryGuide = !!config.plannerProfileId && userTurnsSincePlannerUpdate >= plannerInterval;
 
     if (shouldAutoUpdateStoryGuide) {
-        await updateStoryGuideFromContext({
+        void runBackgroundCall('planner-auto-update', () => updateStoryGuideFromContext({
             source: 'auto',
             showMissingProfileToast: false,
             showSuccessToast: false,
             showErrorToast: true,
             activateDirectorTab: false,
-        });
+            background: true,
+        }));
     }
 
     await runRouter('USER_MESSAGE_RENDERED');
@@ -3350,6 +3958,9 @@ async function callRouterAgent(chatHistory) {
 
     try {
         beginRuntimePhase('router-request', 'Router request', forcedRouterSpeaker ? `Forced speaker: ${forcedRouterSpeaker}` : 'Normal routing', getTimingModelLabel(config.routerProfileId));
+        updateActiveOperationLog('router-request', {
+            request: formatPromptMessages(lastDirectorRequest.messages),
+        });
         updateRouterState({ status: 'calling-director' });
 
         const service  = await getConnService();
@@ -3363,6 +3974,10 @@ async function callRouterAgent(chatHistory) {
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? null;
 
         const responseText = extractResponseText(response);
+        updateActiveOperationLog('router-request', {
+            response: responseText,
+            reasoning: reasoning ?? '',
+        });
         if (!responseText) {
             console.warn('[SceneDirector] Formato de resposta desconhecido:', response);
             recordBackstageIssue('Router', 'Resposta vazia ou formato desconhecido.');
@@ -3384,8 +3999,6 @@ async function callRouterAgent(chatHistory) {
             lastDecision: decision,
             lastError: '',
         });
-        clearBackstageIssue();
-
         return decision.nextSpeaker ? decision : null;
 
     } catch (error) {
@@ -3467,6 +4080,12 @@ async function triggerChar(char, decision = null, options = {}) {
         `Character turn: ${char.name}`,
         targetProfile.profileName ? `Profile ${targetProfile.profileName}` : '',
         getTimingModelLabel(char.profileId, targetProfile.profileName || char.profileName || ''),
+    );
+    const characterOperationLogId = getActiveOperationLogId('character-turn');
+    appendOperationLogDetail(characterOperationLogId, formatTriggerSettleForLog(sceneDirectorState.triggerSettle));
+    appendOperationLogDetail(
+        characterOperationLogId,
+        formatHostChatSummaryForLog('Pre-trigger snapshot', summarizeHostChatForLog(ctx)),
     );
     updateRouterState({ status: 'executing' });
 
@@ -3591,37 +4210,9 @@ function formatDurationMs(value) {
 function getRuntimeTimingView(now = new Date()) {
     const timing = cloneRuntimeTiming();
     const activeElapsedMs = timing.activeStartedAt ? Math.max(0, now.getTime() - timing.activeStartedAt.getTime()) : null;
-    const activeRouter = timing.activeKind === 'router-request' || timing.activeKind === 'router-ooc';
-    const activePlanner = timing.activeKind === 'planner-update' || timing.activeKind === 'planner-ooc';
-    const activeCharacter = timing.activeKind === 'character-turn';
 
     return {
-        activeLabel: timing.activeLabel || 'Idle',
-        activeDetail: timing.activeDetail || '',
         activeElapsedText: activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : 'Idle',
-        lastCompletedLabel: timing.lastCompletedLabel || 'None yet',
-        lastCompletedDurationText: timing.lastCompletedMs != null ? formatDurationMs(timing.lastCompletedMs) : 'n/a',
-        lastCompletedAtText: timing.lastCompletedAt ? formatPanelTime(timing.lastCompletedAt) : 'never',
-        lastRouterText: timing.lastRouterMs != null ? formatDurationMs(timing.lastRouterMs) : 'n/a',
-        lastPlannerText: timing.lastPlannerMs != null ? formatDurationMs(timing.lastPlannerMs) : 'n/a',
-        lastCharacterText: timing.lastCharacterMs != null ? formatDurationMs(timing.lastCharacterMs) : 'n/a',
-        rows: [
-            {
-                step: 'Router',
-                model: activeRouter ? (timing.activeModel || '-') : (timing.lastRouterModel || '-'),
-                time: activeRouter ? (activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : '0.0s') : (timing.lastRouterMs != null ? formatDurationMs(timing.lastRouterMs) : 'n/a'),
-            },
-            {
-                step: 'Planner',
-                model: activePlanner ? (timing.activeModel || '-') : (timing.lastPlannerModel || '-'),
-                time: activePlanner ? (activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : '0.0s') : (timing.lastPlannerMs != null ? formatDurationMs(timing.lastPlannerMs) : 'n/a'),
-            },
-            {
-                step: 'Character',
-                model: activeCharacter ? (timing.activeModel || '-') : (timing.lastCharacterModel || '-'),
-                time: activeCharacter ? (activeElapsedMs != null ? formatDurationMs(activeElapsedMs) : '0.0s') : (timing.lastCharacterMs != null ? formatDurationMs(timing.lastCharacterMs) : 'n/a'),
-            },
-        ],
     };
 }
 
@@ -3638,7 +4229,12 @@ function getStatusTone(value) {
     const normalized = String(value ?? '').toLowerCase();
     if (!normalized || normalized === 'idle') return 'idle';
     if (normalized.includes('error') || normalized.includes('empty')) return 'danger';
-    if (normalized.includes('blocked') || normalized.includes('warning')) return 'warning';
+    if (
+        normalized.includes('blocked')
+        || normalized.includes('warning')
+        || normalized.includes('stopped')
+        || normalized.includes('interrupted')
+    ) return 'warning';
     if (
         normalized.includes('running')
         || normalized.includes('calling')
@@ -3757,26 +4353,6 @@ function renderStatCard(label, value, note = '') {
             ${note ? `<div class="sd-stat-note">${escapeHtml(note)}</div>` : ''}
         </div>
     `;
-}
-
-function renderRuntimeTimingCard() {
-    const view = getRuntimeTimingView();
-    return renderCard('Turn Timing', 'Step, model and time.', `
-        <div class="sd-timing-list">
-            <div class="sd-timing-row sd-timing-row--head">
-                <span>Step</span>
-                <span>Model</span>
-                <span>Time</span>
-            </div>
-            ${view.rows.map((row, index) => `
-                <div class="sd-timing-row" data-runtime-row="${index}">
-                    <span id="sd-runtime-step-${index}">${escapeHtml(row.step)}</span>
-                    <span id="sd-runtime-model-${index}">${escapeHtml(row.model)}</span>
-                    <span id="sd-runtime-time-${index}">${escapeHtml(row.time)}</span>
-                </div>
-            `).join('')}
-        </div>
-    `);
 }
 
 function renderCard(title, subtitle, body, options = {}) {
@@ -3978,6 +4554,7 @@ function renderRouterTimedLorebookStatus() {
 }
 
 function renderWorkspaceNav() {
+    const errorCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'error').length;
     const items = [
         {
             key: 'router',
@@ -3989,6 +4566,12 @@ function renderWorkspaceNav() {
             title: STORY_DIRECTOR_LABEL,
             copy: 'Maintain the private StoryGuide, planner prompt and lorebook scope.',
         },
+        {
+            key: 'logs',
+            title: 'Logs',
+            copy: 'Inspect timing, requests, reasoning and failures by operation.',
+            badge: errorCount ? String(errorCount) : '',
+        },
     ];
 
     return `
@@ -3998,7 +4581,10 @@ function renderWorkspaceNav() {
             <div class="sd-stage-nav">
                 ${items.map(item => `
                     <button class="sd-stage-link ${sceneDirectorState.activeTab === item.key ? 'sd-stage-link--active' : ''}" data-stage="${item.key}">
-                        <span class="sd-stage-name">${escapeHtml(item.title)}</span>
+                        <span class="sd-stage-title-row">
+                            <span class="sd-stage-name">${escapeHtml(item.title)}</span>
+                            ${item.badge ? `<span class="sd-stage-alert">${escapeHtml(item.badge)}</span>` : ''}
+                        </span>
                         <span class="sd-stage-copy">${escapeHtml(item.copy)}</span>
                     </button>
                 `).join('')}
@@ -4007,7 +4593,114 @@ function renderWorkspaceNav() {
     `;
 }
 
-function renderRouterWorkspacePanel(capturedPrompt) {
+function renderOperationLogDetail(label, value, extraClass = '') {
+    const content = String(value ?? '').trim();
+    if (!content) return '';
+
+    return `
+        <section class="sd-log-detail">
+            <div class="sd-log-detail-title">${escapeHtml(label)}</div>
+            <pre class="sd-console ${extraClass}">${escapeHtml(content)}</pre>
+        </section>
+    `;
+}
+
+function renderOperationLogEntry(log) {
+    const startedAt = log?.startedAt ? new Date(log.startedAt) : new Date();
+    const duration = log?.durationMs != null ? formatDurationMs(log.durationMs) : '0.0s';
+    const hasDetails = !!(
+        String(log?.detail ?? '').trim()
+        || String(log?.error ?? '').trim()
+        || String(log?.request ?? '').trim()
+        || String(log?.response ?? '').trim()
+        || String(log?.reasoning ?? '').trim()
+    );
+
+    return `
+        <details class="sd-log-entry" data-operation-log-id="${escapeHtml(log?.id || '')}"${hasDetails ? '' : ' data-empty="true"'}>
+            <summary class="sd-log-row">
+                <span>${escapeHtml(formatPanelTime(startedAt))}</span>
+                <span title="${escapeHtml(log?.step || '-')}">${escapeHtml(log?.step || '-')}</span>
+                <span title="${escapeHtml(log?.model || '-')}">${escapeHtml(log?.model || '-')}</span>
+                <span class="sd-log-duration" data-log-started-at="${log?.status === 'running' ? startedAt.getTime() : ''}">${escapeHtml(duration)}</span>
+                <span class="sd-log-status-cell">
+                    ${renderStatusBadge(log?.status || 'idle')}
+                    ${hasDetails ? '<span class="sd-log-expand">+</span>' : ''}
+                </span>
+            </summary>
+            ${hasDetails ? '<div class="sd-log-entry-body" data-operation-log-body></div>' : ''}
+        </details>
+    `;
+}
+
+function renderOperationLogBody(log) {
+    return `
+        ${log?.detail ? `<div class="sd-log-context">${escapeHtml(log.detail)}</div>` : ''}
+        ${renderOperationLogDetail('Error', log?.error, 'sd-console--error')}
+        ${renderOperationLogDetail('Request', log?.request)}
+        ${renderOperationLogDetail('Response', log?.response)}
+        ${renderOperationLogDetail('Reasoning', log?.reasoning)}
+    `;
+}
+
+function renderLogsWorkspace() {
+    const logs = Array.isArray(sceneDirectorState.operationLogs) ? sceneDirectorState.operationLogs : [];
+    const runningCount = logs.filter(log => log.status === 'running').length;
+    const errorCount = logs.filter(log => log.status === 'error').length;
+
+    return `
+        <div class="sd-main">
+            ${renderPersistentIssueBanner()}
+            <section class="sd-hero sd-hero--logs">
+                <div>
+                    <div class="sd-eyebrow">Backstage Module</div>
+                    <h3>Logs</h3>
+                    <p>Runtime history for routing, planning and character generations.</p>
+                </div>
+                <div class="sd-hero-meta">
+                    ${renderStatusBadge(errorCount ? 'error' : (runningCount ? 'running' : 'ready'))}
+                    <div class="sd-hero-note">${logs.length} retained operations</div>
+                </div>
+            </section>
+
+            <div class="sd-toolbar">
+                <button id="scene-director-clear-logs" class="menu_button">Clear Logs</button>
+            </div>
+
+            <div class="sd-summary-grid">
+                ${renderStatCard('Operations', String(logs.length), `Retains the latest ${MAX_OPERATION_LOGS}`)}
+                ${renderStatCard('Running', String(runningCount), 'Calls currently in progress')}
+                ${renderStatCard('Errors', String(errorCount), 'Expand a row for diagnostics')}
+                ${renderStatCard('Last Event', logs[0]?.startedAt ? formatPanelTime(new Date(logs[0].startedAt)) : 'never', 'Newest operation first')}
+            </div>
+
+            <section class="sd-card">
+                <div class="sd-card-head">
+                    <div>
+                        <div class="sd-card-title">Operation History</div>
+                        <div class="sd-card-subtitle">Expand a row to inspect its request, response, reasoning and error.</div>
+                    </div>
+                </div>
+                <div class="sd-card-body">
+                    <div class="sd-log-table">
+                        <div class="sd-log-row sd-log-row--head">
+                            <span>Time</span>
+                            <span>Step</span>
+                            <span>Model</span>
+                            <span>Duration</span>
+                            <span>Status</span>
+                        </div>
+                        ${logs.length
+                            ? logs.map(renderOperationLogEntry).join('')
+                            : '<div class="sd-log-empty">No operations recorded in this session.</div>'}
+                    </div>
+                </div>
+            </section>
+        </div>
+    `;
+}
+
+function renderRouterWorkspacePanel() {
     const routerResponseText = getRouterWorkspaceResponseText();
     return `
         <div class="sd-grid">
@@ -4031,15 +4724,6 @@ function renderRouterWorkspacePanel(capturedPrompt) {
 
             ${renderDisclosure('Router Response', 'Resposta direta da ultima chamada OOC ao router ou da ultima execucao capturada.', `
                 <pre class="sd-console sd-console--tall">${escapeHtml(routerResponseText || 'No router response yet.')}</pre>
-                ${sceneDirectorState.lastError ? `<pre class="sd-console sd-console--error">${escapeHtml(sceneDirectorState.lastError)}</pre>` : ''}
-            `)}
-
-            ${renderDisclosure('Reasoning', 'Model-side reasoning extracted from the router call.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(sceneDirectorState.lastReasoning || 'No reasoning returned yet.')}</pre>
-            `)}
-
-            ${renderDisclosure('Last Router Request', 'Useful when the turn result smells wrong and you want the exact payload.', `
-                <pre class="sd-console sd-console--wide">${escapeHtml(capturedPrompt || 'No router request captured yet.')}</pre>
             `)}
         </div>
     `;
@@ -4089,18 +4773,29 @@ function renderRouterConfigPanel(castCount) {
         ${renderCard('Router Prompt Template', 'Editable system prompt used by the turn router.', `
             <textarea id="router-prompt" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(config.routerPrompt)}</textarea>
             ${renderEditorMeta('Autosaves when focus leaves the field.', 'router-prompt-token-counter')}
+            <div class="sd-template-tags" aria-label="Router template tags">
+                ${[
+                    '{{recentChat}}',
+                    '{{storyGuide}}',
+                    '{{worldContext}}',
+                    '{{lorebookContext}}',
+                    '{{lorebookCatalog}}',
+                    '{{players}}',
+                    '{{lastSpeaker}}',
+                    '{{user}}',
+                ].map(tag => `<code>${escapeHtml(tag)}</code>`).join('')}
+            </div>
+            <div class="sd-footnote">Context is fetched and sent only when its tag is present in this template.</div>
         `)}
     `;
 }
 
 function renderRouterWorkspace() {
-    const capturedPrompt = formatPromptMessages(sceneDirectorState.lastPromptMessages);
     const castCount = Array.isArray(config.characters) ? config.characters.length : 0;
     const routerView = sceneDirectorState.routerView === 'config' ? 'config' : 'workspace';
 
     return `
         <div class="sd-main">
-            ${renderPersistentIssueBanner()}
             <section class="sd-hero sd-hero--router">
                 <div>
                     <div class="sd-eyebrow">Backstage Module</div>
@@ -4134,16 +4829,14 @@ function renderRouterWorkspace() {
                 ${renderStatCard('Captured Prompt', sceneDirectorState.lastPromptMessages?.length ? 'Yes' : 'No', 'Latest router request payload')}
             </div>
 
-            ${renderRuntimeTimingCard()}
-
             ${routerView === 'config'
                 ? renderRouterConfigPanel(castCount)
-                : renderRouterWorkspacePanel(capturedPrompt)}
+                : renderRouterWorkspacePanel()}
         </div>
     `;
 }
 
-function renderStoryDirectorWorkspacePanel(storyGuide, capturedPrompt) {
+function renderStoryDirectorWorkspacePanel(storyGuide) {
     const plannerResponseText = getPlannerWorkspaceResponseText();
     return `
         <div class="sd-grid">
@@ -4158,15 +4851,6 @@ function renderStoryDirectorWorkspacePanel(storyGuide, capturedPrompt) {
 
             ${renderDisclosure('Planner Response', 'Resposta direta da ultima chamada ao planner ou do ultimo update do StoryGuide.', `
                 <pre class="sd-console sd-console--tall">${escapeHtml(plannerResponseText || 'No planner response yet.')}</pre>
-                ${sceneDirectorState.plannerError ? `<pre class="sd-console sd-console--error">${escapeHtml(sceneDirectorState.plannerError)}</pre>` : ''}
-            `)}
-
-            ${renderDisclosure('Planner Reasoning', 'Reasoning retornado pela ultima chamada do planner.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(sceneDirectorState.plannerReasoning || 'No planner reasoning returned yet.')}</pre>
-            `)}
-
-            ${renderDisclosure('Last Planner Request', 'Payload exato enviado ao planner.', `
-                <pre class="sd-console sd-console--wide">${escapeHtml(capturedPrompt || 'No planner request captured yet.')}</pre>
             `)}
 
             ${renderDisclosure('StoryGuide', 'Estado privado persistido em chat metadata para este chat.', `
@@ -4186,6 +4870,9 @@ function renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, 
 
                 <label>User turns between planner updates</label>
                 <input type="number" id="planner-user-turn-interval" class="text_pole" min="1" max="100" value="${config.plannerUserTurnInterval}">
+
+                <label>Recent RP messages sent to planner</label>
+                <input type="number" id="planner-context-messages" class="text_pole" min="1" max="5000" value="${config.plannerContextMessages}">
 
                 <label>Selected lorebooks for planner context</label>
                 <div class="sd-inline-actions">
@@ -4213,7 +4900,6 @@ function renderStoryDirectorWorkspace() {
     const storyGuide = getStoryGuide();
     const storyGuideSnapshots = getStoryGuideSnapshots();
     const selectedCount = Array.isArray(config.plannerWorldInfoBooks) ? config.plannerWorldInfoBooks.length : 0;
-    const capturedPrompt = formatPromptMessages(sceneDirectorState.lastPlannerPromptMessages);
     const plannerTurnsSinceUpdate = getPlannerUserTurnCounter();
     const plannerInterval = Math.max(1, Number(config.plannerUserTurnInterval || DEFAULT_CONFIG.plannerUserTurnInterval));
     const turnsUntilAutoUpdate = Math.max(0, plannerInterval - plannerTurnsSinceUpdate);
@@ -4223,7 +4909,6 @@ function renderStoryDirectorWorkspace() {
 
     return `
         <div class="sd-main">
-            ${renderPersistentIssueBanner()}
             <section class="sd-hero sd-hero--director">
                 <div>
                     <div class="sd-eyebrow">Backstage Module</div>
@@ -4260,11 +4945,9 @@ function renderStoryDirectorWorkspace() {
                 ${renderStatCard('Last StoryGuide Save', storyGuideUpdatedAt, 'Timestamp from chat metadata')}
             </div>
 
-            ${renderRuntimeTimingCard()}
-
             ${directorView === 'config'
                 ? renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, turnsUntilAutoUpdate, storyGuideUpdatedAt)
-                : renderStoryDirectorWorkspacePanel(storyGuide, capturedPrompt)}
+                : renderStoryDirectorWorkspacePanel(storyGuide)}
         </div>
     `;
 }
@@ -4292,17 +4975,26 @@ function refreshSceneDirectorPanel() {
     panel.toggleClass('sd-hidden', !sceneDirectorState.panelOpen);
 
     const body = $('#scene-director-panel-body');
+    const workspace = sceneDirectorState.activeTab === 'director'
+        ? renderStoryDirectorWorkspace()
+        : sceneDirectorState.activeTab === 'logs'
+            ? renderLogsWorkspace()
+            : renderRouterWorkspace();
     body.html(`
         <div class="sd-shell">
             ${renderWorkspaceNav()}
-            ${sceneDirectorState.activeTab === 'director' ? renderStoryDirectorWorkspace() : renderRouterWorkspace()}
+            ${workspace}
         </div>
     `);
 
+    const logErrorCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'error').length;
+    const logRunningCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'running').length;
     $('#scene-director-header-status').html(
         sceneDirectorState.activeTab === 'director'
             ? renderStatusBadge(sceneDirectorState.directorStatus)
-            : renderStatusBadge(sceneDirectorState.routerStatus)
+            : sceneDirectorState.activeTab === 'logs'
+                ? renderStatusBadge(logErrorCount ? 'error' : (logRunningCount ? 'running' : 'ready'))
+                : renderStatusBadge(sceneDirectorState.routerStatus)
     );
 
     if (sceneDirectorState.activeTab === 'router') {
@@ -4311,7 +5003,7 @@ function refreshSceneDirectorPanel() {
             initRouterTimedLorebookSelect();
             renderGroupMembers();
         }
-    } else {
+    } else if (sceneDirectorState.activeTab === 'director') {
         if (sceneDirectorState.directorView === 'config') {
             initPlannerProfileDropdown();
             initPlannerWorldInfoSelect();
@@ -4466,21 +5158,11 @@ function refreshVisiblePromptTokenCounters() {
 }
 
 function updateRuntimeTimingUi() {
-    const view = getRuntimeTimingView();
-
-    view.rows.forEach((row, index) => {
-        const stepElement = document.getElementById(`sd-runtime-step-${index}`);
-        const modelElement = document.getElementById(`sd-runtime-model-${index}`);
-        const timeElement = document.getElementById(`sd-runtime-time-${index}`);
-
-        if (stepElement) {
-            stepElement.textContent = row.step;
-        }
-        if (modelElement) {
-            modelElement.textContent = row.model;
-        }
-        if (timeElement) {
-            timeElement.textContent = row.time;
+    const now = Date.now();
+    document.querySelectorAll('#scene-director-panel [data-log-started-at]').forEach(element => {
+        const startedAt = Number(element.getAttribute('data-log-started-at'));
+        if (Number.isFinite(startedAt) && startedAt > 0) {
+            element.textContent = formatDurationMs(now - startedAt);
         }
     });
 }
@@ -4532,6 +5214,9 @@ function persistPlannerPanelFields() {
     if ($('#planner-user-turn-interval').length) {
         config.plannerUserTurnInterval = Math.max(1, parseInt($('#planner-user-turn-interval').val()) || DEFAULT_CONFIG.plannerUserTurnInterval);
     }
+    if ($('#planner-context-messages').length) {
+        config.plannerContextMessages = Math.min(5000, Math.max(1, parseInt($('#planner-context-messages').val()) || DEFAULT_CONFIG.plannerContextMessages));
+    }
     if ($('#planner-world-info-books').length) {
         config.plannerWorldInfoBooks = getSelectedPlannerWorldInfoBooks();
     }
@@ -4578,6 +5263,23 @@ function attachFloatingPanelEvents() {
         preserveVisiblePanelDrafts();
         updateSceneDirectorState({ activeTab: $(this).data('stage') || 'router' });
     });
+    $('#scene-director-panel-body').on('click', '.sd-log-entry > summary', function (event) {
+        const entry = this.parentElement;
+        if (!entry || entry.dataset.empty === 'true') {
+            event.preventDefault();
+            return;
+        }
+
+        const body = entry.querySelector('[data-operation-log-body]');
+        if (!body || body.dataset.loaded === 'true') return;
+
+        const logId = String(entry.dataset.operationLogId ?? '');
+        const log = (sceneDirectorState.operationLogs ?? []).find(item => item.id === logId);
+        if (!log) return;
+
+        body.innerHTML = renderOperationLogBody(log);
+        body.dataset.loaded = 'true';
+    });
     $('#scene-director-panel-body').on('click', '[data-router-view]', function () {
         preserveVisiblePanelDrafts();
         updateRouterState({ routerView: $(this).data('router-view') || 'workspace' });
@@ -4618,7 +5320,6 @@ function attachFloatingPanelEvents() {
             lastError: '',
             triggerSettle: null,
         });
-        clearBackstageIssue();
     });
     $('#scene-director-panel-body').on('click', '#router-send-ooc, #router-send-ooc-toolbar', async () => {
         persistDirectorPanelFields();
@@ -4638,10 +5339,14 @@ function attachFloatingPanelEvents() {
             plannerOocHistory: [],
             lastError: '',
         });
-        clearBackstageIssue();
     });
     $('#scene-director-panel-body').on('click', '#scene-director-clear-issue', () => {
         clearBackstageIssue();
+    });
+    $('#scene-director-panel-body').on('click', '#scene-director-clear-logs', () => {
+        updateSceneDirectorState({
+            operationLogs: (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'running'),
+        });
     });
     $('#scene-director-panel-body').on('click', '#planner-send-ooc, #planner-send-ooc-toolbar', async () => {
         persistPlannerPanelFields();
@@ -4734,7 +5439,7 @@ function attachFloatingPanelEvents() {
     $('#scene-director-panel-body').on('input', '#router-ooc-request', () => {
         sceneDirectorState.routerOocDraft = String($('#router-ooc-request').val() ?? '');
     });
-    $('#scene-director-panel-body').on('focusout', '#planner-user-turn-interval, #planner-prompt, #scene-director-story-guide', () => {
+    $('#scene-director-panel-body').on('focusout', '#planner-user-turn-interval, #planner-context-messages, #planner-prompt, #scene-director-story-guide', () => {
         persistPlannerPanelFields();
     });
     $('#scene-director-panel-body').on('input', '#planner-prompt', () => {
@@ -4743,7 +5448,7 @@ function attachFloatingPanelEvents() {
     $('#scene-director-panel-body').on('input', '#scene-director-story-guide', () => {
         schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
     });
-    $('#scene-director-panel-body').on('change', '#planner-user-turn-interval', () => {
+    $('#scene-director-panel-body').on('change', '#planner-user-turn-interval, #planner-context-messages', () => {
         persistPlannerPanelFields();
     });
     $('#scene-director-panel-body').on('focusout', '#planner-ooc-request', () => {
@@ -5050,7 +5755,7 @@ jQuery(document).ready(async () => {
         setTimeout(async () => {
             const c = SillyTavern.getContext();
             const lastMsg = c.chat[c.chat.length - 1];
-            if (lastMsg?.extra?.type === 'tool_call' || lastMsg?.extra?.type === 'tool_response') {
+            if (isToolInvocationChatMessage(lastMsg)) {
                 return; // ignora mensagens de tool call — GM ainda está gerando
             }
             if (skipNextCharacterAutoRouter) {
@@ -5067,13 +5772,17 @@ jQuery(document).ready(async () => {
         const lastMsg = c.chat[c.chat.length - 1];
         const type = lastMsg?.extra?.type;
         const isEmpty = !lastMsg?.mes?.trim();
-        const isToolCycle = isEmpty || type === 'tool_call' || type === 'tool_response';
+        const isToolCycle = isEmpty || isToolInvocationChatMessage(lastMsg);
         fl('← EVT', 'GENERATION_ENDED', `isProcessing=${isProcessing} | type=${type ?? (isEmpty ? 'empty' : 'msg')} | toolCycle=${isToolCycle}`);
         if (!isProcessing) return;
         if (isToolCycle) {
             fl('  =', 'GENERATION_ENDED', 'tool_call pendente — mantendo isProcessing');
             return;
         }
+        updateActiveOperationLog('character-turn', {
+            response: String(lastMsg?.mes ?? ''),
+            reasoning: String(lastMsg?.extra?.reasoning ?? ''),
+        });
         clearCharacterNote();
         clearStoryGuideInjection();
         clearLorebookInjection();
@@ -5101,7 +5810,7 @@ jQuery(document).ready(async () => {
         clearDirectedOocPrompt();
         clearSceneDirection();
         clearActiveTriggerSettleMonitor();
-        finishRuntimePhase(['character-turn']);
+        finishRuntimePhase(['character-turn'], 'stopped');
         skipNextCharacterAutoRouter = false;
         pendingAutoRouter = false;
         isProcessing = false;
@@ -5115,6 +5824,26 @@ jQuery(document).ready(async () => {
     ctx.eventSource.on(ctx.event_types.CHAT_COMPLETION_PROMPT_READY, ({ chat, dryRun }) => {
         if (dryRun) return;
 
+        const characterOperationLogId = getActiveOperationLogId('character-turn');
+        const characterOperation = (sceneDirectorState.operationLogs ?? []).find(log => log.id === characterOperationLogId);
+        const promptReadyNumber = Math.max(0, Number(characterOperation?.promptReadyCount) || 0) + 1;
+        const beforeRemap = summarizeCompletionMessagesForLog(chat);
+        const hostChat = summarizeHostChatForLog();
+        if (characterOperationLogId) {
+            updateOperationLog(characterOperationLogId, {
+                promptReadyCount: promptReadyNumber,
+            });
+            appendOperationLogDetail(characterOperationLogId, [
+                `Prompt ready ${promptReadyNumber} before remap`,
+                `Completion messages: total=${beforeRemap.total}, nonSystem=${beforeRemap.nonSystem} (${beforeRemap.roles})`,
+                `Host chat at prompt ready: total=${hostChat.total}, user=${hostChat.userCount}, character=${hostChat.characterCount}, system=${hostChat.systemCount}, tools=${hostChat.toolCount}`,
+                `Host chat tail: ${hostChat.lastMessages}`,
+                beforeRemap.nonSystem === 0 && (hostChat.userCount + hostChat.characterCount) > 0
+                    ? 'ANOMALY: host chat exists, but Prompt Manager produced no non-system chat messages.'
+                    : '',
+            ].filter(Boolean).join('\n'));
+        }
+
         const noteMsg    = chat.findLast(m => m.role === 'system' && m.content?.includes('Write the next reply only as '));
         const match      = noteMsg?.content?.match(/Write the next reply only as (.+?)\./);
         const activeChar = match?.[1];
@@ -5122,7 +5851,7 @@ jQuery(document).ready(async () => {
         if (activeChar) {
             const normalizedActiveChar = String(activeChar).trim().toLocaleLowerCase();
             for (const msg of chat) {
-                if (msg.role !== 'assistant') continue;
+                if (msg.role !== 'assistant' || msg.tool_calls != null || msg.function_call != null) continue;
                 const messageName = String(msg.name ?? '').trim().toLocaleLowerCase();
                 const contentHasActivePrefix = String(msg.content ?? '')
                     .trimStart()
@@ -5136,6 +5865,22 @@ jQuery(document).ready(async () => {
                     msg.role = 'user';
                 }
             }
+        }
+
+        if (characterOperationLogId) {
+            const afterRemap = summarizeCompletionMessagesForLog(chat);
+            appendOperationLogDetail(characterOperationLogId, [
+                `Prompt ready ${promptReadyNumber} after remap`,
+                `Completion messages: total=${afterRemap.total}, nonSystem=${afterRemap.nonSystem} (${afterRemap.roles})`,
+            ].join('\n'));
+        }
+    });
+
+    ctx.eventSource.on(ctx.event_types.CHAT_COMPLETION_SETTINGS_READY, (payload) => {
+        try {
+            captureCharacterApiRequest(payload);
+        } catch (error) {
+            console.warn('[Backstage] Failed to capture character API request:', error);
         }
     });
 
