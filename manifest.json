@@ -2,6 +2,7 @@
     "display_name": "Backstage",
     "loading_order": 10,
     "js": "index.js",
+    "generate_interceptor": "backstageGenerationInterceptor",
     "author": "Juliano",
     "version": "0.2.0"
 }

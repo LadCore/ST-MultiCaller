@@ -195,6 +195,7 @@ const DEFAULT_CONFIG = {
 let config = { ...DEFAULT_CONFIG };
 let isProcessing = false;
 let lastActiveChar = null;
+let activeCharacterGenerationGuard = null;
 let isStoryGuideUpdateInProgress = false;
 let contextSnapshotQueue = Promise.resolve();
 const backgroundCalls = new Map();
@@ -1062,6 +1063,62 @@ function publishTriggerSettleSnapshot(monitor, status, note = '') {
     updateRouterState(patch);
 }
 
+function buildChatRecoveryAnchor(ctx = SillyTavern.getContext()) {
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    const messages = chat
+        .filter(message => !message?.is_system && String(message?.mes ?? '').trim())
+        .slice(-3)
+        .map(message => JSON.stringify({
+            name: String(message?.name ?? ''),
+            is_user: !!message?.is_user,
+            mes: String(message?.mes ?? ''),
+        }));
+
+    return {
+        chatLength: chat.length,
+        messages,
+    };
+}
+
+function hasRecoveredChatAnchor(anchor, ctx = SillyTavern.getContext()) {
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    if (!anchor?.messages?.length) {
+        return chat.length >= Math.max(0, Number(anchor?.chatLength) || 0);
+    }
+
+    const currentMessages = chat
+        .filter(message => !message?.is_system && String(message?.mes ?? '').trim())
+        .slice(-anchor.messages.length)
+        .map(message => JSON.stringify({
+            name: String(message?.name ?? ''),
+            is_user: !!message?.is_user,
+            mes: String(message?.mes ?? ''),
+        }));
+
+    return currentMessages.length === anchor.messages.length
+        && currentMessages.every((message, index) => message === anchor.messages[index]);
+}
+
+async function waitForStableChatRecovery(anchor, stableMs = PROFILE_SWITCH_SETTLE_QUIET_MS, maxWaitMs = PROFILE_SWITCH_SETTLE_MAX_WAIT_MS) {
+    const startedAt = Date.now();
+    let stableSince = null;
+
+    while (Date.now() - startedAt < maxWaitMs) {
+        if (hasRecoveredChatAnchor(anchor)) {
+            stableSince ??= Date.now();
+            if (Date.now() - stableSince >= stableMs) {
+                return true;
+            }
+        } else {
+            stableSince = null;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    return false;
+}
+
 function clearActiveTriggerSettleMonitor() {
     if (!activeTriggerSettleMonitor) {
         return;
@@ -1069,6 +1126,7 @@ function clearActiveTriggerSettleMonitor() {
 
     clearTimeout(activeTriggerSettleMonitor.quietTimer);
     clearTimeout(activeTriggerSettleMonitor.maxTimer);
+    clearTimeout(activeTriggerSettleMonitor.pollTimer);
     activeTriggerSettleMonitor = null;
 }
 
@@ -1089,7 +1147,10 @@ function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWIT
         events: [],
         quietTimer: null,
         maxTimer: null,
+        pollTimer: null,
         finished: false,
+        armed: false,
+        recoveryAnchor: null,
         resolve: null,
         promise: null,
     };
@@ -1111,6 +1172,7 @@ function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWIT
         monitor.finished = true;
         clearTimeout(monitor.quietTimer);
         clearTimeout(monitor.maxTimer);
+        clearTimeout(monitor.pollTimer);
 
         if (activeTriggerSettleMonitor === monitor) {
             activeTriggerSettleMonitor = null;
@@ -1124,6 +1186,30 @@ function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWIT
             quietMs: monitor.quietMs,
             maxWaitMs: monitor.maxWaitMs,
         });
+    };
+
+    const checkChatRecovery = () => {
+        if (monitor.finished || !monitor.armed) {
+            return;
+        }
+
+        if (!monitor.anchorSeen && hasRecoveredChatAnchor(monitor.recoveryAnchor)) {
+            monitor.anchorSeen = true;
+            monitor.anchorEventName = `chat-tail:${monitor.recoveryAnchor.messages.length}`;
+            monitor.events.push({
+                name: 'CHAT_RECOVERED',
+                detail: `chatLength=${SillyTavern.getContext()?.chat?.length ?? 0}`,
+                at: new Date(),
+            });
+            scheduleQuietTimer();
+        }
+
+        if (!monitor.anchorSeen) {
+            publishTriggerSettleSnapshot(monitor, 'waiting-anchor', 'Profile applied. Waiting for the pre-switch chat tail to recover.');
+        }
+
+        clearTimeout(monitor.pollTimer);
+        monitor.pollTimer = setTimeout(checkChatRecovery, 100);
     };
 
     monitor.noteEvent = (eventName, detail = '') => {
@@ -1143,32 +1229,42 @@ function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWIT
             monitor.events.splice(0, monitor.events.length - PROFILE_SWITCH_SETTLE_EVENT_LIMIT);
         }
 
-        if (!monitor.anchorSeen) {
-            if (String(eventName ?? '').trim() === 'CHAT_CHANGED') {
-                monitor.anchorSeen = true;
-                monitor.anchorEventName = 'CHAT_CHANGED';
-                scheduleQuietTimer();
-            } else {
-                publishTriggerSettleSnapshot(monitor, 'waiting-anchor', 'Observed profile events, but still waiting for CHAT_CHANGED before arming the quiet window.');
-            }
+        if (!monitor.armed) {
+            publishTriggerSettleSnapshot(monitor, 'applying-profile', 'Recording native events while the connection profile is applied.');
             return;
         }
 
-        scheduleQuietTimer();
+        checkChatRecovery();
+        if (monitor.anchorSeen) {
+            scheduleQuietTimer();
+        }
+    };
+
+    monitor.armRecovery = recoveryAnchor => {
+        if (monitor.finished || monitor.armed) {
+            return;
+        }
+
+        monitor.armed = true;
+        monitor.recoveryAnchor = recoveryAnchor;
+        monitor.deadlineAt = Date.now() + monitor.maxWaitMs;
+        monitor.maxTimer = setTimeout(() => {
+            finish(
+                'failed',
+                monitor.anchorSeen
+                    ? `Chat recovered, but native profile events did not remain quiet for ${monitor.quietMs}ms within ${monitor.maxWaitMs}ms.`
+                    : `Pre-switch chat did not recover within ${monitor.maxWaitMs}ms. Character generation was cancelled.`,
+            );
+        }, monitor.maxWaitMs);
+        checkChatRecovery();
     };
 
     monitor.promise = new Promise(resolve => {
         monitor.resolve = resolve;
     });
 
-    monitor.maxTimer = setTimeout(() => {
-        finish('timeout', monitor.anchorSeen
-            ? `Max wait ${monitor.maxWaitMs}ms reached after anchor. Proceeding anyway.`
-            : `Max wait ${monitor.maxWaitMs}ms reached without CHAT_CHANGED. Proceeding anyway.`);
-    }, monitor.maxWaitMs);
-
     activeTriggerSettleMonitor = monitor;
-    publishTriggerSettleSnapshot(monitor, 'waiting-anchor', 'Waiting for CHAT_CHANGED before starting the quiet window.');
+    publishTriggerSettleSnapshot(monitor, 'applying-profile', 'Recording native events while the connection profile is applied.');
     return monitor;
 }
 
@@ -2386,6 +2482,9 @@ function appendOperationLog(entry) {
         startedAt: entry?.startedAt ? new Date(entry.startedAt) : new Date(),
         completedAt: entry?.completedAt ? new Date(entry.completedAt) : null,
         durationMs: Number.isFinite(Number(entry?.durationMs)) ? Number(entry.durationMs) : null,
+        inputTokens: entry?.inputTokens != null && Number.isFinite(Number(entry.inputTokens))
+            ? Math.max(0, Number(entry.inputTokens))
+            : null,
         request: String(entry?.request ?? ''),
         response: String(entry?.response ?? ''),
         reasoning: String(entry?.reasoning ?? ''),
@@ -2615,15 +2714,27 @@ function formatCharacterRequestSummary(payload, requestNumber, messageCharacters
     ].join('\n');
 }
 
-function replaceCharacterRequestTokenMarker(operationLogId, tokenMarker, value) {
+function replaceCharacterRequestTokenMarker(operationLogId, tokenMarker, value, requestNumber = null) {
     const latest = (sceneDirectorState.operationLogs ?? []).find(log => log.id === operationLogId);
     if (!latest || !String(latest.detail ?? '').includes(tokenMarker)) {
         return;
     }
 
-    updateOperationLog(operationLogId, {
+    const patch = {
         detail: String(latest.detail).replace(tokenMarker, String(value)),
-    });
+    };
+    const numericValue = Number(value);
+    if (requestNumber != null && Number.isFinite(numericValue) && numericValue >= 0) {
+        const requestInputTokens = {
+            ...(latest.requestInputTokens ?? {}),
+            [requestNumber]: numericValue,
+        };
+        patch.requestInputTokens = requestInputTokens;
+        patch.inputTokens = Object.values(requestInputTokens)
+            .reduce((total, tokens) => total + Math.max(0, Number(tokens) || 0), 0);
+    }
+
+    updateOperationLog(operationLogId, patch);
 }
 
 function captureCharacterApiRequest(payload) {
@@ -2668,7 +2779,7 @@ function captureCharacterApiRequest(payload) {
 
     Promise.resolve(tokenCountPromise)
         .then(tokenCount => {
-            replaceCharacterRequestTokenMarker(operationLogId, tokenMarker, tokenCount);
+            replaceCharacterRequestTokenMarker(operationLogId, tokenMarker, tokenCount, requestNumber);
         })
         .catch(error => {
             replaceCharacterRequestTokenMarker(
@@ -3485,6 +3596,7 @@ async function updateStoryGuideFromContext(options = {}) {
         updateStoryDirectorState({ lastPlannerPromptMessages: messages });
         updateOperationLog(operationLogId, {
             request: formatPromptMessages(messages),
+            inputTokens: budgetedRequest.inputTokens,
         });
         const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
@@ -3649,6 +3761,7 @@ async function runPlannerOocRequest() {
         updateStoryDirectorState({ lastPlannerPromptMessages: messages });
         updateActiveOperationLog('planner-ooc', {
             request: formatPromptMessages(messages),
+            inputTokens: budgetedRequest.inputTokens,
         });
         const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
@@ -3751,6 +3864,7 @@ async function runRouterOocRequest() {
         updateRouterState({ lastPromptMessages: messages });
         updateActiveOperationLog('router-ooc', {
             request: formatPromptMessages(messages),
+            inputTokens: budgetedRequest.inputTokens,
         });
         const service = await getConnService();
         const response = await service.sendRequest(
@@ -3960,6 +4074,7 @@ async function callRouterAgent(chatHistory) {
         beginRuntimePhase('router-request', 'Router request', forcedRouterSpeaker ? `Forced speaker: ${forcedRouterSpeaker}` : 'Normal routing', getTimingModelLabel(config.routerProfileId));
         updateActiveOperationLog('router-request', {
             request: formatPromptMessages(lastDirectorRequest.messages),
+            inputTokens: budgetedRequest.inputTokens,
         });
         updateRouterState({ status: 'calling-director' });
 
@@ -4015,6 +4130,54 @@ async function callRouterAgent(chatHistory) {
     }
 }
 
+async function backstageGenerationInterceptor(chat, contextSize, abort, type) {
+    const guard = activeCharacterGenerationGuard;
+    if (!guard) {
+        return;
+    }
+
+    guard.interceptorCalls += 1;
+    const coreChatLength = Array.isArray(chat) ? chat.length : 0;
+    let hasChatHistory = null;
+    let promptManagerError = '';
+
+    try {
+        const { promptManager } = await import('/scripts/openai.js');
+        const promptCollection = promptManager?.getPromptCollection?.(type);
+        hasChatHistory = !!promptCollection?.has?.('chatHistory');
+    } catch (error) {
+        promptManagerError = error?.message ?? String(error);
+    }
+
+    const details = [
+        `Generation interceptor ${guard.interceptorCalls}`,
+        `Attempt: ${Math.max(1, Number(guard.attempt) || 1)}/2`,
+        `Character: ${guard.charName}`,
+        `Type: ${String(type ?? 'normal')}`,
+        `Core chat messages: ${coreChatLength}`,
+        `Prompt Manager chatHistory: ${hasChatHistory === null ? 'inspection failed' : (hasChatHistory ? 'present' : 'missing')}`,
+        `Context size: ${Math.max(0, Number(contextSize) || 0)}`,
+        promptManagerError ? `Prompt Manager inspection error: ${promptManagerError}` : '',
+    ].filter(Boolean).join('\n');
+
+    appendOperationLogDetail(guard.operationLogId, details);
+
+    const abortReason = coreChatLength === 0
+        ? 'ST captured an empty coreChat before prompt assembly.'
+        : (hasChatHistory === false ? 'Prompt Manager collection is missing chatHistory before prompt assembly.' : '');
+
+    if (!abortReason) {
+        return;
+    }
+
+    guard.aborted = true;
+    guard.abortReason = abortReason;
+    appendOperationLogDetail(guard.operationLogId, `GENERATION ABORTED BEFORE API REQUEST: ${abortReason}`);
+    abort(true);
+}
+
+globalThis.backstageGenerationInterceptor = backstageGenerationInterceptor;
+
 // ================= TRIGGER =================
 
 
@@ -4024,31 +4187,39 @@ async function triggerChar(char, decision = null, options = {}) {
     const targetProfile = resolveCharacterProfileForSwitch(char, ctx);
 
     if (char.name !== lastActiveChar && targetProfile.profileName) {
-        lastActiveChar = char.name;
         if (targetProfile.source === 'profileId' && targetProfile.profileName !== char.profileName) {
             char.profileName = targetProfile.profileName;
             saveConfig();
         }
 
+        const recoveryAnchor = buildChatRecoveryAnchor(ctx);
         const settleMonitor = beginTriggerSettleMonitor(char.name, targetProfile.profileName);
         try {
             fl('  →', 'triggerChar', `/profile await=true "${targetProfile.profileName}" | source=${targetProfile.source}${targetProfile.profileId ? ` | id=${targetProfile.profileId}` : ''}`);
             await ctx.executeSlashCommandsWithOptions(`/profile await=true "${targetProfile.profileName}"`);
+            settleMonitor.armRecovery(recoveryAnchor);
             const settleResult = await settleMonitor.promise;
             ctx = SillyTavern.getContext();
 
             fl('  ←', 'triggerChar', `profile settled | status=${settleResult.status} | events=${settleResult.events.length} | chatLength=${Array.isArray(ctx.chat) ? ctx.chat.length : 0}`);
-            if (settleResult.status === 'timeout') {
-                console.warn('[Backstage] Profile switch settle reached max wait before trigger', {
+            if (settleResult.status !== 'settled') {
+                const error = new Error(`Profile switch did not recover a stable chat for ${char.name}.`);
+                console.error('[Backstage] Character generation cancelled after profile switch', {
                     char: char.name,
                     profileName: targetProfile.profileName,
+                    status: settleResult.status,
+                    note: settleResult.note,
                     quietMs: settleResult.quietMs,
                     maxWaitMs: settleResult.maxWaitMs,
                     events: settleResult.events,
                 });
+                recordBackstageIssue(`Character turn: ${char.name}`, `${error.message} ${settleResult.note}`);
+                throw error;
             }
+            lastActiveChar = char.name;
         } catch (error) {
             clearActiveTriggerSettleMonitor();
+            lastActiveChar = null;
             throw error;
         }
     } else {
@@ -4089,8 +4260,81 @@ async function triggerChar(char, decision = null, options = {}) {
     );
     updateRouterState({ status: 'executing' });
 
-    fl('  →', 'triggerChar', `/trigger "${char.name}"`);
-    ctx.executeSlashCommandsWithOptions(`/trigger "${char.name}"`);
+    fl('  →', 'triggerChar', `/trigger await=true "${char.name}"`);
+    const generationGuard = {
+        charName: char.name,
+        operationLogId: characterOperationLogId,
+        interceptorCalls: 0,
+        attempt: 0,
+        aborted: false,
+        abortReason: '',
+    };
+    activeCharacterGenerationGuard = generationGuard;
+    const retryRecoveryAnchor = buildChatRecoveryAnchor(ctx);
+
+    try {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            generationGuard.attempt = attempt;
+            generationGuard.aborted = false;
+            generationGuard.abortReason = '';
+            const callsBeforeAttempt = generationGuard.interceptorCalls;
+
+            await ctx.executeSlashCommandsWithOptions(`/trigger await=true "${char.name}"`);
+
+            if (!generationGuard.aborted) {
+                if (generationGuard.interceptorCalls === callsBeforeAttempt) {
+                    throw new Error('Character generation finished without reaching the Backstage generation interceptor.');
+                }
+                break;
+            }
+
+            const canRetry = attempt === 1
+                && generationGuard.abortReason === 'ST captured an empty coreChat before prompt assembly.';
+            if (!canRetry) {
+                throw new Error(generationGuard.abortReason);
+            }
+
+            appendOperationLogDetail(
+                characterOperationLogId,
+                `RETRY 1/1: Waiting for the pre-trigger chat tail to remain stable for ${PROFILE_SWITCH_SETTLE_QUIET_MS}ms before repeating /trigger.`,
+            );
+            const recovered = await waitForStableChatRecovery(retryRecoveryAnchor);
+            if (!recovered) {
+                throw new Error(`Chat did not remain stable within ${PROFILE_SWITCH_SETTLE_MAX_WAIT_MS}ms after the empty coreChat abort.`);
+            }
+
+            ctx = SillyTavern.getContext();
+            appendOperationLogDetail(
+                characterOperationLogId,
+                formatHostChatSummaryForLog('Retry pre-trigger snapshot', summarizeHostChatForLog(ctx)),
+            );
+            fl('  â†’', 'triggerChar', `/trigger retry 1/1 await=true "${char.name}"`);
+        }
+    } catch (error) {
+        const message = error?.message ?? String(error);
+        updateOperationLog(characterOperationLogId, { error: message });
+        appendOperationLogDetail(characterOperationLogId, `Character generation failed: ${message}`);
+        recordBackstageIssue(`Character turn: ${char.name}`, message);
+        clearCharacterNote();
+        clearStoryGuideInjection();
+        clearLorebookInjection();
+        clearDirectedOocPrompt();
+        clearSceneDirection();
+        finishRuntimePhase(['character-turn'], 'error');
+        skipNextCharacterAutoRouter = false;
+        pendingAutoRouter = false;
+        isProcessing = false;
+        unlockChat();
+        updateRouterState({
+            status: 'error',
+            lastError: message,
+        });
+        throw error;
+    } finally {
+        if (activeCharacterGenerationGuard === generationGuard) {
+            activeCharacterGenerationGuard = null;
+        }
+    }
     fl('← END', 'triggerChar', `char=${char.name}`);
 }
 
@@ -4608,6 +4852,9 @@ function renderOperationLogDetail(label, value, extraClass = '') {
 function renderOperationLogEntry(log) {
     const startedAt = log?.startedAt ? new Date(log.startedAt) : new Date();
     const duration = log?.durationMs != null ? formatDurationMs(log.durationMs) : '0.0s';
+    const inputTokens = log?.inputTokens != null && Number.isFinite(Number(log.inputTokens))
+        ? Math.round(Number(log.inputTokens)).toLocaleString()
+        : '-';
     const hasDetails = !!(
         String(log?.detail ?? '').trim()
         || String(log?.error ?? '').trim()
@@ -4622,6 +4869,7 @@ function renderOperationLogEntry(log) {
                 <span>${escapeHtml(formatPanelTime(startedAt))}</span>
                 <span title="${escapeHtml(log?.step || '-')}">${escapeHtml(log?.step || '-')}</span>
                 <span title="${escapeHtml(log?.model || '-')}">${escapeHtml(log?.model || '-')}</span>
+                <span title="Estimated input tokens">${escapeHtml(inputTokens)}</span>
                 <span class="sd-log-duration" data-log-started-at="${log?.status === 'running' ? startedAt.getTime() : ''}">${escapeHtml(duration)}</span>
                 <span class="sd-log-status-cell">
                     ${renderStatusBadge(log?.status || 'idle')}
@@ -4687,6 +4935,7 @@ function renderLogsWorkspace() {
                             <span>Time</span>
                             <span>Step</span>
                             <span>Model</span>
+                            <span>Tokens</span>
                             <span>Duration</span>
                             <span>Status</span>
                         </div>
