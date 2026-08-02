@@ -11,7 +11,7 @@
             <div class="sd-header-copy">
                 <div class="sd-eyebrow">SillyTavern RP Control</div>
                 <div class="sd-title">Backstage</div>
-                <div class="sd-subtitle">Turn Router and Story Director in one clean control room.</div>
+                <div class="sd-subtitle">Routing, story planning and specialized RP agents in one control room.</div>
             </div>
             <div class="sd-header-actions">
                 <span id="scene-director-header-status"></span>
@@ -90,8 +90,8 @@
         position: absolute;
         right: 0;
         bottom: 50px;
-        width: min(1280px, calc(100vw - 24px));
-        max-height: min(900px, calc(100vh - 152px));
+        width: min(1540px, calc(100vw - 24px));
+        max-height: min(960px, calc(100vh - 128px));
         display: flex;
         flex-direction: column;
         gap: 14px;
@@ -728,6 +728,164 @@
         text-align: center;
     }
 
+    #scene-director-panel .sd-agent-shell {
+        display: grid;
+        grid-template-columns: 250px minmax(0, 1fr);
+        gap: 16px;
+        min-height: 560px;
+    }
+
+    #scene-director-panel .sd-agent-list-pane,
+    #scene-director-panel .sd-agent-content {
+        min-width: 0;
+    }
+
+    #scene-director-panel .sd-agent-list-pane {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 14px;
+        border: 1px solid var(--sd-border);
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.12);
+    }
+
+    #scene-director-panel .sd-agent-list-head,
+    #scene-director-panel .sd-agent-list-title-row,
+    #scene-director-panel .sd-agent-danger-zone {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    #scene-director-panel .sd-agent-count {
+        min-width: 28px;
+        padding: 3px 7px;
+        border: 1px solid var(--sd-border);
+        border-radius: 999px;
+        color: var(--sd-text-dim);
+        text-align: center;
+        font-size: 11px;
+    }
+
+    #scene-director-panel .sd-agent-create {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+    }
+
+    #scene-director-panel .sd-agent-create input {
+        min-width: 0;
+    }
+
+    #scene-director-panel .sd-agent-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-height: 0;
+        overflow: auto;
+    }
+
+    #scene-director-panel .sd-agent-list-item {
+        width: 100%;
+        display: grid;
+        gap: 5px;
+        padding: 10px;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        text-align: left;
+        cursor: pointer;
+    }
+
+    #scene-director-panel .sd-agent-list-item:hover {
+        border-color: var(--sd-border);
+        background: rgba(255, 255, 255, 0.04);
+    }
+
+    #scene-director-panel .sd-agent-list-item--active {
+        border-color: rgba(99, 194, 141, 0.42);
+        background: var(--sd-accent-soft);
+    }
+
+    #scene-director-panel .sd-agent-list-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 800;
+    }
+
+    #scene-director-panel .sd-agent-list-tag,
+    #scene-director-panel .sd-agent-list-schedule {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--sd-text-dim);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+    }
+
+    #scene-director-panel .sd-agent-state-dot {
+        width: 8px;
+        height: 8px;
+        flex: 0 0 auto;
+        border-radius: 999px;
+        background: var(--sd-text-dim);
+    }
+
+    #scene-director-panel .sd-agent-state-dot--success {
+        background: var(--sd-accent);
+    }
+
+    #scene-director-panel .sd-agent-state-dot--danger {
+        background: var(--sd-danger);
+    }
+
+    #scene-director-panel .sd-agent-state-dot--info {
+        background: var(--sd-info);
+    }
+
+    #scene-director-panel .sd-agent-state-dot--warning {
+        background: var(--sd-warning);
+    }
+
+    #scene-director-panel .sd-agent-content {
+        min-height: 0;
+    }
+
+    #scene-director-panel .sd-agent-empty {
+        display: grid;
+        place-content: center;
+        min-height: 420px;
+        padding: 32px;
+        border: 1px dashed var(--sd-border-strong);
+        border-radius: 8px;
+        color: var(--sd-text-dim);
+        text-align: center;
+    }
+
+    #scene-director-panel .sd-agent-empty h4 {
+        margin: 0 0 8px;
+        color: var(--SmartThemeBodyColor, #ddd);
+        font-size: 18px;
+    }
+
+    #scene-director-panel .sd-agent-danger-zone {
+        grid-column: 1 / -1;
+        padding: 14px;
+        border: 1px solid rgba(255, 142, 120, 0.28);
+        border-radius: 8px;
+        background: rgba(255, 142, 120, 0.06);
+    }
+
+    #scene-director-panel .menu_button.danger {
+        border-color: rgba(255, 142, 120, 0.42);
+        color: #ffd8d0;
+    }
+
     #scene-director-panel .sd-footnote {
         margin-top: 10px;
         font-size: 12px;
@@ -870,6 +1028,15 @@
 
         #scene-director-panel .sd-row {
             grid-template-columns: 1fr;
+        }
+
+        #scene-director-panel .sd-agent-shell {
+            grid-template-columns: 1fr;
+            min-height: 0;
+        }
+
+        #scene-director-panel .sd-agent-list {
+            max-height: 240px;
         }
     }
 </style>

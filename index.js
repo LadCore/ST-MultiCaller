@@ -5,7 +5,8 @@ const EXTENSION_DISPLAY_NAME = 'Backstage';
 const EXTENSION_LABEL = 'Backstage';
 const ROUTER_LABEL = 'Turn Router';
 const STORY_DIRECTOR_LABEL = 'Story Director';
-const CURRENT_CONFIG_VERSION = 10;
+const AGENTS_LABEL = 'Agents';
+const CURRENT_CONFIG_VERSION = 12;
 const DEFAULT_WORLD_CONTEXT_CHARS = 0;
 const PROFILE_SWITCH_SETTLE_QUIET_MS = 2000;
 const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
@@ -14,6 +15,12 @@ const STORY_GUIDE_SNAPSHOT_RETENTION = 3;
 const STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_PLANNER_CONTEXT_MESSAGES = 500;
 const MAX_OPERATION_LOGS = 100;
+const DEFAULT_AGENT_CONTEXT_MESSAGES = 100;
+const AGENT_SCHEDULE_TYPES = new Set(['manual', 'user-turns', 'total-turns', 'character-turns']);
+const LOCAL_CONFIG_STORAGE_KEY = `st_${EXTENSION_NAME}_settings`;
+const LEGACY_CONFIG_BACKUP_KEY = `${LOCAL_CONFIG_STORAGE_KEY}_legacy_backup`;
+const NATIVE_SETTINGS_NAMESPACE = 'backstage';
+const NATIVE_SETTINGS_STORAGE_VERSION = 1;
 
 const DEFAULT_SCENE_DIRECTOR_PROMPT = `You are the RP Scene Director for a SillyTavern group roleplay.
 
@@ -171,6 +178,9 @@ Planner pause the RP for a while`;
 const ROUTER_OOC_DEFAULT_DRAFT = `OOC
 
 Router pause the RP for a while`;
+const AGENT_OOC_DEFAULT_DRAFT = `OOC
+
+Pause the RP for a while`;
 
 const DEFAULT_CONFIG = {
     configVersion:     CURRENT_CONFIG_VERSION,
@@ -189,6 +199,7 @@ const DEFAULT_CONFIG = {
     routerPrompt:      DEFAULT_SCENE_DIRECTOR_PROMPT,
     plannerPrompt:     DEFAULT_STORY_PLANNER_PROMPT,
     characters: [],
+    agents: [],
     // characters: [{ name, profileId, profileName }]
 };
 
@@ -200,11 +211,15 @@ let isStoryGuideUpdateInProgress = false;
 let contextSnapshotQueue = Promise.resolve();
 const backgroundCalls = new Map();
 const activeOperationLogIds = new Map();
+let agentSchedulerQueue = Promise.resolve();
+const runningAgentIds = new Set();
 let sceneDirectorState = {
     panelOpen: false,
     activeTab: 'router',
     directorView: 'workspace',
     routerView: 'workspace',
+    agentView: 'workspace',
+    activeAgentId: '',
     routerStatus: 'idle',
     routerUpdatedAt: null,
     directorStatus: 'idle',
@@ -222,6 +237,8 @@ let sceneDirectorState = {
     routerOocHistory: [],
     plannerOocDraft: PLANNER_OOC_DEFAULT_DRAFT,
     plannerOocHistory: [],
+    agentOocDrafts: {},
+    agentOocHistories: {},
     routerTimedLorebookSearch: '',
     persistentIssue: '',
     persistentIssueSource: '',
@@ -269,8 +286,169 @@ function fl(direction, method, detail = '') {
 
 // ================= CONFIG =================
 
+function buildLocalDirectorConfig() {
+    return {
+        configVersion: CURRENT_CONFIG_VERSION,
+        plannerProfileId: config.plannerProfileId,
+        plannerUserTurnInterval: config.plannerUserTurnInterval,
+        plannerContextMessages: config.plannerContextMessages,
+        plannerWorldInfoBooks: config.plannerWorldInfoBooks,
+        plannerPrompt: config.plannerPrompt,
+    };
+}
+
+function buildNativeRouterAgentConfig() {
+    return {
+        storageVersion: NATIVE_SETTINGS_STORAGE_VERSION,
+        router: {
+            enabled: config.enabled,
+            profileId: config.routerProfileId,
+            inputTokenBudget: config.routerInputTokenBudget,
+            worldContextChars: config.worldContextChars,
+            prompt: config.routerPrompt,
+            characters: config.characters,
+            timedLorebook: {
+                book: config.routerTimedLorebookBook,
+                uid: config.routerTimedLorebookUid,
+                name: config.routerTimedLorebookName,
+                triggerRegex: config.routerTimedLorebookTriggerRegex,
+            },
+        },
+        agents: config.agents,
+    };
+}
+
+function hasMeaningfulRouterAgentValues(value) {
+    const source = value && typeof value === 'object' ? value : {};
+    const agents = Array.isArray(source.agents) ? source.agents : [];
+    const characters = Array.isArray(source.characters) ? source.characters : [];
+    return agents.length > 0
+        || !!String(source.routerProfileId ?? '').trim()
+        || characters.some(character => String(character?.profileId ?? '').trim())
+        || (!!String(source.routerPrompt ?? '').trim() && source.routerPrompt !== DEFAULT_SCENE_DIRECTOR_PROMPT)
+        || !!String(source.routerTimedLorebookBook ?? '').trim()
+        || !!String(source.routerTimedLorebookUid ?? '').trim()
+        || !!String(source.routerTimedLorebookTriggerRegex ?? '').trim()
+        || Math.max(0, parseInt(source.routerInputTokenBudget) || 0) !== DEFAULT_CONFIG.routerInputTokenBudget
+        || Math.max(0, parseInt(source.worldContextChars) || 0) !== DEFAULT_CONFIG.worldContextChars
+        || source.enabled === false;
+}
+
+function applyNativeRouterAgentConfig(nativeSettings) {
+    const router = nativeSettings?.router && typeof nativeSettings.router === 'object'
+        ? nativeSettings.router
+        : {};
+    const timedLorebook = router.timedLorebook && typeof router.timedLorebook === 'object'
+        ? router.timedLorebook
+        : {};
+
+    config.enabled = router.enabled ?? config.enabled;
+    config.routerProfileId = String(router.profileId ?? config.routerProfileId ?? '');
+    config.routerInputTokenBudget = Math.max(0, parseInt(router.inputTokenBudget) || 0);
+    config.worldContextChars = Math.max(0, parseInt(router.worldContextChars) || 0);
+    config.routerPrompt = String(router.prompt ?? config.routerPrompt ?? DEFAULT_SCENE_DIRECTOR_PROMPT);
+    config.characters = Array.isArray(router.characters) ? router.characters : config.characters;
+    config.routerTimedLorebookBook = String(timedLorebook.book ?? config.routerTimedLorebookBook ?? '');
+    config.routerTimedLorebookUid = String(timedLorebook.uid ?? config.routerTimedLorebookUid ?? '');
+    config.routerTimedLorebookName = String(timedLorebook.name ?? config.routerTimedLorebookName ?? '');
+    config.routerTimedLorebookTriggerRegex = String(timedLorebook.triggerRegex ?? config.routerTimedLorebookTriggerRegex ?? '');
+    config.agents = normalizeAgentDefinitions(nativeSettings?.agents);
+}
+
 function saveConfig() {
-    localStorage.setItem(`st_${EXTENSION_NAME}_settings`, JSON.stringify(config));
+    const ctx = SillyTavern.getContext();
+    const nativeSettings = buildNativeRouterAgentConfig();
+    const extensionSettingsRoot = ctx?.extensionSettings?.[EXTENSION_NAME];
+    const currentNative = extensionSettingsRoot?.[NATIVE_SETTINGS_NAMESPACE];
+    const hasNativeSettings = Number(currentNative?.storageVersion) >= NATIVE_SETTINGS_STORAGE_VERSION;
+    const hasMeaningfulNativeValues = hasMeaningfulRouterAgentValues({
+        ...config,
+        agents: config.agents,
+        characters: config.characters,
+    });
+
+    if (!hasNativeSettings && hasMeaningfulNativeValues && !localStorage.getItem(LEGACY_CONFIG_BACKUP_KEY)) {
+        localStorage.setItem(LEGACY_CONFIG_BACKUP_KEY, JSON.stringify(config));
+    }
+
+    const localJson = JSON.stringify(buildLocalDirectorConfig());
+    if (localStorage.getItem(LOCAL_CONFIG_STORAGE_KEY) !== localJson) {
+        localStorage.setItem(LOCAL_CONFIG_STORAGE_KEY, localJson);
+    }
+
+    if (!ctx?.extensionSettings || (!hasNativeSettings && !hasMeaningfulNativeValues)) return;
+
+    const currentNativeJson = JSON.stringify(currentNative ?? null);
+    const nextNativeJson = JSON.stringify(nativeSettings);
+    if (currentNativeJson === nextNativeJson) return;
+
+    ctx.extensionSettings[EXTENSION_NAME] = {
+        ...(extensionSettingsRoot && typeof extensionSettingsRoot === 'object' ? extensionSettingsRoot : {}),
+        [NATIVE_SETTINGS_NAMESPACE]: nativeSettings,
+    };
+    ctx.saveSettingsDebounced?.();
+}
+
+function normalizeAgentId(value) {
+    return String(value ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 64);
+}
+
+function createUniqueAgentId(name, agents = config.agents) {
+    const base = normalizeAgentId(name) || 'agent';
+    const used = new Set((Array.isArray(agents) ? agents : []).map(agent => normalizeAgentId(agent?.id)));
+    if (!used.has(base)) return base;
+
+    let suffix = 2;
+    while (used.has(`${base}-${suffix}`)) suffix += 1;
+    return `${base}-${suffix}`;
+}
+
+function normalizeAgentDefinition(agent, index = 0) {
+    const name = String(agent?.name ?? `Agent ${index + 1}`).trim() || `Agent ${index + 1}`;
+    const scheduleType = AGENT_SCHEDULE_TYPES.has(String(agent?.scheduleType ?? 'manual'))
+        ? String(agent.scheduleType)
+        : 'manual';
+
+    return {
+        id: normalizeAgentId(agent?.id) || createUniqueAgentId(name, []),
+        name,
+        enabled: agent?.enabled !== false,
+        profileId: String(agent?.profileId ?? ''),
+        profileName: String(agent?.profileName ?? ''),
+        prompt: String(agent?.prompt ?? ''),
+        scheduleType,
+        interval: Math.min(10000, Math.max(1, parseInt(agent?.interval) || 5)),
+        characterName: String(agent?.characterName ?? '').trim(),
+        referenceCharacterAvatar: String(agent?.referenceCharacterAvatar ?? ''),
+        referenceCharacterName: String(agent?.referenceCharacterName ?? '').trim(),
+        worldInfoBooks: Array.isArray(agent?.worldInfoBooks)
+            ? agent.worldInfoBooks.map(name => String(name ?? '').trim()).filter(Boolean)
+            : [],
+        contextMessages: Math.min(5000, Math.max(1, parseInt(agent?.contextMessages) || DEFAULT_AGENT_CONTEXT_MESSAGES)),
+    };
+}
+
+function normalizeAgentDefinitions(agents) {
+    const normalized = [];
+    const used = new Set();
+
+    for (const source of Array.isArray(agents) ? agents : []) {
+        const agent = normalizeAgentDefinition(source, normalized.length);
+        const baseId = agent.id;
+        let candidate = baseId;
+        let suffix = 2;
+        while (used.has(candidate)) candidate = `${baseId}-${suffix++}`;
+        agent.id = candidate;
+        used.add(candidate);
+        normalized.push(agent);
+    }
+
+    return normalized;
 }
 
 function isLegacyRouterPrompt(prompt) {
@@ -337,18 +515,54 @@ function migrateConfig() {
         if (needsStoryPlannerPromptRefresh(config.plannerPrompt)) {
             config.plannerPrompt = DEFAULT_STORY_PLANNER_PROMPT;
         }
+        config.agents = normalizeAgentDefinitions(config.agents);
         delete config.maxTokens;
         config.configVersion = CURRENT_CONFIG_VERSION;
         saveConfig();
     }
 }
 
-function loadConfig() {
-    const saved = localStorage.getItem(`st_${EXTENSION_NAME}_settings`);
-    if (saved) {
-        config = { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
+function parseStoredConfig(storageKey) {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return { raw: '', value: null };
+
+    try {
+        const value = JSON.parse(raw);
+        return { raw, value: value && typeof value === 'object' ? value : null };
+    } catch (error) {
+        console.warn(`[Backstage] Could not parse stored config ${storageKey}:`, error);
+        return { raw, value: null };
     }
+}
+
+function loadConfig() {
+    const currentLocal = parseStoredConfig(LOCAL_CONFIG_STORAGE_KEY);
+    const legacyBackup = parseStoredConfig(LEGACY_CONFIG_BACKUP_KEY);
+    const legacySource = hasMeaningfulRouterAgentValues(currentLocal.value)
+        ? currentLocal.value
+        : (hasMeaningfulRouterAgentValues(legacyBackup.value) ? legacyBackup.value : null);
+    config = {
+        ...DEFAULT_CONFIG,
+        ...(legacySource ?? {}),
+        ...(currentLocal.value ?? {}),
+    };
+
+    const ctx = SillyTavern.getContext();
+    const nativeSettings = ctx?.extensionSettings?.[EXTENSION_NAME]?.[NATIVE_SETTINGS_NAMESPACE];
+    const hasNativeSettings = Number(nativeSettings?.storageVersion) >= NATIVE_SETTINGS_STORAGE_VERSION;
+
+    if (hasNativeSettings) {
+        applyNativeRouterAgentConfig(nativeSettings);
+    } else {
+        if (currentLocal.raw && hasMeaningfulRouterAgentValues(currentLocal.value) && !legacyBackup.raw) {
+            localStorage.setItem(LEGACY_CONFIG_BACKUP_KEY, currentLocal.raw);
+        }
+        config.agents = normalizeAgentDefinitions(config.agents);
+    }
+
     migrateConfig();
+    config.agents = normalizeAgentDefinitions(config.agents);
+    if (!hasNativeSettings && legacySource) saveConfig();
 }
 
 const routerTimedLorebookEntryCache = new Map();
@@ -2097,7 +2311,7 @@ function routerPromptUsesTag(tag, template = config.routerPrompt) {
 }
 
 function buildRouterSystemPrompt(routerContext) {
-    return renderTemplate(config.routerPrompt, {
+    return renderTemplate(resolveAgentTagsInText(config.routerPrompt), {
         lastSpeaker: routerContext.lastSpeaker,
         players: routerContext.playerNames,
         recentChat: routerContext.recentChat,
@@ -2475,6 +2689,7 @@ function appendOperationLog(entry) {
     const normalized = {
         id: String(entry?.id ?? createOperationLogId()),
         kind: String(entry?.kind ?? 'event'),
+        agentId: String(entry?.agentId ?? ''),
         step: String(entry?.step ?? 'Event'),
         model: String(entry?.model ?? '-'),
         detail: String(entry?.detail ?? ''),
@@ -2485,6 +2700,7 @@ function appendOperationLog(entry) {
         inputTokens: entry?.inputTokens != null && Number.isFinite(Number(entry.inputTokens))
             ? Math.max(0, Number(entry.inputTokens))
             : null,
+        context: String(entry?.context ?? ''),
         request: String(entry?.request ?? ''),
         response: String(entry?.response ?? ''),
         reasoning: String(entry?.reasoning ?? ''),
@@ -3048,6 +3264,597 @@ function getSceneDirectorMetadata(ctx = SillyTavern.getContext()) {
     return ctx.chatMetadata.sceneDirector;
 }
 
+function getAgentDefinition(agentId) {
+    const cleanId = normalizeAgentId(agentId);
+    return (Array.isArray(config.agents) ? config.agents : [])
+        .find(agent => normalizeAgentId(agent?.id) === cleanId) ?? null;
+}
+
+function getAgentMetadata(ctx = SillyTavern.getContext()) {
+    const metadata = getSceneDirectorMetadata(ctx);
+    metadata.agents ??= {};
+    return metadata.agents;
+}
+
+function getAgentRuntimeState(agentId, ctx = SillyTavern.getContext()) {
+    const cleanId = normalizeAgentId(agentId);
+    const agents = getAgentMetadata(ctx);
+    const current = agents[cleanId] && typeof agents[cleanId] === 'object' ? agents[cleanId] : {};
+    return {
+        output: String(current.output ?? ''),
+        updatedAt: String(current.updatedAt ?? ''),
+        runId: String(current.runId ?? ''),
+        lastStatus: String(current.lastStatus ?? 'idle'),
+        lastError: String(current.lastError ?? ''),
+        pendingTurns: Math.max(0, Number(current.pendingTurns) || 0),
+        lastTrigger: String(current.lastTrigger ?? ''),
+    };
+}
+
+function saveAgentRuntimeState(agentId, patch, ctx = SillyTavern.getContext()) {
+    const cleanId = normalizeAgentId(agentId);
+    if (!cleanId) return null;
+
+    const agents = getAgentMetadata(ctx);
+    agents[cleanId] = {
+        ...getAgentRuntimeState(cleanId, ctx),
+        ...patch,
+    };
+    ctx.saveMetadata?.();
+    return agents[cleanId];
+}
+
+function getAgentDependencies(template) {
+    const dependencies = [];
+    const pattern = /{{\s*agent:([a-zA-Z0-9_-]+)\s*}}/gi;
+    let match;
+    while ((match = pattern.exec(String(template ?? ''))) !== null) {
+        const id = normalizeAgentId(match[1]);
+        if (id && !dependencies.includes(id)) dependencies.push(id);
+    }
+    return dependencies;
+}
+
+function getAgentOutputSnapshot(agentId, ctx = SillyTavern.getContext()) {
+    const definition = getAgentDefinition(agentId);
+    const runtime = getAgentRuntimeState(agentId, ctx);
+    return {
+        id: normalizeAgentId(agentId),
+        name: definition?.name || agentId,
+        output: runtime.output,
+        runId: runtime.runId,
+        updatedAt: runtime.updatedAt,
+    };
+}
+
+function resolveCharacterByName(referenceName, ctx = SillyTavern.getContext()) {
+    const query = String(referenceName ?? '').trim().toLowerCase();
+    const characters = Array.isArray(ctx.characters) ? ctx.characters : [];
+    if (!query) return { character: null, status: 'empty' };
+
+    const exactMatches = characters.filter(character => String(character?.name ?? '').trim().toLowerCase() === query);
+    if (exactMatches.length === 1) return { character: exactMatches[0], status: 'exact' };
+    if (exactMatches.length > 1) return { character: null, status: 'ambiguous' };
+
+    const firstNameMatches = characters.filter(character => {
+        const firstName = String(character?.name ?? '').trim().toLowerCase().split(/\s+/)[0];
+        return firstName === query;
+    });
+    if (firstNameMatches.length === 1) return { character: firstNameMatches[0], status: 'first-name' };
+    if (firstNameMatches.length > 1) return { character: null, status: 'ambiguous' };
+    return { character: null, status: 'not-found' };
+}
+
+function getCharacterPersonalityTagReferences(template, ctx = SillyTavern.getContext()) {
+    const references = [];
+    const seen = new Set();
+    const pattern = /{{\s*characterPersonality\s*:\s*([^{}]+?)\s*}}/gi;
+    let match;
+
+    while ((match = pattern.exec(String(template ?? ''))) !== null) {
+        const query = String(match[1] ?? '').trim();
+        const key = query.toLowerCase();
+        if (!query || seen.has(key)) continue;
+        seen.add(key);
+        const resolved = resolveCharacterByName(query, ctx);
+        references.push({
+            query,
+            status: resolved.status,
+            name: String(resolved.character?.name ?? ''),
+            avatar: String(resolved.character?.avatar ?? ''),
+            personality: getCharacterCardValue(resolved.character, 'personality'),
+        });
+    }
+
+    return references;
+}
+
+function resolveAgentTagsInText(template, ctx = SillyTavern.getContext(), snapshots = null) {
+    const values = snapshots instanceof Map ? snapshots : null;
+    const withAgentOutputs = String(template ?? '').replace(/{{\s*agent:([a-zA-Z0-9_-]+)\s*}}/gi, (_match, rawId) => {
+        const id = normalizeAgentId(rawId);
+        const snapshot = values?.get(id) ?? getAgentOutputSnapshot(id, ctx);
+        return snapshot?.output?.trim() || `[No output available for agent:${id}]`;
+    });
+
+    return withAgentOutputs.replace(/{{\s*characterPersonality\s*:\s*([^{}]+?)\s*}}/gi, (_match, rawName) => {
+        const query = String(rawName ?? '').trim();
+        const resolved = resolveCharacterByName(query, ctx);
+        if (!resolved.character) {
+            return resolved.status === 'ambiguous'
+                ? `[Character personality reference is ambiguous: ${query}]`
+                : `[Character personality not found: ${query}]`;
+        }
+
+        return getCharacterCardValue(resolved.character, 'personality')
+            || `[Character personality not provided: ${resolved.character.name || query}]`;
+    });
+}
+
+function getAgentReferenceCharacter(agent, ctx = SillyTavern.getContext()) {
+    const characters = Array.isArray(ctx.characters) ? ctx.characters : [];
+    const avatar = String(agent?.referenceCharacterAvatar ?? '');
+    const name = String(agent?.referenceCharacterName ?? '').trim();
+
+    return characters.find(character => String(character?.avatar ?? '') === avatar)
+        ?? characters.find(character => String(character?.name ?? '').trim().toLowerCase() === name.toLowerCase())
+        ?? null;
+}
+
+function getCharacterCardValue(character, ...fieldNames) {
+    const data = character?.data ?? character ?? {};
+    for (const fieldName of fieldNames) {
+        const value = data[fieldName] ?? character?.[fieldName];
+        if (value != null && String(value).trim()) return String(value).trim();
+    }
+    return '';
+}
+
+function getAgentCharacterReference(agent, ctx = SillyTavern.getContext()) {
+    const character = getAgentReferenceCharacter(agent, ctx);
+    return {
+        name: String(character?.name ?? agent?.referenceCharacterName ?? '').trim(),
+        avatar: String(character?.avatar ?? agent?.referenceCharacterAvatar ?? ''),
+        personality: getCharacterCardValue(character, 'personality'),
+        scenario: getCharacterCardValue(character, 'scenario'),
+        creatorNotes: getCharacterCardValue(character, 'creator_notes', 'creatorcomment'),
+    };
+}
+
+async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getContext()) {
+    const realMessages = getRpContextMessages(ctx.chat);
+    const recentMessages = realMessages.slice(-agent.contextMessages);
+    const recentChatEntries = formatRpContextMessages(recentMessages, ctx.name1 || '');
+    const dependencies = getAgentDependencies(agent.prompt);
+    const dependencySnapshots = new Map(
+        dependencies.map(id => [id, getAgentOutputSnapshot(id, ctx)]),
+    );
+    const characterReference = getAgentCharacterReference(agent, ctx);
+    const characterPersonalityReferences = getCharacterPersonalityTagReferences(agent.prompt, ctx);
+    const [lorebookContext, lorebookCatalog] = await Promise.all([
+        routerPromptUsesTag('lorebookContext', agent.prompt)
+            ? getSelectedWorldInfoContext(ctx, agent.worldInfoBooks)
+            : Promise.resolve({
+                text: '',
+                source: 'agent-template-tag-not-used',
+                selectedBooks: [],
+                activatedEntries: [],
+                length: 0,
+            }),
+        routerPromptUsesTag('lorebookCatalog', agent.prompt)
+            ? getSelectedWorldInfoCatalog(agent.worldInfoBooks, { fullContent: true })
+            : Promise.resolve({
+                text: '',
+                source: 'agent-template-tag-not-used',
+                selectedBooks: [],
+                entryCount: 0,
+            }),
+    ]);
+
+    return {
+        agentId: agent.id,
+        agentName: agent.name,
+        promptTemplate: agent.prompt,
+        previousOutput: getAgentRuntimeState(agent.id, ctx).output,
+        recentChatEntries,
+        recentChat: recentChatEntries.join('\n'),
+        humanName: String(ctx.name1 ?? ''),
+        lastSpeaker: String(realMessages[realMessages.length - 1]?.name ?? 'Unknown'),
+        trigger: String(trigger?.label ?? trigger?.type ?? 'manual'),
+        dependencies: Object.fromEntries(dependencySnapshots),
+        characterReference,
+        characterPersonalityReferences,
+        lorebookContext,
+        lorebookCatalog,
+    };
+}
+
+function buildAgentMessages(agentContext, options = {}) {
+    const dependencySnapshots = new Map(Object.entries(agentContext.dependencies ?? {}));
+    const withAgentOutputs = resolveAgentTagsInText(agentContext.promptTemplate, SillyTavern.getContext(), dependencySnapshots);
+    const systemPrompt = renderTemplate(withAgentOutputs, {
+        recentChat: agentContext.recentChat,
+        previousOutput: agentContext.previousOutput || '[No previous output]',
+        user: agentContext.humanName,
+        lastSpeaker: agentContext.lastSpeaker,
+        trigger: agentContext.trigger,
+        characterPersonality: agentContext.characterReference?.personality || '[Character personality not provided]',
+        characterScenario: agentContext.characterReference?.scenario || '[Character scenario not provided]',
+        characterCreatorNotes: agentContext.characterReference?.creatorNotes || '[Character creator notes not provided]',
+        lorebookContext: agentContext.lorebookContext?.text || '[No activated lorebook context]',
+        lorebookCatalog: agentContext.lorebookCatalog?.text || '[No selected lorebook catalog]',
+    });
+
+    if (options.mode === 'ooc') {
+        return [
+            { role: 'system', content: systemPrompt },
+            {
+                role: 'system',
+                content: 'Agent workspace mode. Respond directly to the operator in OOC. Do not replace the agent persistent output unless the operator explicitly asks you to draft a replacement. Do not narrate in-character prose.',
+            },
+            ...(Array.isArray(options.priorHistory) ? options.priorHistory : []),
+            { role: 'user', content: String(options.oocRequest ?? '').trim() },
+        ];
+    }
+
+    return [
+        { role: 'system', content: systemPrompt },
+        {
+            role: 'user',
+            content: 'Run your assigned task now. Return only the complete updated output for this agent.',
+        },
+    ];
+}
+
+function formatAgentContextForLog(agentContext) {
+    return JSON.stringify({
+        agent: {
+            id: agentContext.agentId,
+            name: agentContext.agentName,
+        },
+        trigger: agentContext.trigger,
+        user: agentContext.humanName,
+        lastSpeaker: agentContext.lastSpeaker,
+        recentChatMessages: agentContext.recentChatEntries?.length ?? 0,
+        previousOutput: agentContext.previousOutput,
+        dependencies: agentContext.dependencies,
+        characterReference: agentContext.characterReference,
+        characterPersonalityReferences: agentContext.characterPersonalityReferences,
+        lorebookContext: agentContext.lorebookContext,
+        lorebookCatalog: agentContext.lorebookCatalog,
+    }, null, 2);
+}
+
+function getLatestAgentOperation(agentId) {
+    const cleanId = normalizeAgentId(agentId);
+    return (sceneDirectorState.operationLogs ?? []).find(log => log.agentId === cleanId) ?? null;
+}
+
+function sortScheduledAgents(agentIds) {
+    const due = new Set(agentIds.map(normalizeAgentId));
+    const visiting = new Set();
+    const visited = new Set();
+    const result = [];
+
+    const visit = id => {
+        if (visited.has(id)) return;
+        if (visiting.has(id)) {
+            throw new Error(`Circular agent dependency detected at agent:${id}.`);
+        }
+
+        visiting.add(id);
+        const agent = getAgentDefinition(id);
+        for (const dependency of getAgentDependencies(agent?.prompt)) {
+            if (getAgentDefinition(dependency)) visit(dependency);
+        }
+        visiting.delete(id);
+        visited.add(id);
+        if (due.has(id)) result.push(id);
+    };
+
+    for (const id of due) visit(id);
+    return result;
+}
+
+function agentScheduleMatchesEvent(agent, event) {
+    if (!agent.enabled || agent.scheduleType === 'manual') return false;
+    if (agent.scheduleType === 'user-turns') return event.type === 'user';
+    if (agent.scheduleType === 'total-turns') return event.type === 'user' || event.type === 'character';
+    if (agent.scheduleType !== 'character-turns' || event.type !== 'character') return false;
+
+    const target = String(agent.characterName ?? '').trim().toLocaleLowerCase();
+    const speaker = String(event.characterName ?? '').trim().toLocaleLowerCase();
+    if (!target || !speaker) return false;
+    return target === speaker || target.split(/\s+/)[0] === speaker.split(/\s+/)[0];
+}
+
+async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual run' }) {
+    const agent = getAgentDefinition(agentId);
+    if (!agent) throw new Error(`Agent not found: ${agentId}`);
+    if (runningAgentIds.has(agent.id)) return null;
+
+    const ctx = SillyTavern.getContext();
+    const originChatKey = getChatContextKey(ctx);
+    const operationKind = `agent:${agent.id}`;
+    const model = getTimingModelLabel(agent.profileId, agent.profileName);
+    const logId = beginOperationLog(operationKind, `Agent: ${agent.name}`, trigger.label || trigger.type, model);
+    updateOperationLog(logId, { agentId: agent.id });
+    runningAgentIds.add(agent.id);
+    saveAgentRuntimeState(agent.id, {
+        lastStatus: 'running',
+        lastError: '',
+        lastTrigger: trigger.label || trigger.type,
+    }, ctx);
+    refreshSceneDirectorPanel();
+
+    try {
+        if (!agent.profileId) throw new Error(`Agent ${agent.name} has no Connection Profile.`);
+        if (!agent.prompt.trim()) throw new Error(`Agent ${agent.name} has an empty prompt.`);
+        sortScheduledAgents([agent.id]);
+
+        const agentContext = await buildAgentContextSnapshot(agent, trigger, ctx);
+        const budgetedRequest = await fitContextMessagesToInputBudget(
+            agent.profileId,
+            agentContext,
+            buildAgentMessages,
+        );
+        const messages = budgetedRequest.messages;
+        updateOperationLog(logId, {
+            context: formatAgentContextForLog(budgetedRequest.context),
+            request: formatPromptMessages(messages),
+            inputTokens: budgetedRequest.inputTokens,
+            detail: [
+                `Trigger: ${trigger.label || trigger.type}`,
+                `Profile: ${agent.profileName || agent.profileId}`,
+                `Dependencies: ${getAgentDependencies(agent.prompt).map(id => `agent:${id}`).join(', ') || 'none'}`,
+                `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
+                `Recent RP messages: ${budgetedRequest.context?.recentChatEntries?.length ?? 0}`,
+                `Input budget: ${budgetedRequest.budget}`,
+                `Input trimmed: ${budgetedRequest.trimmed}`,
+            ].join('\n'),
+        });
+
+        const response = await sendPlannerStreamingRequest(agent.profileId, messages);
+        const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
+        const responseText = stripMarkdownFence(extractResponseText(response));
+        if (!responseText) throw new Error(`Agent ${agent.name} returned an empty output.`);
+        if (getChatContextKey(SillyTavern.getContext()) !== originChatKey) {
+            throw new Error(`Chat changed while agent ${agent.name} was running. Output was not saved.`);
+        }
+
+        const currentRuntime = getAgentRuntimeState(agent.id, ctx);
+        const consumedTurns = trigger.type === 'manual'
+            ? currentRuntime.pendingTurns
+            : Math.max(1, Number(trigger.consumedTurns) || agent.interval);
+        const runId = `agent-run-${Date.now()}-${agent.id}`;
+        saveAgentRuntimeState(agent.id, {
+            output: responseText,
+            updatedAt: new Date().toISOString(),
+            runId,
+            lastStatus: 'success',
+            lastError: '',
+            lastTrigger: trigger.label || trigger.type,
+            pendingTurns: Math.max(0, currentRuntime.pendingTurns - consumedTurns),
+        }, ctx);
+        updateOperationLog(logId, {
+            response: responseText,
+            reasoning: String(reasoning ?? ''),
+            runId,
+        });
+        completeOperationLog(logId, 'success');
+        return responseText;
+    } catch (error) {
+        const message = error?.message ?? String(error);
+        saveAgentRuntimeState(agent.id, {
+            lastStatus: 'error',
+            lastError: message,
+            lastTrigger: trigger.label || trigger.type,
+        }, ctx);
+        updateOperationLog(logId, { error: message });
+        completeOperationLog(logId, 'error');
+        sceneDirectorState = {
+            ...sceneDirectorState,
+            persistentIssue: message,
+            persistentIssueSource: `Agent: ${agent.name}`,
+            persistentIssueAt: new Date(),
+        };
+        refreshSceneDirectorPanel();
+        throw error;
+    } finally {
+        runningAgentIds.delete(agent.id);
+        refreshSceneDirectorPanel();
+    }
+}
+
+function getAgentOocDraft(agentId) {
+    const id = normalizeAgentId(agentId);
+    return String(sceneDirectorState.agentOocDrafts?.[id] ?? AGENT_OOC_DEFAULT_DRAFT);
+}
+
+function getAgentOocHistory(agentId) {
+    const id = normalizeAgentId(agentId);
+    const history = sceneDirectorState.agentOocHistories?.[id];
+    return Array.isArray(history) ? history : [];
+}
+
+function updateAgentOocState(agentId, patch = {}) {
+    const id = normalizeAgentId(agentId);
+    if (!id) return;
+
+    sceneDirectorState = {
+        ...sceneDirectorState,
+        agentOocDrafts: Object.hasOwn(patch, 'draft')
+            ? { ...(sceneDirectorState.agentOocDrafts ?? {}), [id]: String(patch.draft ?? '') }
+            : sceneDirectorState.agentOocDrafts,
+        agentOocHistories: Object.hasOwn(patch, 'history')
+            ? { ...(sceneDirectorState.agentOocHistories ?? {}), [id]: Array.isArray(patch.history) ? patch.history : [] }
+            : sceneDirectorState.agentOocHistories,
+    };
+}
+
+async function runAgentOocRequest(agentId) {
+    const agent = getAgentDefinition(agentId);
+    if (!agent) throw new Error(`Agent not found: ${agentId}`);
+    if (!agent.profileId) {
+        toastr.warning(`Configure a Connection Profile for ${agent.name} first.`, EXTENSION_LABEL);
+        return null;
+    }
+    if (runningAgentIds.has(agent.id)) {
+        toastr.info(`${agent.name} is already running.`, EXTENSION_LABEL);
+        return null;
+    }
+
+    const oocRequest = getAgentOocDraft(agent.id).trim();
+    if (!oocRequest) {
+        toastr.info('Write an OOC request first.', EXTENSION_LABEL);
+        return null;
+    }
+
+    const ctx = SillyTavern.getContext();
+    const originChatKey = getChatContextKey(ctx);
+    const operationKind = `agent-ooc:${agent.id}`;
+    const logId = beginOperationLog(
+        operationKind,
+        `Agent OOC: ${agent.name}`,
+        'Direct agent workspace request',
+        getTimingModelLabel(agent.profileId, agent.profileName),
+    );
+    updateOperationLog(logId, { agentId: agent.id });
+    runningAgentIds.add(agent.id);
+    refreshSceneDirectorPanel();
+
+    try {
+        const agentContext = await buildAgentContextSnapshot(
+            agent,
+            { type: 'ooc', label: 'Manual OOC request from Agents workspace' },
+            ctx,
+        );
+        const priorHistory = getAgentOocHistory(agent.id)
+            .slice(-12)
+            .map(message => ({
+                role: message?.role === 'user' ? 'user' : 'assistant',
+                content: String(message?.content ?? ''),
+            }));
+        const budgetedRequest = await fitContextMessagesToInputBudget(
+            agent.profileId,
+            agentContext,
+            currentContext => buildAgentMessages(currentContext, {
+                mode: 'ooc',
+                priorHistory,
+                oocRequest,
+            }),
+        );
+        const messages = budgetedRequest.messages;
+        updateOperationLog(logId, {
+            context: formatAgentContextForLog(budgetedRequest.context),
+            request: formatPromptMessages(messages),
+            inputTokens: budgetedRequest.inputTokens,
+            detail: [
+                `Profile: ${agent.profileName || agent.profileId}`,
+                `History messages: ${priorHistory.length}`,
+                `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
+                `Input budget: ${budgetedRequest.budget}`,
+                `Input trimmed: ${budgetedRequest.trimmed}`,
+            ].join('\n'),
+        });
+
+        const response = await sendPlannerStreamingRequest(agent.profileId, messages);
+        const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
+        const responseText = stripMarkdownFence(extractResponseText(response));
+        if (!responseText) throw new Error(`Agent ${agent.name} returned an empty OOC response.`);
+        if (getChatContextKey(SillyTavern.getContext()) !== originChatKey) {
+            throw new Error(`Chat changed while ${agent.name} OOC was running. Response was discarded.`);
+        }
+
+        const nextHistory = [
+            ...getAgentOocHistory(agent.id),
+            { role: 'user', content: oocRequest },
+            { role: 'assistant', content: responseText },
+        ];
+        updateAgentOocState(agent.id, {
+            draft: AGENT_OOC_DEFAULT_DRAFT,
+            history: nextHistory,
+        });
+        updateOperationLog(logId, {
+            response: responseText,
+            reasoning: String(reasoning ?? ''),
+        });
+        completeOperationLog(logId, 'success');
+        return responseText;
+    } catch (error) {
+        const message = error?.message ?? String(error);
+        updateOperationLog(logId, { error: message });
+        completeOperationLog(logId, 'error');
+        sceneDirectorState = {
+            ...sceneDirectorState,
+            persistentIssue: message,
+            persistentIssueSource: `Agent OOC: ${agent.name}`,
+            persistentIssueAt: new Date(),
+        };
+        toastr.error(message, EXTENSION_LABEL);
+        return null;
+    } finally {
+        runningAgentIds.delete(agent.id);
+        refreshSceneDirectorPanel();
+    }
+}
+
+async function runDueAgents(agentIds, event) {
+    let orderedIds;
+    try {
+        orderedIds = sortScheduledAgents(agentIds);
+    } catch (error) {
+        const logId = appendOperationLog({
+            kind: 'agent-scheduler',
+            step: 'Agent scheduler',
+            status: 'error',
+            completedAt: new Date(),
+            durationMs: 0,
+            error: error?.message ?? String(error),
+        });
+        completeOperationLog(logId, 'error');
+        return;
+    }
+
+    for (const id of orderedIds) {
+        const agent = getAgentDefinition(id);
+        const runtime = getAgentRuntimeState(id);
+        if (!agent?.enabled || runtime.pendingTurns < agent.interval) continue;
+        try {
+            await executeAgent(id, {
+                type: 'scheduled',
+                label: event.label,
+                consumedTurns: agent.interval,
+            });
+        } catch (error) {
+            console.error(`[Backstage] Scheduled agent ${id} failed:`, error);
+        }
+    }
+}
+
+function scheduleAgentsForTurn(event) {
+    if (!config.enabled) return;
+    const ctx = SillyTavern.getContext();
+    const dueIds = [];
+    let changed = false;
+
+    for (const agent of Array.isArray(config.agents) ? config.agents : []) {
+        if (!agentScheduleMatchesEvent(agent, event)) continue;
+        const runtime = getAgentRuntimeState(agent.id, ctx);
+        const pendingTurns = runtime.pendingTurns + 1;
+        saveAgentRuntimeState(agent.id, { pendingTurns }, ctx);
+        changed = true;
+        if (pendingTurns >= agent.interval) dueIds.push(agent.id);
+    }
+
+    if (changed) refreshSceneDirectorPanel();
+    if (!dueIds.length) return;
+
+    agentSchedulerQueue = agentSchedulerQueue
+        .catch(() => {})
+        .then(() => runDueAgents(dueIds, event));
+}
+
 function getStoryGuide(ctx = SillyTavern.getContext()) {
     return String(getSceneDirectorMetadata(ctx).storyGuide ?? '');
 }
@@ -3471,7 +4278,7 @@ async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.ge
 }
 
 function buildPlannerMessages(plannerContext, options = {}) {
-    const plannerPrompt = renderTemplate(config.plannerPrompt || DEFAULT_STORY_PLANNER_PROMPT, {
+    const plannerPrompt = renderTemplate(resolveAgentTagsInText(config.plannerPrompt || DEFAULT_STORY_PLANNER_PROMPT), {
         user: plannerContext.humanName,
     });
     const contextBlock = `Current StoryGuide:
@@ -4797,6 +5604,295 @@ function renderRouterTimedLorebookStatus() {
     `;
 }
 
+function getSelectedAgent() {
+    const agents = Array.isArray(config.agents) ? config.agents : [];
+    const selected = agents.find(agent => agent.id === sceneDirectorState.activeAgentId) ?? agents[0] ?? null;
+    if (selected && sceneDirectorState.activeAgentId !== selected.id) {
+        sceneDirectorState.activeAgentId = selected.id;
+    }
+    return selected;
+}
+
+function formatAgentSchedule(agent) {
+    if (!agent || agent.scheduleType === 'manual') return 'Manual only';
+    if (agent.scheduleType === 'user-turns') return `Every ${agent.interval} user turns`;
+    if (agent.scheduleType === 'total-turns') return `Every ${agent.interval} total turns`;
+    return `Every ${agent.interval} turns by ${agent.characterName || 'unassigned character'}`;
+}
+
+function renderAgentList(selectedAgent) {
+    const agents = Array.isArray(config.agents) ? config.agents : [];
+    return `
+        <aside class="sd-agent-list-pane">
+            <div class="sd-agent-list-head">
+                <div>
+                    <div class="sd-card-title">Configured agents</div>
+                    <div class="sd-card-subtitle">Definitions are global; outputs stay with each chat.</div>
+                </div>
+                <span class="sd-agent-count">${agents.length}</span>
+            </div>
+            <div class="sd-agent-create">
+                <input id="agent-new-name" class="text_pole" type="text" placeholder="Agent name" maxlength="80">
+                <button id="agent-create" class="menu_button primary">Add</button>
+            </div>
+            <div class="sd-agent-list">
+                ${agents.length ? agents.map(agent => {
+                    const runtime = getAgentRuntimeState(agent.id);
+                    return `
+                        <button class="sd-agent-list-item${selectedAgent?.id === agent.id ? ' sd-agent-list-item--active' : ''}" data-agent-id="${escapeHtml(agent.id)}">
+                            <span class="sd-agent-list-title-row">
+                                <span class="sd-agent-list-name">${escapeHtml(agent.name)}</span>
+                                <span class="sd-agent-state-dot sd-agent-state-dot--${escapeHtml(getStatusTone(runtime.lastStatus))}"></span>
+                            </span>
+                            <span class="sd-agent-list-tag">{{agent:${escapeHtml(agent.id)}}}</span>
+                            <span class="sd-agent-list-schedule">${escapeHtml(formatAgentSchedule(agent))}</span>
+                        </button>
+                    `;
+                }).join('') : '<div class="sd-log-empty">No agents configured.</div>'}
+            </div>
+        </aside>
+    `;
+}
+
+function renderAgentWorkspacePanel(agent) {
+    const runtime = getAgentRuntimeState(agent.id);
+    const latestLog = getLatestAgentOperation(agent.id);
+    const dependencies = getAgentDependencies(agent.prompt);
+    const updatedAt = runtime.updatedAt ? formatPanelTime(new Date(runtime.updatedAt)) : 'never';
+    const turnsUntilRun = agent.scheduleType === 'manual' ? '-' : Math.max(0, agent.interval - runtime.pendingTurns);
+
+    return `
+        <div class="sd-grid">
+            <div class="sd-summary-grid">
+                ${renderStatCard('Status', formatStateLabel(runtime.lastStatus), runtime.lastError || 'Latest persisted state')}
+                ${renderStatCard('Pending turns', String(runtime.pendingTurns), agent.scheduleType === 'manual' ? 'Manual schedule' : `${turnsUntilRun} until next run`)}
+                ${renderStatCard('Dependencies', String(dependencies.length), dependencies.map(id => `agent:${id}`).join(', ') || 'No agent tags')}
+                ${renderStatCard('Last update', updatedAt, runtime.runId || 'No successful run')}
+            </div>
+
+            ${renderDisclosure('Agent Output', 'Persistent output available through this agent tag.', `
+                <textarea id="agent-output" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(runtime.output)}</textarea>
+                ${renderEditorMeta('Stored per chat. Autosaves when focus leaves the field.', 'agent-output-token-counter')}
+            `, { open: true })}
+
+            ${renderDisclosure('Reasoning', 'Reasoning captured from the latest execution in this session.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.reasoning || 'No reasoning captured in this session.')}</pre>
+            `)}
+            ${renderDisclosure('Context', 'Exact resolved context snapshot recorded for the latest execution.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.context || 'No context captured in this session.')}</pre>
+            `)}
+            ${renderDisclosure('Request', 'Messages sent to the selected Connection Profile.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.request || 'No request captured in this session.')}</pre>
+            `)}
+            ${runtime.lastError || latestLog?.error ? renderDisclosure('Error', 'Latest execution failure. The previous valid output was preserved.', `
+                <pre class="sd-console sd-console--error">${escapeHtml(runtime.lastError || latestLog?.error)}</pre>
+            `, { open: true }) : ''}
+        </div>
+    `;
+}
+
+function renderAgentOocPanel(agent) {
+    const history = getAgentOocHistory(agent.id);
+    const transcript = formatOocTranscript(history);
+    const latestLog = (sceneDirectorState.operationLogs ?? [])
+        .find(log => log.agentId === agent.id && log.kind === `agent-ooc:${agent.id}`) ?? null;
+
+    return `
+        <div class="sd-grid">
+            ${renderDisclosure('Agent OOC', 'Direct and disposable conversation with this agent using its current context.', `
+                <textarea id="agent-ooc-request" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(getAgentOocDraft(agent.id))}</textarea>
+                <div class="sd-inline-actions">
+                    <button id="agent-send-ooc" class="menu_button primary" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Send OOC</button>
+                    <button id="agent-clear-ooc-draft" class="menu_button">Reset Draft</button>
+                    <button id="agent-clear-ooc-history" class="menu_button">Clear Conversation</button>
+                </div>
+                <div class="sd-footnote">Uses this agent's profile, prompt, RP context, character reference, lorebooks and prior OOC messages. It does not replace Agent Output.</div>
+            `, { open: true })}
+
+            ${renderDisclosure('OOC Conversation', 'Newest messages are shown first.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(transcript || 'No OOC conversation yet.')}</pre>
+            `, { open: true })}
+
+            ${renderDisclosure('Reasoning', 'Reasoning captured from the latest OOC request in this session.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.reasoning || 'No OOC reasoning captured in this session.')}</pre>
+            `)}
+            ${renderDisclosure('Context', 'Resolved context snapshot from the latest OOC request.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.context || 'No OOC context captured in this session.')}</pre>
+            `)}
+            ${renderDisclosure('Request', 'Messages sent for the latest OOC request.', `
+                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.request || 'No OOC request captured in this session.')}</pre>
+            `)}
+            ${latestLog?.error ? renderDisclosure('Error', 'Latest OOC request failure.', `
+                <pre class="sd-console sd-console--error">${escapeHtml(latestLog.error)}</pre>
+            `, { open: true }) : ''}
+        </div>
+    `;
+}
+
+function renderAgentReferenceCharacterOptions(agent, ctx = SillyTavern.getContext()) {
+    const characters = [...(Array.isArray(ctx.characters) ? ctx.characters : [])]
+        .filter(character => character?.avatar && character?.name)
+        .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+    const selectedAvatar = String(agent.referenceCharacterAvatar ?? '');
+    const hasSelectedCharacter = characters.some(character => String(character.avatar) === selectedAvatar);
+    const missingSelection = selectedAvatar && !hasSelectedCharacter
+        ? `<option value="${escapeHtml(selectedAvatar)}" selected>${escapeHtml(agent.referenceCharacterName || 'Unavailable character')} (unavailable)</option>`
+        : '';
+
+    return `
+        <option value="">No reference character</option>
+        ${missingSelection}
+        ${characters.map(character => `
+            <option value="${escapeHtml(character.avatar)}" ${String(character.avatar) === selectedAvatar ? 'selected' : ''}>${escapeHtml(character.name)}</option>
+        `).join('')}
+    `;
+}
+
+function renderAgentConfigPanel(agent) {
+    const characterSchedule = agent.scheduleType === 'character-turns';
+    const selectedLorebookCount = Array.isArray(agent.worldInfoBooks) ? agent.worldInfoBooks.length : 0;
+    return `
+        <div class="sd-grid sd-grid--double">
+            ${renderCard('Agent Settings', 'Identity, connection and execution cadence.', `
+                <label class="sd-checkbox-row" for="agent-enabled">
+                    <input id="agent-enabled" type="checkbox" ${agent.enabled ? 'checked' : ''}>
+                    <span>Enable automatic execution</span>
+                </label>
+                <label>Name</label>
+                <input id="agent-name" class="text_pole" type="text" maxlength="80" value="${escapeHtml(agent.name)}">
+                <label>Output tag</label>
+                <input class="text_pole" type="text" readonly value="{{agent:${escapeHtml(agent.id)}}}">
+                <div class="sd-footnote">The ID remains stable when the display name changes.</div>
+                <label>Connection profile</label>
+                <select id="agent-profile-dropdown" class="text_pole"></select>
+                <label>Reference character</label>
+                <select id="agent-reference-character" class="text_pole">
+                    ${renderAgentReferenceCharacterOptions(agent)}
+                </select>
+                <div class="sd-footnote">Makes the selected card fields available through prompt tags. Nothing is injected unless a tag is used.</div>
+                <label>Schedule</label>
+                <select id="agent-schedule-type" class="text_pole">
+                    <option value="manual" ${agent.scheduleType === 'manual' ? 'selected' : ''}>Manual only</option>
+                    <option value="user-turns" ${agent.scheduleType === 'user-turns' ? 'selected' : ''}>User turns</option>
+                    <option value="total-turns" ${agent.scheduleType === 'total-turns' ? 'selected' : ''}>Total RP turns</option>
+                    <option value="character-turns" ${characterSchedule ? 'selected' : ''}>Specific character turns</option>
+                </select>
+                <label>Turns between updates</label>
+                <input id="agent-interval" class="text_pole" type="number" min="1" max="10000" value="${agent.interval}">
+                <label>Character name</label>
+                <input id="agent-character-name" class="text_pole" type="text" value="${escapeHtml(agent.characterName)}" ${characterSchedule ? '' : 'disabled'} placeholder="Exact or first name">
+                <label>Recent RP messages available to {{recentChat}}</label>
+                <input id="agent-context-messages" class="text_pole" type="number" min="1" max="5000" value="${agent.contextMessages}">
+            `)}
+            ${renderCard('Prompt Template', 'The complete system prompt for this specialized agent.', `
+                <div class="sd-template-tags">
+                    <code>{{recentChat}}</code><code>{{previousOutput}}</code><code>{{user}}</code>
+                    <code>{{lastSpeaker}}</code><code>{{trigger}}</code><code>{{agent:id}}</code>
+                    <code>{{characterPersonality}}</code><code>{{characterScenario}}</code><code>{{characterCreatorNotes}}</code>
+                    <code>{{characterPersonality:Name}}</code>
+                    <code>{{lorebookContext}}</code><code>{{lorebookCatalog}}</code>
+                </div>
+                <textarea id="agent-prompt" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(agent.prompt)}</textarea>
+                ${renderEditorMeta('Dependencies are detected from {{agent:id}} tags. Autosaves on blur.', 'agent-prompt-token-counter')}
+            `)}
+            ${renderCard('Lorebook Scope', 'Select the books this agent can resolve through its lorebook tags.', `
+                <div class="sd-inline-actions">
+                    <button id="agent-world-info-all" class="menu_button">Select All</button>
+                    <button id="agent-world-info-none" class="menu_button">Clear All</button>
+                    <span id="agent-world-info-count" class="sd-muted">${selectedLorebookCount} selected</span>
+                </div>
+                <div id="agent-world-info-books" class="sd-checkbox-list"></div>
+                <div class="sd-footnote"><code>{{lorebookContext}}</code> resolves activated entries. <code>{{lorebookCatalog}}</code> resolves every entry from the selected books.</div>
+            `)}
+            <div class="sd-agent-danger-zone">
+                <div>
+                    <div class="sd-card-title">Delete agent</div>
+                    <div class="sd-card-subtitle">Removes the global definition and this chat's stored output.</div>
+                </div>
+                <button id="agent-delete" class="menu_button danger">Delete</button>
+            </div>
+        </div>
+    `;
+}
+
+function renderAgentViewPanel(agent, view) {
+    if (view === 'config') return renderAgentConfigPanel(agent);
+    if (view === 'ooc') return renderAgentOocPanel(agent);
+    return renderAgentWorkspacePanel(agent);
+}
+
+function switchAgentView(nextView) {
+    const view = ['workspace', 'ooc', 'config'].includes(nextView) ? nextView : 'workspace';
+    const agent = getSelectedAgent();
+    preserveVisiblePanelDrafts();
+    sceneDirectorState.agentView = view;
+
+    $('#scene-director-panel-body [data-agent-view]')
+        .removeClass('sd-subnav-button--active')
+        .filter(`[data-agent-view="${view}"]`)
+        .addClass('sd-subnav-button--active');
+    $('#scene-director-panel-body [data-agent-workspace-action]')
+        .toggleClass('sd-hidden', view !== 'workspace');
+
+    const content = $('#scene-director-panel-body .sd-agent-content');
+    if (!content.length) {
+        refreshSceneDirectorPanel();
+        return;
+    }
+
+    content.html(agent
+        ? renderAgentViewPanel(agent, view)
+        : '<div class="sd-agent-empty"><h4>Create the first agent</h4><p>Give it a name, assign a Connection Profile and write one focused task.</p></div>');
+
+    if (agent && view === 'config') {
+        initAgentProfileDropdown();
+        initAgentWorldInfoSelect();
+    }
+    refreshVisiblePromptTokenCounters();
+}
+
+function renderAgentsWorkspace() {
+    const agent = getSelectedAgent();
+    const view = ['workspace', 'ooc', 'config'].includes(sceneDirectorState.agentView)
+        ? sceneDirectorState.agentView
+        : 'workspace';
+    const runtime = agent ? getAgentRuntimeState(agent.id) : null;
+    return `
+        <div class="sd-main sd-main--agents">
+            <section class="sd-hero sd-hero--agents">
+                <div>
+                    <div class="sd-eyebrow">Backstage Module</div>
+                    <h3>${escapeHtml(AGENTS_LABEL)}</h3>
+                    <p>Build focused state agents, schedule their updates and compose their outputs through stable prompt tags.</p>
+                </div>
+                <div class="sd-hero-meta">
+                    ${renderStatusBadge(runtime?.lastStatus || 'idle')}
+                    <div class="sd-hero-note">${agent ? escapeHtml(`{{agent:${agent.id}}}`) : 'No selected agent'}</div>
+                </div>
+            </section>
+            ${renderPersistentIssueBanner()}
+            <div class="sd-toolbar">
+                ${agent ? `<button id="agent-run" data-agent-workspace-action class="menu_button primary${view === 'workspace' ? '' : ' sd-hidden'}" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Run Now</button>` : ''}
+                ${agent ? `<button id="agent-copy-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Copy Output</button>` : ''}
+                ${agent ? `<button id="agent-clear-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Clear Output</button>` : ''}
+                <div class="sd-subnav">
+                    <button class="menu_button sd-subnav-button${view === 'workspace' ? ' sd-subnav-button--active' : ''}" data-agent-view="workspace">Workspace</button>
+                    <button class="menu_button sd-subnav-button${view === 'ooc' ? ' sd-subnav-button--active' : ''}" data-agent-view="ooc">OOC</button>
+                    <button class="menu_button sd-subnav-button${view === 'config' ? ' sd-subnav-button--active' : ''}" data-agent-view="config">Config</button>
+                </div>
+            </div>
+            <div class="sd-agent-shell">
+                ${renderAgentList(agent)}
+                <section class="sd-agent-content">
+                    ${agent
+                        ? renderAgentViewPanel(agent, view)
+                        : '<div class="sd-agent-empty"><h4>Create the first agent</h4><p>Give it a name, assign a Connection Profile and write one focused task.</p></div>'}
+                </section>
+            </div>
+        </div>
+    `;
+}
+
 function renderWorkspaceNav() {
     const errorCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'error').length;
     const items = [
@@ -4809,6 +5905,11 @@ function renderWorkspaceNav() {
             key: 'director',
             title: STORY_DIRECTOR_LABEL,
             copy: 'Maintain the private StoryGuide, planner prompt and lorebook scope.',
+        },
+        {
+            key: 'agents',
+            title: AGENTS_LABEL,
+            copy: 'Configure focused agents, schedules, outputs and dependencies.',
         },
         {
             key: 'logs',
@@ -4858,6 +5959,7 @@ function renderOperationLogEntry(log) {
     const hasDetails = !!(
         String(log?.detail ?? '').trim()
         || String(log?.error ?? '').trim()
+        || String(log?.context ?? '').trim()
         || String(log?.request ?? '').trim()
         || String(log?.response ?? '').trim()
         || String(log?.reasoning ?? '').trim()
@@ -4885,6 +5987,7 @@ function renderOperationLogBody(log) {
     return `
         ${log?.detail ? `<div class="sd-log-context">${escapeHtml(log.detail)}</div>` : ''}
         ${renderOperationLogDetail('Error', log?.error, 'sd-console--error')}
+        ${renderOperationLogDetail('Context', log?.context)}
         ${renderOperationLogDetail('Request', log?.request)}
         ${renderOperationLogDetail('Response', log?.response)}
         ${renderOperationLogDetail('Reasoning', log?.reasoning)}
@@ -5032,6 +6135,7 @@ function renderRouterConfigPanel(castCount) {
                     '{{players}}',
                     '{{lastSpeaker}}',
                     '{{user}}',
+                    '{{agent:id}}',
                 ].map(tag => `<code>${escapeHtml(tag)}</code>`).join('')}
             </div>
             <div class="sd-footnote">Context is fetched and sent only when its tag is present in this template.</div>
@@ -5140,6 +6244,7 @@ function renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, 
             ${renderCard('Template', 'Editable system prompt used by the Story Director planner.', `
                 <textarea id="planner-prompt" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(config.plannerPrompt)}</textarea>
                 ${renderEditorMeta('Autosaves when focus leaves the field.', 'planner-prompt-token-counter')}
+                <div class="sd-template-tags"><code>{{user}}</code><code>{{agent:id}}</code></div>
             `)}
         </div>
     `;
@@ -5226,6 +6331,8 @@ function refreshSceneDirectorPanel() {
     const body = $('#scene-director-panel-body');
     const workspace = sceneDirectorState.activeTab === 'director'
         ? renderStoryDirectorWorkspace()
+        : sceneDirectorState.activeTab === 'agents'
+            ? renderAgentsWorkspace()
         : sceneDirectorState.activeTab === 'logs'
             ? renderLogsWorkspace()
             : renderRouterWorkspace();
@@ -5238,9 +6345,13 @@ function refreshSceneDirectorPanel() {
 
     const logErrorCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'error').length;
     const logRunningCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'running').length;
+    const selectedAgent = getSelectedAgent();
+    const selectedAgentStatus = selectedAgent ? getAgentRuntimeState(selectedAgent.id).lastStatus : 'idle';
     $('#scene-director-header-status').html(
         sceneDirectorState.activeTab === 'director'
             ? renderStatusBadge(sceneDirectorState.directorStatus)
+            : sceneDirectorState.activeTab === 'agents'
+                ? renderStatusBadge(selectedAgentStatus)
             : sceneDirectorState.activeTab === 'logs'
                 ? renderStatusBadge(logErrorCount ? 'error' : (logRunningCount ? 'running' : 'ready'))
                 : renderStatusBadge(sceneDirectorState.routerStatus)
@@ -5257,6 +6368,9 @@ function refreshSceneDirectorPanel() {
             initPlannerProfileDropdown();
             initPlannerWorldInfoSelect();
         }
+    } else if (sceneDirectorState.activeTab === 'agents' && sceneDirectorState.agentView === 'config') {
+        initAgentProfileDropdown();
+        initAgentWorldInfoSelect();
     }
 
     refreshVisiblePromptTokenCounters();
@@ -5314,6 +6428,18 @@ function updatePlannerWorldInfoCount() {
     $('#planner-world-info-count').text(`${count} selected`);
 }
 
+function getSelectedAgentWorldInfoBooks() {
+    return $('#agent-world-info-books input[type="checkbox"]:checked')
+        .map((_, input) => String($(input).val() || '').trim())
+        .get()
+        .filter(Boolean);
+}
+
+function updateAgentWorldInfoCount() {
+    const count = getSelectedAgentWorldInfoBooks().length;
+    $('#agent-world-info-count').text(`${count} selected`);
+}
+
 function preserveVisiblePanelDrafts() {
     const routerPrompt = $('#router-prompt');
     if (routerPrompt.length) {
@@ -5339,6 +6465,14 @@ function preserveVisiblePanelDrafts() {
     if (plannerOoc.length) {
         sceneDirectorState.plannerOocDraft = String(plannerOoc.val() ?? '');
     }
+
+    const selectedAgent = getSelectedAgent();
+    const agentOoc = $('#agent-ooc-request');
+    if (selectedAgent && agentOoc.length) {
+        updateAgentOocState(selectedAgent.id, { draft: String(agentOoc.val() ?? '') });
+    }
+
+    persistAgentPanelFields();
 }
 
 function setPromptTokenCounterText(counterId, text) {
@@ -5404,6 +6538,8 @@ function refreshVisiblePromptTokenCounters() {
     schedulePromptTokenCounterUpdate('router-prompt', 'router-prompt-token-counter');
     schedulePromptTokenCounterUpdate('planner-prompt', 'planner-prompt-token-counter');
     schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
+    schedulePromptTokenCounterUpdate('agent-prompt', 'agent-prompt-token-counter');
+    schedulePromptTokenCounterUpdate('agent-output', 'agent-output-token-counter');
 }
 
 function updateRuntimeTimingUi() {
@@ -5482,6 +6618,84 @@ function persistPlannerPanelFields() {
     saveConfig();
 }
 
+function persistAgentPanelFields() {
+    const agent = getSelectedAgent();
+    if (!agent) return;
+
+    if ($('#agent-enabled').length) agent.enabled = $('#agent-enabled').is(':checked');
+    if ($('#agent-name').length) agent.name = String($('#agent-name').val() ?? '').trim() || agent.name;
+    if ($('#agent-profile-dropdown').length) agent.profileId = $('#agent-profile-dropdown').val() || agent.profileId;
+    if ($('#agent-reference-character').length) {
+        const referenceAvatar = String($('#agent-reference-character').val() ?? '');
+        const referenceCharacter = (SillyTavern.getContext().characters ?? [])
+            .find(character => String(character?.avatar ?? '') === referenceAvatar);
+        agent.referenceCharacterAvatar = referenceAvatar;
+        agent.referenceCharacterName = String(referenceCharacter?.name ?? '').trim();
+    }
+    if ($('#agent-world-info-books').length) {
+        agent.worldInfoBooks = getSelectedAgentWorldInfoBooks();
+    }
+    if ($('#agent-schedule-type').length) {
+        const scheduleType = String($('#agent-schedule-type').val() ?? 'manual');
+        agent.scheduleType = AGENT_SCHEDULE_TYPES.has(scheduleType) ? scheduleType : 'manual';
+    }
+    if ($('#agent-interval').length) agent.interval = Math.min(10000, Math.max(1, parseInt($('#agent-interval').val()) || 1));
+    if ($('#agent-character-name').length) agent.characterName = String($('#agent-character-name').val() ?? '').trim();
+    if ($('#agent-context-messages').length) {
+        agent.contextMessages = Math.min(5000, Math.max(1, parseInt($('#agent-context-messages').val()) || DEFAULT_AGENT_CONTEXT_MESSAGES));
+    }
+    if ($('#agent-prompt').length) agent.prompt = String($('#agent-prompt').val() ?? '');
+    if ($('#agent-output').length) {
+        const nextOutput = String($('#agent-output').val() ?? '');
+        if (nextOutput !== getAgentRuntimeState(agent.id).output) {
+            saveAgentRuntimeState(agent.id, {
+                output: nextOutput,
+                updatedAt: new Date().toISOString(),
+            });
+        }
+    }
+    saveConfig();
+}
+
+function createAgentFromPanel() {
+    const name = String($('#agent-new-name').val() ?? '').trim();
+    if (!name) {
+        toastr.warning('Enter an agent name first.', EXTENSION_LABEL);
+        return null;
+    }
+
+    const id = createUniqueAgentId(name);
+    const agent = normalizeAgentDefinition({
+        id,
+        name,
+        enabled: true,
+        scheduleType: 'manual',
+        interval: 5,
+        contextMessages: DEFAULT_AGENT_CONTEXT_MESSAGES,
+        prompt: `You are ${name}, a focused support agent for an ongoing group roleplay.\n\nTask:\n- Define one narrow responsibility here.\n- Maintain only information relevant to that responsibility.\n- Update the prior state instead of discarding valid facts.\n- Do not narrate the roleplay.\n\nPrevious output:\n{{previousOutput}}\n\nRecent RP context:\n{{recentChat}}`,
+    }, config.agents.length);
+    config.agents.push(agent);
+    sceneDirectorState.activeAgentId = agent.id;
+    sceneDirectorState.agentView = 'config';
+    saveConfig();
+    refreshSceneDirectorPanel();
+    return agent;
+}
+
+function deleteSelectedAgent() {
+    const agent = getSelectedAgent();
+    if (!agent || !window.confirm(`Delete agent "${agent.name}"?`)) return false;
+
+    config.agents = config.agents.filter(item => item.id !== agent.id);
+    const metadata = getAgentMetadata();
+    delete metadata[agent.id];
+    SillyTavern.getContext().saveMetadata?.();
+    sceneDirectorState.activeAgentId = config.agents[0]?.id ?? '';
+    saveConfig();
+    refreshSceneDirectorPanel();
+    return true;
+}
+
 function attachFloatingPanelEvents() {
     $('#scene-director-toggle').on('click', () => {
         updateSceneDirectorState({ panelOpen: !sceneDirectorState.panelOpen });
@@ -5536,6 +6750,96 @@ function attachFloatingPanelEvents() {
     $('#scene-director-panel-body').on('click', '[data-director-view]', function () {
         preserveVisiblePanelDrafts();
         updateStoryDirectorState({ directorView: $(this).data('director-view') || 'workspace' });
+    });
+    $('#scene-director-panel-body').on('click', '[data-agent-view]', function () {
+        switchAgentView($(this).data('agent-view') || 'workspace');
+    });
+    $('#scene-director-panel-body').on('click', '[data-agent-id]', function () {
+        preserveVisiblePanelDrafts();
+        updateSceneDirectorState({ activeAgentId: String($(this).data('agent-id') ?? '') });
+    });
+    $('#scene-director-panel-body').on('click', '#agent-create', () => createAgentFromPanel());
+    $('#scene-director-panel-body').on('keydown', '#agent-new-name', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            createAgentFromPanel();
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#agent-run', async () => {
+        persistAgentPanelFields();
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        try {
+            await executeAgent(agent.id, { type: 'manual', label: 'Manual run from Agents workspace' });
+            toastr.success(`${agent.name} updated.`, EXTENSION_LABEL);
+        } catch (error) {
+            toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#agent-copy-output', async () => {
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        await navigator.clipboard.writeText(getAgentRuntimeState(agent.id).output);
+        toastr.success(`${agent.name} output copied.`, EXTENSION_LABEL);
+    });
+    $('#scene-director-panel-body').on('click', '#agent-clear-output', () => {
+        const agent = getSelectedAgent();
+        if (!agent || !window.confirm(`Clear the stored output for "${agent.name}" in this chat?`)) return;
+        saveAgentRuntimeState(agent.id, { output: '', updatedAt: '', runId: '', lastStatus: 'idle', lastError: '' });
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-send-ooc', async () => {
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        updateAgentOocState(agent.id, { draft: String($('#agent-ooc-request').val() ?? '') });
+        await runAgentOocRequest(agent.id);
+    });
+    $('#scene-director-panel-body').on('click', '#agent-clear-ooc-draft', () => {
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        updateAgentOocState(agent.id, { draft: AGENT_OOC_DEFAULT_DRAFT });
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-clear-ooc-history', () => {
+        const agent = getSelectedAgent();
+        if (!agent || !window.confirm(`Clear the OOC conversation for "${agent.name}"?`)) return;
+        updateAgentOocState(agent.id, { history: [] });
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-delete', () => deleteSelectedAgent());
+    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-prompt, #agent-output', () => {
+        persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character', () => {
+        persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-world-info-books input[type="checkbox"]', () => {
+        updateAgentWorldInfoCount();
+        persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-world-info-all', () => {
+        $('#agent-world-info-books input[type="checkbox"]').prop('checked', true);
+        updateAgentWorldInfoCount();
+        persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-world-info-none', () => {
+        $('#agent-world-info-books input[type="checkbox"]').prop('checked', false);
+        updateAgentWorldInfoCount();
+        persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-schedule-type', () => {
+        persistAgentPanelFields();
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('input', '#agent-prompt', () => {
+        schedulePromptTokenCounterUpdate('agent-prompt', 'agent-prompt-token-counter');
+    });
+    $('#scene-director-panel-body').on('input', '#agent-output', () => {
+        schedulePromptTokenCounterUpdate('agent-output', 'agent-output-token-counter');
+    });
+    $('#scene-director-panel-body').on('input', '#agent-ooc-request', () => {
+        const agent = getSelectedAgent();
+        if (agent) updateAgentOocState(agent.id, { draft: String($('#agent-ooc-request').val() ?? '') });
     });
     $('#scene-director-panel-body').on('click', '#scene-director-run', async () => {
         persistDirectorPanelFields();
@@ -5832,6 +7136,52 @@ async function initPlannerProfileDropdown() {
     );
 }
 
+async function initAgentProfileDropdown() {
+    const agent = getSelectedAgent();
+    if (!agent || !$('#agent-profile-dropdown').length) return;
+
+    const service = await getConnService();
+    service.handleDropdown(
+        '#agent-profile-dropdown',
+        agent.profileId,
+        (profile) => {
+            const current = getAgentDefinition(agent.id);
+            if (!current) return;
+            current.profileId = profile?.id ?? '';
+            current.profileName = profile?.name ?? '';
+            saveConfig();
+        },
+    );
+}
+
+async function initAgentWorldInfoSelect() {
+    const agent = getSelectedAgent();
+    const container = $('#agent-world-info-books');
+    if (!agent || !container.length) return;
+
+    try {
+        const wi = await getWorldInfoModule();
+        const worldNames = getAvailableWorldInfoNames(wi);
+        const selected = new Set(Array.isArray(agent.worldInfoBooks) ? agent.worldInfoBooks : []);
+        const options = worldNames
+            .map((name, index) => {
+                const id = `agent-world-info-book-${index}`;
+                return `<label class="sd-checkbox-row" for="${id}">
+                    <input id="${id}" type="checkbox" value="${escapeHtml(name)}" ${selected.has(name) ? 'checked' : ''}>
+                    <span>${escapeHtml(name)}</span>
+                </label>`;
+            })
+            .join('');
+
+        container.html(options || '<div class="sd-muted">No lorebooks found.</div>');
+        updateAgentWorldInfoCount();
+    } catch (error) {
+        console.warn('[SceneDirector] Failed to initialize agent World Info select:', error);
+        container.html('<div class="sd-muted">Could not load lorebooks.</div>');
+        updateAgentWorldInfoCount();
+    }
+}
+
 async function initPlannerWorldInfoSelect() {
     const container = $('#planner-world-info-books');
     if (!container.length) return;
@@ -5995,6 +7345,11 @@ jQuery(document).ready(async () => {
     };
 
     ctx.eventSource.on(ctx.event_types.USER_MESSAGE_RENDERED, () => {
+        scheduleAgentsForTurn({
+            type: 'user',
+            label: 'Scheduled after user turn',
+            characterName: String(SillyTavern.getContext().name1 ?? ''),
+        });
         setTimeout(() => {
             handleUserTurnPipeline();
         }, 300);
@@ -6007,6 +7362,11 @@ jQuery(document).ready(async () => {
             if (isToolInvocationChatMessage(lastMsg)) {
                 return; // ignora mensagens de tool call — GM ainda está gerando
             }
+            scheduleAgentsForTurn({
+                type: 'character',
+                label: `Scheduled after ${String(lastMsg?.name ?? 'character')} turn`,
+                characterName: String(lastMsg?.name ?? ''),
+            });
             if (skipNextCharacterAutoRouter) {
                 skipNextCharacterAutoRouter = false;
                 return;
