@@ -1,3 +1,12 @@
+import { refreshReadOnlyTokenCounters, scheduleTokenCounterUpdate } from './ui/token-counters.js';
+import {
+    AGENT_INJECTION_POSITIONS,
+    applyAgentCharacterInjectionPrompts,
+    clearAgentCharacterInjectionPrompts,
+    formatAgentInjectionPlacement,
+    normalizeAgentInjectionPlacement,
+} from './agents/character-injection.js';
+
 console.log('[Backstage] Loading...');
 
 const EXTENSION_NAME = 'MultiCaller';
@@ -13,6 +22,8 @@ const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
 const PROFILE_SWITCH_SETTLE_EVENT_LIMIT = 12;
 const STORY_GUIDE_SNAPSHOT_RETENTION = 3;
 const STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
+const AGENT_OUTPUT_SNAPSHOT_RETENTION = 3;
+const AGENT_OUTPUT_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_PLANNER_CONTEXT_MESSAGES = 500;
 const MAX_OPERATION_LOGS = 100;
 const DEFAULT_AGENT_CONTEXT_MESSAGES = 100;
@@ -272,8 +283,6 @@ let forcedRouterSpeaker = null;
 let skipNextCharacterAutoRouter = false;
 let pendingAutoRouter = false;
 let activeTriggerSettleMonitor = null;
-const promptTokenCounterTimers = new Map();
-const promptTokenCounterVersions = new Map();
 
 // ================= FLOW LOG =================
 
@@ -413,6 +422,7 @@ function normalizeAgentDefinition(agent, index = 0) {
     const scheduleType = AGENT_SCHEDULE_TYPES.has(String(agent?.scheduleType ?? 'manual'))
         ? String(agent.scheduleType)
         : 'manual';
+    const injectionPlacement = normalizeAgentInjectionPlacement(agent);
 
     return {
         id: normalizeAgentId(agent?.id) || createUniqueAgentId(name, []),
@@ -429,8 +439,38 @@ function normalizeAgentDefinition(agent, index = 0) {
         worldInfoBooks: Array.isArray(agent?.worldInfoBooks)
             ? agent.worldInfoBooks.map(name => String(name ?? '').trim()).filter(Boolean)
             : [],
+        vectFoxEnabled: agent?.vectFoxEnabled === true,
         contextMessages: Math.min(5000, Math.max(1, parseInt(agent?.contextMessages) || DEFAULT_AGENT_CONTEXT_MESSAGES)),
+        validateOutputFormat: agent?.validateOutputFormat === true,
+        characterInjectionEnabled: agent?.characterInjectionEnabled === true,
+        characterInjectionPosition: injectionPlacement.position,
+        characterInjectionDepth: injectionPlacement.depth,
+        characterInjectionRole: injectionPlacement.role,
+        characterInjectionTargets: normalizeCharacterInjectionTargets(agent?.characterInjectionTargets),
     };
+}
+
+function normalizeOutputTagName(value) {
+    return String(value ?? '')
+        .trim()
+        .replace(/^<\/?\s*/, '')
+        .replace(/\s*>$/, '')
+        .trim();
+}
+
+function isValidXmlTagName(value) {
+    return /^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(normalizeOutputTagName(value));
+}
+
+function normalizeCharacterInjectionTargets(targets) {
+    return (Array.isArray(targets) ? targets : [])
+        .map(target => ({
+            characterAvatar: String(target?.characterAvatar ?? ''),
+            characterName: String(target?.characterName ?? '').trim(),
+            mode: target?.mode === 'full' ? 'full' : 'tag',
+            tag: normalizeOutputTagName(target?.tag),
+        }))
+        .filter(target => target.characterAvatar || target.characterName);
 }
 
 function normalizeAgentDefinitions(agents) {
@@ -599,6 +639,7 @@ const CHAR_NOTE_KEY = 'rp-router-char-note';
 const SCENE_DIRECTION_KEY = 'scene-director-next-reply';
 const LOREBOOK_INJECTION_KEY = 'scene-director-lorebook-context';
 const STORY_GUIDE_INJECTION_KEY = 'scene-director-story-guide-context';
+const AGENT_CHARACTER_INJECTION_KEY = 'backstage-agent-character-context';
 const DIRECT_OOC_KEY = 'scene-director-direct-ooc';
 const EXTENSION_PROMPT_TYPES = {
     IN_PROMPT: 0,
@@ -1032,6 +1073,153 @@ function applyStoryGuideInjectionForCharacter(charName, storyGuide = getStoryGui
         false,
         EXTENSION_PROMPT_ROLES.SYSTEM,
     );
+}
+
+function resolveAgentInjectionTarget(agent, charName, ctx = SillyTavern.getContext()) {
+    const targets = normalizeCharacterInjectionTargets(agent?.characterInjectionTargets);
+    if (!targets.length) return null;
+
+    const resolvedCharacter = resolveCharacterByName(charName, ctx).character;
+    const avatar = String(resolvedCharacter?.avatar ?? '');
+    const normalizedName = String(resolvedCharacter?.name ?? charName ?? '').trim().toLocaleLowerCase();
+    const exact = targets.find(target => (
+        (avatar && target.characterAvatar === avatar)
+        || (target.characterName && target.characterName.toLocaleLowerCase() === normalizedName)
+    ));
+    if (exact) return exact;
+
+    const firstName = normalizedName.split(/\s+/)[0];
+    const firstNameMatches = targets.filter(target => (
+        String(target.characterName ?? '').trim().toLocaleLowerCase().split(/\s+/)[0] === firstName
+    ));
+    return firstNameMatches.length === 1 ? firstNameMatches[0] : null;
+}
+
+function isEmptyAgentInjectionContent(content) {
+    const textOnly = String(content ?? '')
+        .replace(/<\/?[A-Za-z_][A-Za-z0-9_.:-]*\s*>/g, '')
+        .trim();
+    return /^(?:-\s*)?none[.!]?$/i.test(textOnly);
+}
+
+function validateAgentOutput(agent, output) {
+    if (agent?.validateOutputFormat) {
+        const formatValidation = validateTaggedOutputFormat(agent.prompt, output);
+        if (!formatValidation.valid) return formatValidation;
+    }
+
+    if (agent?.characterInjectionEnabled) {
+        for (const target of normalizeCharacterInjectionTargets(agent.characterInjectionTargets)) {
+            if (target.mode !== 'tag') continue;
+            const extracted = extractTaggedOutputSection(output, target.tag);
+            if (!extracted.valid) {
+                return {
+                    valid: false,
+                    error: `Character injection for ${target.characterName || 'unknown character'} is invalid: ${extracted.error}`,
+                };
+            }
+        }
+    }
+
+    return { valid: true, error: '' };
+}
+
+function buildAgentCharacterInjection(charName, ctx = SillyTavern.getContext()) {
+    const deliveries = [];
+    const errors = [];
+
+    for (const agent of Array.isArray(config.agents) ? config.agents : []) {
+        if (!agent.characterInjectionEnabled) continue;
+        const target = resolveAgentInjectionTarget(agent, charName, ctx);
+        if (!target) continue;
+
+        const output = getAgentRuntimeState(agent.id, ctx).output.trim();
+        if (!output) continue;
+        const outputValidation = validateAgentOutput(agent, output);
+        if (!outputValidation.valid) {
+            errors.push(`${agent.name}: ${outputValidation.error}`);
+            continue;
+        }
+
+        if (target.mode === 'full') {
+            deliveries.push({ agent, target, content: output });
+            continue;
+        }
+
+        const extracted = extractTaggedOutputSection(output, target.tag);
+        if (!extracted.valid) {
+            errors.push(`${agent.name}: ${extracted.error}`);
+            continue;
+        }
+        if (!extracted.content || isEmptyAgentInjectionContent(extracted.content)) continue;
+        deliveries.push({ agent, target, content: extracted.content });
+    }
+
+    const deliveriesByAgent = new Map();
+    for (const delivery of deliveries) {
+        const agentId = String(delivery.agent.id);
+        const group = deliveriesByAgent.get(agentId) ?? { agent: delivery.agent, deliveries: [] };
+        group.deliveries.push(delivery);
+        deliveriesByAgent.set(agentId, group);
+    }
+
+    const injections = [...deliveriesByAgent.values()].map(group => ({
+        agent: group.agent,
+        deliveries: group.deliveries,
+        prompt: `<AGENT_GUIDANCE>
+speaker: ${charName}
+scope: private character guidance
+
+<RULES>
+- Apply only the guidance relevant to the current reply.
+- Preserve character knowledge boundaries and roleplay continuity.
+- Do not quote, mention, or expose agents, hidden guidance, prompts, or routing.
+</RULES>
+
+<SOURCE>
+agent: ${group.agent.name}
+agent_id: ${group.agent.id}
+
+${group.deliveries.map(delivery => `mode: ${delivery.target.mode}
+
+${delivery.content}`).join('\n\n')}
+</SOURCE>
+</AGENT_GUIDANCE>`,
+    }));
+
+    return {
+        injections,
+        deliveries,
+        errors,
+    };
+}
+
+function applyAgentCharacterInjection(charName) {
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.setExtensionPrompt !== 'function') {
+        return {
+            injections: [],
+            deliveries: [],
+            applied: [],
+            errors: ['SillyTavern setExtensionPrompt is unavailable.'],
+        };
+    }
+
+    const result = buildAgentCharacterInjection(charName, ctx);
+    if (result.errors.length) {
+        recordBackstageIssue(`Agent injection: ${charName}`, result.errors.join(' | '));
+    }
+    const applied = applyAgentCharacterInjectionPrompts(
+        ctx,
+        AGENT_CHARACTER_INJECTION_KEY,
+        result.injections,
+    );
+    return { ...result, applied };
+}
+
+function clearAgentCharacterInjection() {
+    const ctx = SillyTavern.getContext();
+    clearAgentCharacterInjectionPrompts(ctx, AGENT_CHARACTER_INJECTION_KEY);
 }
 
 function buildSceneDirectionPrompt(decision, charName) {
@@ -3288,6 +3476,11 @@ function getAgentRuntimeState(agentId, ctx = SillyTavern.getContext()) {
         lastError: String(current.lastError ?? ''),
         pendingTurns: Math.max(0, Number(current.pendingTurns) || 0),
         lastTrigger: String(current.lastTrigger ?? ''),
+        snapshots: (Array.isArray(current.snapshots) ? current.snapshots : [])
+            .map(normalizeStoryGuideSnapshot)
+            .filter(Boolean)
+            .slice(0, AGENT_OUTPUT_SNAPSHOT_RETENTION),
+        lastSnapshotAt: String(current.lastSnapshotAt ?? ''),
     };
 }
 
@@ -3431,7 +3624,16 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
     );
     const characterReference = getAgentCharacterReference(agent, ctx);
     const characterPersonalityReferences = getCharacterPersonalityTagReferences(agent.prompt, ctx);
-    const [lorebookContext, lorebookCatalog] = await Promise.all([
+    const [worldContext, lorebookContext, lorebookCatalog] = await Promise.all([
+        agent.vectFoxEnabled
+            ? getVectFoxRouterContext(ctx, { forceEnabled: true, maxChars: 0 })
+            : Promise.resolve({
+                text: '',
+                source: 'agent-vectfox-disabled',
+                entryCount: 0,
+                originalLength: 0,
+                truncated: false,
+            }),
         routerPromptUsesTag('lorebookContext', agent.prompt)
             ? getSelectedWorldInfoContext(ctx, agent.worldInfoBooks)
             : Promise.resolve({
@@ -3464,6 +3666,7 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
         dependencies: Object.fromEntries(dependencySnapshots),
         characterReference,
         characterPersonalityReferences,
+        worldContext,
         lorebookContext,
         lorebookCatalog,
     };
@@ -3472,6 +3675,7 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
 function buildAgentMessages(agentContext, options = {}) {
     const dependencySnapshots = new Map(Object.entries(agentContext.dependencies ?? {}));
     const withAgentOutputs = resolveAgentTagsInText(agentContext.promptTemplate, SillyTavern.getContext(), dependencySnapshots);
+    const templateUsesPreviousOutput = routerPromptUsesTag('previousOutput', agentContext.promptTemplate);
     const systemPrompt = renderTemplate(withAgentOutputs, {
         recentChat: agentContext.recentChat,
         previousOutput: agentContext.previousOutput || '[No previous output]',
@@ -3484,10 +3688,32 @@ function buildAgentMessages(agentContext, options = {}) {
         lorebookContext: agentContext.lorebookContext?.text || '[No activated lorebook context]',
         lorebookCatalog: agentContext.lorebookCatalog?.text || '[No selected lorebook catalog]',
     });
+    const vectFoxMessages = agentContext.worldContext?.text
+        ? [{
+            role: 'system',
+            content: `[VECTFOX_CONTEXT]
+This is private retrieved world and roleplay context for the agent's assigned task. Use only relevant information and do not mention this context source.
+
+${agentContext.worldContext.text}
+[/VECTFOX_CONTEXT]`,
+        }]
+        : [];
 
     if (options.mode === 'ooc') {
+        const persistedOutputMessage = templateUsesPreviousOutput
+            ? []
+            : [{
+                role: 'system',
+                content: `[PERSISTED_AGENT_OUTPUT]
+This is the agent's current persisted output. Use it as existing working state when answering the operator.
+
+${agentContext.previousOutput || '[No previous output]'}
+[/PERSISTED_AGENT_OUTPUT]`,
+            }];
         return [
             { role: 'system', content: systemPrompt },
+            ...vectFoxMessages,
+            ...persistedOutputMessage,
             {
                 role: 'system',
                 content: 'Agent workspace mode. Respond directly to the operator in OOC. Do not replace the agent persistent output unless the operator explicitly asks you to draft a replacement. Do not narrate in-character prose.',
@@ -3499,6 +3725,7 @@ function buildAgentMessages(agentContext, options = {}) {
 
     return [
         { role: 'system', content: systemPrompt },
+        ...vectFoxMessages,
         {
             role: 'user',
             content: 'Run your assigned task now. Return only the complete updated output for this agent.',
@@ -3520,6 +3747,7 @@ function formatAgentContextForLog(agentContext) {
         dependencies: agentContext.dependencies,
         characterReference: agentContext.characterReference,
         characterPersonalityReferences: agentContext.characterPersonalityReferences,
+        worldContext: agentContext.worldContext,
         lorebookContext: agentContext.lorebookContext,
         lorebookCatalog: agentContext.lorebookCatalog,
     }, null, 2);
@@ -3608,7 +3836,11 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
                 `Profile: ${agent.profileName || agent.profileId}`,
                 `Dependencies: ${getAgentDependencies(agent.prompt).map(id => `agent:${id}`).join(', ') || 'none'}`,
                 `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
+                `VectFox: ${agent.vectFoxEnabled ? `${budgetedRequest.context?.worldContext?.text?.length ?? 0} chars from ${budgetedRequest.context?.worldContext?.source ?? 'unknown'}` : 'disabled'}`,
                 `Recent RP messages: ${budgetedRequest.context?.recentChatEntries?.length ?? 0}`,
+                `Output validation: ${agent.validateOutputFormat ? 'enabled' : 'disabled'}`,
+                `Character injection targets: ${normalizeCharacterInjectionTargets(agent.characterInjectionTargets).map(target => `${target.characterName}:${target.mode}${target.mode === 'tag' ? `:<${target.tag}>` : ''}`).join(', ') || 'none'}`,
+                `Character injection placement: ${formatAgentInjectionPlacement(agent)}`,
                 `Input budget: ${budgetedRequest.budget}`,
                 `Input trimmed: ${budgetedRequest.trimmed}`,
             ].join('\n'),
@@ -3617,7 +3849,15 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         const response = await sendPlannerStreamingRequest(agent.profileId, messages);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
+        updateOperationLog(logId, {
+            response: responseText,
+            reasoning: String(reasoning ?? ''),
+        });
         if (!responseText) throw new Error(`Agent ${agent.name} returned an empty output.`);
+        const outputValidation = validateAgentOutput(agent, responseText);
+        if (!outputValidation.valid) {
+            throw new Error(`${agent.name} output was rejected: ${outputValidation.error}`);
+        }
         if (getChatContextKey(SillyTavern.getContext()) !== originChatKey) {
             throw new Error(`Chat changed while agent ${agent.name} was running. Output was not saved.`);
         }
@@ -3636,9 +3876,18 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             lastTrigger: trigger.label || trigger.type,
             pendingTurns: Math.max(0, currentRuntime.pendingTurns - consumedTurns),
         }, ctx);
+        try {
+            const snapshot = await maybePersistAgentOutputSnapshot(agent.id, responseText, ctx);
+            if (snapshot) {
+                appendOperationLogDetail(logId, `Agent output snapshot saved: ${snapshot.fileName}`);
+            }
+        } catch (snapshotError) {
+            const snapshotMessage = snapshotError?.message ?? String(snapshotError);
+            console.error(`[Backstage] ${agent.name} updated, but snapshot persistence failed:`, snapshotError);
+            appendOperationLogDetail(logId, `Agent output snapshot failed: ${snapshotMessage}`);
+            toastr.warning(`${agent.name} updated, but its snapshot was not saved.`, EXTENSION_LABEL);
+        }
         updateOperationLog(logId, {
-            response: responseText,
-            reasoning: String(reasoning ?? ''),
             runId,
         });
         completeOperationLog(logId, 'success');
@@ -3752,7 +4001,9 @@ async function runAgentOocRequest(agentId) {
             detail: [
                 `Profile: ${agent.profileName || agent.profileId}`,
                 `History messages: ${priorHistory.length}`,
+                `Persisted output: ${agentContext.previousOutput.length} chars (${routerPromptUsesTag('previousOutput', agent.prompt) ? 'prompt tag' : 'dedicated OOC system message'})`,
                 `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
+                `VectFox: ${agent.vectFoxEnabled ? `${budgetedRequest.context?.worldContext?.text?.length ?? 0} chars from ${budgetedRequest.context?.worldContext?.source ?? 'unknown'}` : 'disabled'}`,
                 `Input budget: ${budgetedRequest.budget}`,
                 `Input trimmed: ${budgetedRequest.trimmed}`,
             ].join('\n'),
@@ -4039,6 +4290,74 @@ async function copyStoryGuideSnapshot(index, ctx = SillyTavern.getContext()) {
     return true;
 }
 
+function getAgentOutputSnapshots(agentId, ctx = SillyTavern.getContext()) {
+    return getAgentRuntimeState(agentId, ctx).snapshots;
+}
+
+function shouldPersistAgentOutputSnapshot(agentId, now = new Date(), ctx = SillyTavern.getContext()) {
+    const runtime = getAgentRuntimeState(agentId, ctx);
+    const lastSavedAt = runtime.lastSnapshotAt || runtime.snapshots[0]?.savedAt || '';
+    if (!lastSavedAt) return true;
+
+    const lastSavedMs = Date.parse(lastSavedAt);
+    if (!Number.isFinite(lastSavedMs)) return true;
+    return now.getTime() - lastSavedMs >= AGENT_OUTPUT_SNAPSHOT_MIN_INTERVAL_MS;
+}
+
+function buildAgentOutputSnapshotFileName(agentId, savedAt = new Date()) {
+    const safeAgentId = normalizeAgentId(agentId) || 'agent';
+    const stamp = savedAt.toISOString().replace(/[:.]/g, '-');
+    const suffix = Math.random().toString(36).slice(2, 8);
+    return `backstage-agent-${safeAgentId}-${stamp}-${suffix}.md`;
+}
+
+async function maybePersistAgentOutputSnapshot(agentId, value, ctx = SillyTavern.getContext()) {
+    const output = String(value ?? '');
+    if (!output.trim()) return null;
+
+    const now = new Date();
+    if (!shouldPersistAgentOutputSnapshot(agentId, now, ctx)) return null;
+
+    const fileName = buildAgentOutputSnapshotFileName(agentId, now);
+    const path = await uploadUserFile(fileName, output);
+    const snapshot = {
+        savedAt: now.toISOString(),
+        path,
+        fileName,
+        content: output,
+    };
+    const runtime = getAgentRuntimeState(agentId, ctx);
+    const existing = runtime.snapshots;
+    const nextSnapshots = [snapshot, ...existing].slice(0, AGENT_OUTPUT_SNAPSHOT_RETENTION);
+    const prunedSnapshots = existing.slice(Math.max(0, AGENT_OUTPUT_SNAPSHOT_RETENTION - 1));
+
+    saveAgentRuntimeState(agentId, {
+        snapshots: nextSnapshots,
+        lastSnapshotAt: snapshot.savedAt,
+    }, ctx);
+
+    await Promise.allSettled(
+        prunedSnapshots
+            .map(entry => entry?.path)
+            .filter(Boolean)
+            .map(pathToDelete => deleteUserFile(pathToDelete)),
+    );
+
+    return snapshot;
+}
+
+async function copyAgentOutputSnapshot(agentId, index, ctx = SillyTavern.getContext()) {
+    const snapshot = getAgentOutputSnapshots(agentId, ctx)[index];
+    if (!snapshot) {
+        toastr.info(`Agent snapshot ${index + 1} unavailable.`, EXTENSION_LABEL);
+        return false;
+    }
+
+    await navigator.clipboard.writeText(snapshot.content);
+    toastr.success(`Agent snapshot ${index + 1} copied.`, EXTENSION_LABEL);
+    return true;
+}
+
 function getPlannerUserTurnCounter(ctx = SillyTavern.getContext()) {
     return Math.max(0, Number(getSceneDirectorMetadata(ctx).userTurnsSincePlannerUpdate ?? 0));
 }
@@ -4066,101 +4385,156 @@ function stripMarkdownFence(text) {
         .trim();
 }
 
-function collectPlannerBlockTags(text) {
-    const tags = new Map();
-    const pattern = /\[([^\[\]\r\n]+)\]/g;
+function tokenizeXmlOutput(text) {
+    const tokens = [];
+    const pattern = /<\s*(\/?)\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*>/g;
     let match;
 
     while ((match = pattern.exec(String(text ?? ''))) !== null) {
-        const rawTag = String(match[1] ?? '').trim();
-        const closing = rawTag.startsWith('/');
-        const name = rawTag
-            .replace(/^\/\s*/, '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLocaleUpperCase();
-
-        if (!name) continue;
-
-        const current = tags.get(name) ?? {
-            name,
-            label: rawTag.replace(/^\/\s*/, '').trim(),
-            open: 0,
-            close: 0,
-        };
-        if (closing) {
-            current.close += 1;
-        } else {
-            current.open += 1;
-        }
-        tags.set(name, current);
+        const closing = Boolean(match[1]);
+        const label = String(match[2] ?? '').trim();
+        tokens.push({
+            name: label,
+            label,
+            closing,
+            start: match.index,
+            end: pattern.lastIndex,
+        });
     }
 
-    return tags;
+    return tokens;
 }
 
-function validatePlannerOutputFormat(plannerPrompt, output) {
-    const prompt = String(plannerPrompt ?? '');
+function parseXmlOutput(text, requiredNames = null) {
+    const source = String(text ?? '');
+    const tokens = tokenizeXmlOutput(source);
+    const namesWithClosers = new Set(tokens.filter(token => token.closing).map(token => token.name));
+    const structuralNames = requiredNames instanceof Set
+        ? new Set([...requiredNames, ...namesWithClosers])
+        : namesWithClosers;
+    const stack = [];
+    const nodes = [];
+    const signature = [];
+    const errors = [];
+
+    for (const token of tokens) {
+        if (!structuralNames.has(token.name)) continue;
+        signature.push(`${token.closing ? '/' : ''}${token.name}`);
+
+        if (!token.closing) {
+            const node = { ...token, openEnd: token.end, closeStart: -1, closeEnd: -1 };
+            stack.push(node);
+            nodes.push(node);
+            continue;
+        }
+
+        const opened = stack.pop();
+        if (!opened) {
+            errors.push(`Unexpected closing tag </${token.label}>.`);
+            continue;
+        }
+        if (opened.name !== token.name) {
+            errors.push(`Tag <${opened.label}> was closed by </${token.label}>.`);
+            continue;
+        }
+        opened.closeStart = token.start;
+        opened.closeEnd = token.end;
+    }
+
+    for (const opened of stack.reverse()) {
+        errors.push(`Tag <${opened.label}> is not closed.`);
+    }
+
+    return { source, tokens, structuralNames, nodes, signature, errors };
+}
+
+function getOutputFormatContract(promptTemplate) {
+    const prompt = String(promptTemplate ?? '');
     const markers = [...prompt.matchAll(/\bOUTPUT\s+FORMAT\b/gi)];
     const marker = markers[markers.length - 1];
     if (!marker) {
         return {
             valid: false,
-            error: 'Planner format validation failed: the system prompt has no OUTPUT FORMAT section.',
+            error: 'Output format validation failed: the system prompt has no OUTPUT FORMAT section.',
         };
     }
 
     const formatSection = prompt.slice(Number(marker.index) + marker[0].length);
-    const formatTags = collectPlannerBlockTags(formatSection);
-    const requirements = [...formatTags.values()].filter(tag => tag.close > 0);
-    if (!requirements.length) {
+    const contract = parseXmlOutput(formatSection);
+    if (!contract.structuralNames.size) {
         return {
             valid: false,
-            error: 'Planner format validation failed: OUTPUT FORMAT contains no [TAG]...[/TAG] blocks.',
+            error: 'Output format validation failed: OUTPUT FORMAT contains no <TAG>...</TAG> blocks.',
+        };
+    }
+    if (contract.errors.length) {
+        return {
+            valid: false,
+            error: `Output format validation failed: ${contract.errors.join(' ')}`,
         };
     }
 
-    const invalidTemplateTags = requirements.filter(tag => tag.open !== tag.close);
-    if (invalidTemplateTags.length) {
-        const details = invalidTemplateTags
-            .map(tag => `[${tag.label}] ${tag.open} open / ${tag.close} close`)
-            .join(', ');
+    return { valid: true, error: '', contract };
+}
+
+function validateTaggedOutputFormat(promptTemplate, output) {
+    const format = getOutputFormatContract(promptTemplate);
+    if (!format.valid) return format;
+
+    const actual = parseXmlOutput(output, format.contract.structuralNames);
+    if (actual.errors.length) {
         return {
             valid: false,
-            error: `Planner format validation failed: OUTPUT FORMAT has unbalanced blocks: ${details}.`,
+            error: `Output format validation failed: ${actual.errors.join(' ')}`,
         };
     }
 
-    const outputTags = collectPlannerBlockTags(output);
-    const mismatches = [];
-
-    for (const expected of requirements) {
-        const actual = outputTags.get(expected.name) ?? { open: 0, close: 0 };
-        if (actual.open !== expected.open || actual.close !== expected.close) {
-            mismatches.push(
-                `[${expected.label}] expected ${expected.open}/${expected.close}, received ${actual.open}/${actual.close}`,
-            );
-        }
-    }
-
-    const expectedNames = new Set(requirements.map(tag => tag.name));
-    for (const actual of outputTags.values()) {
-        if (!expectedNames.has(actual.name) && actual.open > 0 && actual.close > 0) {
-            mismatches.push(`[${actual.label}] is not declared in OUTPUT FORMAT`);
-        }
-    }
-
-    if (mismatches.length) {
+    const expectedSignature = format.contract.signature;
+    const actualSignature = actual.signature;
+    const mismatchIndex = expectedSignature.findIndex((tag, index) => actualSignature[index] !== tag);
+    if (mismatchIndex >= 0 || expectedSignature.length !== actualSignature.length) {
+        const position = mismatchIndex >= 0 ? mismatchIndex : Math.min(expectedSignature.length, actualSignature.length);
+        const expected = expectedSignature[position] ? `<${expectedSignature[position]}>` : 'end of output';
+        const received = actualSignature[position] ? `<${actualSignature[position]}>` : 'end of output';
         return {
             valid: false,
-            error: `Planner output format mismatch: ${mismatches.join('; ')}.`,
+            error: `Output format mismatch at structural tag ${position + 1}: expected ${expected}, received ${received}.`,
         };
     }
 
     return {
         valid: true,
         error: '',
-        blockCount: requirements.reduce((total, tag) => total + tag.open, 0),
+        blockCount: actual.nodes.length,
+        parsed: actual,
+    };
+}
+
+function extractTaggedOutputSection(output, tagName) {
+    const normalizedTag = normalizeOutputTagName(tagName);
+    if (!normalizedTag) return { valid: false, content: '', error: 'No output tag was configured.' };
+    if (!isValidXmlTagName(normalizedTag)) {
+        return { valid: false, content: '', error: `Invalid XML tag name <${normalizedTag}>.` };
+    }
+
+    const parsed = parseXmlOutput(output, new Set([normalizedTag]));
+    if (parsed.errors.length) {
+        return { valid: false, content: '', error: parsed.errors.join(' ') };
+    }
+
+    const matches = parsed.nodes.filter(node => node.name === normalizedTag && node.closeStart >= 0);
+    if (matches.length !== 1) {
+        return {
+            valid: false,
+            content: '',
+            error: `Expected exactly one <${normalizeOutputTagName(tagName)}> block, received ${matches.length}.`,
+        };
+    }
+
+    return {
+        valid: true,
+        content: parsed.source.slice(matches[0].openEnd, matches[0].closeStart).trim(),
+        error: '',
     };
 }
 
@@ -4428,7 +4802,7 @@ async function updateStoryGuideFromContext(options = {}) {
         }
 
         const plannerSystemPrompt = messages.find(message => message?.role === 'system')?.content ?? '';
-        const formatValidation = validatePlannerOutputFormat(plannerSystemPrompt, updatedGuide);
+        const formatValidation = validateTaggedOutputFormat(plannerSystemPrompt, updatedGuide);
         if (!formatValidation.valid) {
             recordBackstageIssue('Story Director', formatValidation.error);
             updateStoryDirectorState({
@@ -4785,6 +5159,7 @@ async function runDirectedCharacterOoc(targetName, oocText) {
         clearCharacterNote();
         clearStoryGuideInjection();
         clearLorebookInjection();
+        clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
         finishRuntimePhase(['character-turn'], 'error');
@@ -5049,10 +5424,16 @@ async function triggerChar(char, decision = null, options = {}) {
     }
 
     setCharacterNote(char.name);
-    applyStoryGuideInjectionForCharacter(char.name);
+    // Legacy Story Director delivery is disabled while agent character injection replaces it.
+    // applyStoryGuideInjectionForCharacter(char.name);
     await applyLorebookInjectionForCharacter(char.name);
     setDirectedOocPrompt(char.name, options.directOocText);
-    clearSceneDirection();
+    if (decision) {
+        setSceneDirection(decision, char.name);
+    } else {
+        clearSceneDirection();
+    }
+    const agentInjection = applyAgentCharacterInjection(char.name);
     beginRuntimePhase(
         'character-turn',
         `Character turn: ${char.name}`,
@@ -5065,6 +5446,10 @@ async function triggerChar(char, decision = null, options = {}) {
         characterOperationLogId,
         formatHostChatSummaryForLog('Pre-trigger snapshot', summarizeHostChatForLog(ctx)),
     );
+    appendOperationLogDetail(characterOperationLogId, [
+        `Agent guidance sources: ${agentInjection.applied.map(item => `${item.agent.name} (${item.deliveries.map(delivery => delivery.target.mode).join('+')}; ${formatAgentInjectionPlacement(item.agent)})`).join(', ') || 'none'}`,
+        agentInjection.errors.length ? `Agent guidance errors: ${agentInjection.errors.join(' | ')}` : '',
+    ].filter(Boolean).join('\n'));
     updateRouterState({ status: 'executing' });
 
     fl('  →', 'triggerChar', `/trigger await=true "${char.name}"`);
@@ -5125,6 +5510,7 @@ async function triggerChar(char, decision = null, options = {}) {
         clearCharacterNote();
         clearStoryGuideInjection();
         clearLorebookInjection();
+        clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
         finishRuntimePhase(['character-turn'], 'error');
@@ -5164,6 +5550,7 @@ async function executeDecision(decision, caller = 'unknown') {
         clearSceneDirection();
         clearStoryGuideInjection();
         clearLorebookInjection();
+        clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearCharacterNote();
         fl('← END', 'executeDecision', `jogador | nextSpeaker="${nextSpeaker}"`);
@@ -5183,6 +5570,7 @@ async function executeDecision(decision, caller = 'unknown') {
         clearSceneDirection();
         clearStoryGuideInjection();
         clearLorebookInjection();
+        clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearCharacterNote();
         fl('← END', 'executeDecision', `jogador | nextSpeaker="${nextSpeaker}"`);
@@ -5435,6 +5823,23 @@ function renderEditorMeta(note, counterId) {
     `;
 }
 
+function renderTokenCountedConsole(value, fallback = '', extraClass = '') {
+    const content = String(value ?? '');
+    const hasContent = !!content.trim();
+    const displayValue = hasContent ? content : String(fallback ?? '');
+    const classes = ['sd-console', extraClass].filter(Boolean).join(' ');
+
+    return `
+        <div data-token-count-container>
+            <pre class="${escapeHtml(classes)}" data-token-count-source data-token-count-empty="${hasContent ? 'false' : 'true'}">${escapeHtml(displayValue)}</pre>
+            <div class="sd-editor-meta">
+                <div></div>
+                <div class="sd-token-counter" data-token-count-result>${hasContent ? '-' : '0 tokens'}</div>
+            </div>
+        </div>
+    `;
+}
+
 function renderDisclosure(title, subtitle, body, options = {}) {
     const open = options.open ? ' open' : '';
     const extraClass = options.extraClass ? ` ${options.extraClass}` : '';
@@ -5544,7 +5949,7 @@ function renderTriggerSettleSummary(state) {
         <div class="sd-kv"><span>Started</span><b>${escapeHtml(formatPanelTime(state.startedAt))}</b></div>
         <div class="sd-kv"><span>Last event</span><b>${escapeHtml(state.lastEventName || 'none')}</b></div>
         <div class="sd-footnote">${escapeHtml(state.note || '')}</div>
-        <pre class="sd-console">${escapeHtml(eventLines)}</pre>
+        ${renderTokenCountedConsole(eventLines)}
     `;
 }
 
@@ -5579,7 +5984,7 @@ function renderRouterInjectionPreview(decision) {
 
     return `
         <div class="sd-kv"><span>Target</span><b>${escapeHtml(targetName)}</b></div>
-        <pre class="sd-console sd-console--tall">${escapeHtml(prompt)}</pre>
+        ${renderTokenCountedConsole(prompt, '', 'sd-console--tall')}
     `;
 }
 
@@ -5660,6 +6065,11 @@ function renderAgentWorkspacePanel(agent) {
     const dependencies = getAgentDependencies(agent.prompt);
     const updatedAt = runtime.updatedAt ? formatPanelTime(new Date(runtime.updatedAt)) : 'never';
     const turnsUntilRun = agent.scheduleType === 'manual' ? '-' : Math.max(0, agent.interval - runtime.pendingTurns);
+    const injectionTargets = normalizeCharacterInjectionTargets(agent.characterInjectionTargets);
+    const outputValidation = runtime.output ? validateAgentOutput(agent, runtime.output) : { valid: true, error: '' };
+    const injectionSummary = injectionTargets.length
+        ? injectionTargets.map(target => `${target.characterName || 'Unknown'} -> ${target.mode === 'full' ? 'Full output' : `[${target.tag}]`}`).join('\n')
+        : 'No character destinations configured.';
 
     return `
         <div class="sd-grid">
@@ -5675,17 +6085,25 @@ function renderAgentWorkspacePanel(agent) {
                 ${renderEditorMeta('Stored per chat. Autosaves when focus leaves the field.', 'agent-output-token-counter')}
             `, { open: true })}
 
+            ${renderDisclosure('Output Contract', 'Validation and character delivery for the latest stored output.', `
+                <div class="sd-kv"><span>Format validation</span><b>${agent.validateOutputFormat ? (outputValidation.valid ? 'valid' : 'invalid') : 'disabled'}</b></div>
+                <div class="sd-kv"><span>Character injection</span><b>${agent.characterInjectionEnabled ? 'enabled' : 'disabled'}</b></div>
+                <div class="sd-kv"><span>Placement</span><b>${escapeHtml(formatAgentInjectionPlacement(agent))}</b></div>
+                ${renderTokenCountedConsole(injectionSummary)}
+                ${outputValidation.valid ? '' : renderTokenCountedConsole(outputValidation.error, '', 'sd-console--error')}
+            `)}
+
             ${renderDisclosure('Reasoning', 'Reasoning captured from the latest execution in this session.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.reasoning || 'No reasoning captured in this session.')}</pre>
+                ${renderTokenCountedConsole(latestLog?.reasoning, 'No reasoning captured in this session.', 'sd-console--tall')}
             `)}
             ${renderDisclosure('Context', 'Exact resolved context snapshot recorded for the latest execution.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.context || 'No context captured in this session.')}</pre>
+                ${renderTokenCountedConsole(latestLog?.context, 'No context captured in this session.', 'sd-console--tall')}
             `)}
             ${renderDisclosure('Request', 'Messages sent to the selected Connection Profile.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.request || 'No request captured in this session.')}</pre>
+                ${renderTokenCountedConsole(latestLog?.request, 'No request captured in this session.', 'sd-console--tall')}
             `)}
             ${runtime.lastError || latestLog?.error ? renderDisclosure('Error', 'Latest execution failure. The previous valid output was preserved.', `
-                <pre class="sd-console sd-console--error">${escapeHtml(runtime.lastError || latestLog?.error)}</pre>
+                ${renderTokenCountedConsole(runtime.lastError || latestLog?.error, '', 'sd-console--error')}
             `, { open: true }) : ''}
         </div>
     `;
@@ -5710,20 +6128,20 @@ function renderAgentOocPanel(agent) {
             `, { open: true })}
 
             ${renderDisclosure('OOC Conversation', 'Newest messages are shown first.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(transcript || 'No OOC conversation yet.')}</pre>
+                ${renderTokenCountedConsole(transcript, 'No OOC conversation yet.', 'sd-console--tall')}
             `, { open: true })}
 
             ${renderDisclosure('Reasoning', 'Reasoning captured from the latest OOC request in this session.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.reasoning || 'No OOC reasoning captured in this session.')}</pre>
+                ${renderTokenCountedConsole(latestLog?.reasoning, 'No OOC reasoning captured in this session.', 'sd-console--tall')}
             `)}
             ${renderDisclosure('Context', 'Resolved context snapshot from the latest OOC request.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.context || 'No OOC context captured in this session.')}</pre>
+                ${renderTokenCountedConsole(latestLog?.context, 'No OOC context captured in this session.', 'sd-console--tall')}
             `)}
             ${renderDisclosure('Request', 'Messages sent for the latest OOC request.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(latestLog?.request || 'No OOC request captured in this session.')}</pre>
+                ${renderTokenCountedConsole(latestLog?.request, 'No OOC request captured in this session.', 'sd-console--tall')}
             `)}
             ${latestLog?.error ? renderDisclosure('Error', 'Latest OOC request failure.', `
-                <pre class="sd-console sd-console--error">${escapeHtml(latestLog.error)}</pre>
+                ${renderTokenCountedConsole(latestLog.error, '', 'sd-console--error')}
             `, { open: true }) : ''}
         </div>
     `;
@@ -5748,9 +6166,55 @@ function renderAgentReferenceCharacterOptions(agent, ctx = SillyTavern.getContex
     `;
 }
 
+function renderAgentInjectionCharacterOptions(target, ctx = SillyTavern.getContext()) {
+    const characters = [...(Array.isArray(ctx.characters) ? ctx.characters : [])]
+        .filter(character => character?.avatar && character?.name)
+        .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+    const selectedAvatar = String(target?.characterAvatar ?? '');
+    const selectedName = String(target?.characterName ?? '');
+    const hasSelectedCharacter = characters.some(character => String(character.avatar) === selectedAvatar);
+    const missingSelection = (selectedAvatar || selectedName) && !hasSelectedCharacter
+        ? `<option value="${escapeHtml(selectedAvatar)}" data-character-name="${escapeHtml(selectedName)}" selected>${escapeHtml(selectedName || 'Unavailable character')} (unavailable)</option>`
+        : '';
+
+    return `
+        <option value="">Select character</option>
+        ${missingSelection}
+        ${characters.map(character => `
+            <option value="${escapeHtml(character.avatar)}" data-character-name="${escapeHtml(character.name)}" ${String(character.avatar) === selectedAvatar ? 'selected' : ''}>${escapeHtml(character.name)}</option>
+        `).join('')}
+    `;
+}
+
+function renderAgentInjectionTargets(agent) {
+    const targets = normalizeCharacterInjectionTargets(agent.characterInjectionTargets);
+    if (!targets.length) {
+        return '<div class="sd-log-empty">No character destinations configured.</div>';
+    }
+
+    return targets.map((target, index) => `
+        <div class="sd-agent-injection-target" data-agent-injection-target data-target-index="${index}">
+            <select class="text_pole" data-agent-injection-character>
+                ${renderAgentInjectionCharacterOptions(target)}
+            </select>
+            <select class="text_pole" data-agent-injection-mode>
+                <option value="tag" ${target.mode === 'tag' ? 'selected' : ''}>Tagged section</option>
+                <option value="full" ${target.mode === 'full' ? 'selected' : ''}>Full output</option>
+            </select>
+            <input class="text_pole" data-agent-injection-tag type="text" value="${escapeHtml(target.tag ? `<${target.tag}>` : '')}" placeholder="<Mirella>" ${target.mode === 'full' ? 'disabled' : ''}>
+            <button class="menu_button" data-agent-injection-remove="${index}" title="Remove destination">Remove</button>
+        </div>
+    `).join('');
+}
+
 function renderAgentConfigPanel(agent) {
     const characterSchedule = agent.scheduleType === 'character-turns';
     const selectedLorebookCount = Array.isArray(agent.worldInfoBooks) ? agent.worldInfoBooks.length : 0;
+    const injectionPlacement = normalizeAgentInjectionPlacement(agent);
+    const injectionEnabled = agent.characterInjectionEnabled;
+    const inChatPlacement = injectionPlacement.position === AGENT_INJECTION_POSITIONS.IN_CHAT;
+    const placementDisabled = injectionEnabled ? '' : 'disabled';
+    const depthSettingsDisabled = injectionEnabled && inChatPlacement ? '' : 'disabled';
     return `
         <div class="sd-grid sd-grid--double">
             ${renderCard('Agent Settings', 'Identity, connection and execution cadence.', `
@@ -5795,7 +6259,51 @@ function renderAgentConfigPanel(agent) {
                 <textarea id="agent-prompt" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(agent.prompt)}</textarea>
                 ${renderEditorMeta('Dependencies are detected from {{agent:id}} tags. Autosaves on blur.', 'agent-prompt-token-counter')}
             `)}
-            ${renderCard('Lorebook Scope', 'Select the books this agent can resolve through its lorebook tags.', `
+            ${renderCard('Output Contract', 'Validate the response and route the latest valid output into character prompts.', `
+                <label class="sd-checkbox-row" for="agent-validate-output-format">
+                    <input id="agent-validate-output-format" type="checkbox" ${agent.validateOutputFormat ? 'checked' : ''}>
+                    <span>Validate XML tags from the final OUTPUT FORMAT section</span>
+                </label>
+                <label class="sd-checkbox-row" for="agent-character-injection-enabled">
+                    <input id="agent-character-injection-enabled" type="checkbox" ${agent.characterInjectionEnabled ? 'checked' : ''}>
+                    <span>Inject output into characters</span>
+                </label>
+                <div class="floating_prompt_radio_group ${injectionEnabled ? '' : 'sd-control-disabled'}">
+                    <label class="checkbox_label" for="agent-injection-position-before">
+                        <input id="agent-injection-position-before" type="radio" name="agent-injection-position" value="${AGENT_INJECTION_POSITIONS.BEFORE_MAIN}" ${injectionPlacement.position === AGENT_INJECTION_POSITIONS.BEFORE_MAIN ? 'checked' : ''} ${placementDisabled}>
+                        <span>Before Main Prompt / Story String</span>
+                    </label>
+                    <label class="checkbox_label" for="agent-injection-position-after">
+                        <input id="agent-injection-position-after" type="radio" name="agent-injection-position" value="${AGENT_INJECTION_POSITIONS.AFTER_MAIN}" ${injectionPlacement.position === AGENT_INJECTION_POSITIONS.AFTER_MAIN ? 'checked' : ''} ${placementDisabled}>
+                        <span>After Main Prompt / Story String</span>
+                    </label>
+                    <label class="checkbox_label alignItemsCenter" for="agent-injection-position-depth">
+                        <input id="agent-injection-position-depth" type="radio" name="agent-injection-position" value="${AGENT_INJECTION_POSITIONS.IN_CHAT}" ${inChatPlacement ? 'checked' : ''} ${placementDisabled}>
+                        <span>In-chat @ Depth</span>
+                        <input id="agent-injection-depth" class="text_pole textarea_compact widthNatural" type="number" min="0" max="9999" value="${injectionPlacement.depth}" ${depthSettingsDisabled}>
+                        <span>as</span>
+                        <select id="agent-injection-role" class="text_pole widthNatural" ${depthSettingsDisabled}>
+                            <option value="0" ${injectionPlacement.role === 0 ? 'selected' : ''}>System</option>
+                            <option value="1" ${injectionPlacement.role === 1 ? 'selected' : ''}>User</option>
+                            <option value="2" ${injectionPlacement.role === 2 ? 'selected' : ''}>Assistant</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="sd-footnote">Depth 0 inserts after the newest chat message. Before/After Main always use the System role.</div>
+                <div id="agent-injection-targets" class="sd-agent-injection-targets ${agent.characterInjectionEnabled ? '' : 'sd-control-disabled'}">
+                    ${renderAgentInjectionTargets(agent)}
+                </div>
+                <div class="sd-inline-actions">
+                    <button id="agent-injection-add" class="menu_button" ${agent.characterInjectionEnabled ? '' : 'disabled'}>Add destination</button>
+                </div>
+                <div class="sd-footnote">Use valid, case-sensitive XML names such as &lt;Mirella&gt; or &lt;Tio_Klarus&gt;. Each destination must appear exactly once in the final OUTPUT FORMAT and response. Tagged section removes only that outer tag; Full output injects the entire validated payload.</div>
+            `)}
+            ${renderCard('Knowledge Context', 'Choose VectFox and the lorebooks available to this agent.', `
+                <label class="sd-checkbox-row" for="agent-vectfox-enabled">
+                    <input id="agent-vectfox-enabled" type="checkbox" ${agent.vectFoxEnabled ? 'checked' : ''}>
+                    <span>Include VectFox context in every agent request</span>
+                </label>
+                <div class="sd-footnote">VectFox is sent automatically as a private system message in normal and OOC calls. When disabled, the integration is not called for this agent.</div>
                 <div class="sd-inline-actions">
                     <button id="agent-world-info-all" class="menu_button">Select All</button>
                     <button id="agent-world-info-none" class="menu_button">Clear All</button>
@@ -5857,6 +6365,7 @@ function renderAgentsWorkspace() {
         ? sceneDirectorState.agentView
         : 'workspace';
     const runtime = agent ? getAgentRuntimeState(agent.id) : null;
+    const snapshots = runtime?.snapshots ?? [];
     return `
         <div class="sd-main sd-main--agents">
             <section class="sd-hero sd-hero--agents">
@@ -5874,6 +6383,7 @@ function renderAgentsWorkspace() {
             <div class="sd-toolbar">
                 ${agent ? `<button id="agent-run" data-agent-workspace-action class="menu_button primary${view === 'workspace' ? '' : ' sd-hidden'}" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Run Now</button>` : ''}
                 ${agent ? `<button id="agent-copy-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Copy Output</button>` : ''}
+                ${agent ? [0, 1, 2].map(index => `<button data-agent-copy-snapshot="${index}" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${snapshots.length <= index ? 'disabled' : ''} title="${snapshots[index]?.savedAt ? escapeHtml(new Date(snapshots[index].savedAt).toLocaleString()) : 'No snapshot'}">Snapshot ${index + 1}</button>`).join('') : ''}
                 ${agent ? `<button id="agent-clear-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Clear Output</button>` : ''}
                 <div class="sd-subnav">
                     <button class="menu_button sd-subnav-button${view === 'workspace' ? ' sd-subnav-button--active' : ''}" data-agent-view="workspace">Workspace</button>
@@ -5945,7 +6455,7 @@ function renderOperationLogDetail(label, value, extraClass = '') {
     return `
         <section class="sd-log-detail">
             <div class="sd-log-detail-title">${escapeHtml(label)}</div>
-            <pre class="sd-console ${extraClass}">${escapeHtml(content)}</pre>
+            ${renderTokenCountedConsole(content, '', extraClass)}
         </section>
     `;
 }
@@ -6075,7 +6585,7 @@ function renderRouterWorkspacePanel() {
             ${renderCard('Router Injection', 'Preview of the private directive that will be injected into the selected character.', renderRouterInjectionPreview(sceneDirectorState.lastDecision))}
 
             ${renderDisclosure('Router Response', 'Resposta direta da ultima chamada OOC ao router ou da ultima execucao capturada.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(routerResponseText || 'No router response yet.')}</pre>
+                ${renderTokenCountedConsole(routerResponseText, 'No router response yet.', 'sd-console--tall')}
             `)}
         </div>
     `;
@@ -6203,7 +6713,7 @@ function renderStoryDirectorWorkspacePanel(storyGuide) {
             `, { open: true })}
 
             ${renderDisclosure('Planner Response', 'Resposta direta da ultima chamada ao planner ou do ultimo update do StoryGuide.', `
-                <pre class="sd-console sd-console--tall">${escapeHtml(plannerResponseText || 'No planner response yet.')}</pre>
+                ${renderTokenCountedConsole(plannerResponseText, 'No planner response yet.', 'sd-console--tall')}
             `)}
 
             ${renderDisclosure('StoryGuide', 'Estado privado persistido em chat metadata para este chat.', `
@@ -6440,6 +6950,24 @@ function updateAgentWorldInfoCount() {
     $('#agent-world-info-count').text(`${count} selected`);
 }
 
+function getAgentInjectionTargetsFromPanel() {
+    return $('#agent-injection-targets [data-agent-injection-target]')
+        .map((_, row) => {
+            const element = $(row);
+            const characterSelect = element.find('[data-agent-injection-character]');
+            const selectedOption = characterSelect.find('option:selected');
+            return {
+                characterAvatar: String(characterSelect.val() ?? ''),
+                characterName: String(selectedOption.attr('data-character-name') ?? selectedOption.text() ?? '')
+                    .replace(/\s*\(unavailable\)\s*$/i, '')
+                    .trim(),
+                mode: element.find('[data-agent-injection-mode]').val() === 'full' ? 'full' : 'tag',
+                tag: normalizeOutputTagName(element.find('[data-agent-injection-tag]').val()),
+            };
+        })
+        .get();
+}
+
 function preserveVisiblePanelDrafts() {
     const routerPrompt = $('#router-prompt');
     if (routerPrompt.length) {
@@ -6475,63 +7003,12 @@ function preserveVisiblePanelDrafts() {
     persistAgentPanelFields();
 }
 
-function setPromptTokenCounterText(counterId, text) {
-    const counter = document.getElementById(counterId);
-    if (counter) {
-        counter.textContent = text;
-    }
-}
-
 function schedulePromptTokenCounterUpdate(textareaId, counterId) {
-    if (!textareaId || !counterId) {
-        return;
-    }
-
-    const textarea = document.getElementById(textareaId);
-    const counter = document.getElementById(counterId);
-    if (!textarea || !counter) {
-        return;
-    }
-
-    const currentVersion = (promptTokenCounterVersions.get(counterId) || 0) + 1;
-    promptTokenCounterVersions.set(counterId, currentVersion);
-
-    const existingTimer = promptTokenCounterTimers.get(counterId);
-    if (existingTimer) {
-        clearTimeout(existingTimer);
-    }
-
-    setPromptTokenCounterText(counterId, '...');
-
-    const timerId = window.setTimeout(async () => {
-        const value = String(textarea.value ?? '');
-        const latestVersion = promptTokenCounterVersions.get(counterId);
-        if (latestVersion !== currentVersion) {
-            return;
-        }
-
-        if (!value.trim()) {
-            setPromptTokenCounterText(counterId, '0 tokens');
-            return;
-        }
-
-        try {
-            const tokens = await SillyTavern.getContext().getTokenCountAsync(value);
-            if (promptTokenCounterVersions.get(counterId) !== currentVersion) {
-                return;
-            }
-
-            setPromptTokenCounterText(counterId, `${Number(tokens) || 0} tokens`);
-        } catch {
-            if (promptTokenCounterVersions.get(counterId) !== currentVersion) {
-                return;
-            }
-
-            setPromptTokenCounterText(counterId, '? tokens');
-        }
-    }, 180);
-
-    promptTokenCounterTimers.set(counterId, timerId);
+    scheduleTokenCounterUpdate(
+        textareaId,
+        counterId,
+        text => SillyTavern.getContext().getTokenCountAsync(text),
+    );
 }
 
 function refreshVisiblePromptTokenCounters() {
@@ -6540,6 +7017,10 @@ function refreshVisiblePromptTokenCounters() {
     schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
     schedulePromptTokenCounterUpdate('agent-prompt', 'agent-prompt-token-counter');
     schedulePromptTokenCounterUpdate('agent-output', 'agent-output-token-counter');
+    refreshReadOnlyTokenCounters(
+        document.getElementById('scene-director-panel-body'),
+        text => SillyTavern.getContext().getTokenCountAsync(text),
+    );
 }
 
 function updateRuntimeTimingUi() {
@@ -6635,6 +7116,9 @@ function persistAgentPanelFields() {
     if ($('#agent-world-info-books').length) {
         agent.worldInfoBooks = getSelectedAgentWorldInfoBooks();
     }
+    if ($('#agent-vectfox-enabled').length) {
+        agent.vectFoxEnabled = $('#agent-vectfox-enabled').is(':checked');
+    }
     if ($('#agent-schedule-type').length) {
         const scheduleType = String($('#agent-schedule-type').val() ?? 'manual');
         agent.scheduleType = AGENT_SCHEDULE_TYPES.has(scheduleType) ? scheduleType : 'manual';
@@ -6644,17 +7128,75 @@ function persistAgentPanelFields() {
     if ($('#agent-context-messages').length) {
         agent.contextMessages = Math.min(5000, Math.max(1, parseInt($('#agent-context-messages').val()) || DEFAULT_AGENT_CONTEXT_MESSAGES));
     }
+    if ($('#agent-validate-output-format').length) {
+        agent.validateOutputFormat = $('#agent-validate-output-format').is(':checked');
+    }
+    if ($('#agent-character-injection-enabled').length) {
+        agent.characterInjectionEnabled = $('#agent-character-injection-enabled').is(':checked');
+    }
+    if ($('input[name="agent-injection-position"]:checked').length) {
+        agent.characterInjectionPosition = String($('input[name="agent-injection-position"]:checked').val() ?? AGENT_INJECTION_POSITIONS.IN_CHAT);
+    }
+    if ($('#agent-injection-depth').length) {
+        agent.characterInjectionDepth = Math.min(9999, Math.max(0, parseInt($('#agent-injection-depth').val()) || 0));
+    }
+    if ($('#agent-injection-role').length) {
+        agent.characterInjectionRole = Math.min(2, Math.max(0, parseInt($('#agent-injection-role').val()) || 0));
+    }
+    const normalizedPlacement = normalizeAgentInjectionPlacement(agent);
+    agent.characterInjectionPosition = normalizedPlacement.position;
+    agent.characterInjectionDepth = normalizedPlacement.depth;
+    agent.characterInjectionRole = normalizedPlacement.role;
+    if ($('#agent-injection-targets').length) {
+        agent.characterInjectionTargets = normalizeCharacterInjectionTargets(getAgentInjectionTargetsFromPanel());
+    }
     if ($('#agent-prompt').length) agent.prompt = String($('#agent-prompt').val() ?? '');
     if ($('#agent-output').length) {
         const nextOutput = String($('#agent-output').val() ?? '');
         if (nextOutput !== getAgentRuntimeState(agent.id).output) {
-            saveAgentRuntimeState(agent.id, {
-                output: nextOutput,
-                updatedAt: new Date().toISOString(),
-            });
+            const validation = validateAgentOutput(agent, nextOutput);
+            if (validation.valid) {
+                saveAgentRuntimeState(agent.id, {
+                    output: nextOutput,
+                    updatedAt: new Date().toISOString(),
+                    lastStatus: 'success',
+                    lastError: '',
+                });
+            } else {
+                saveAgentRuntimeState(agent.id, {
+                    lastStatus: 'error',
+                    lastError: `Edited output was not saved: ${validation.error}`,
+                });
+                toastr.error(validation.error, EXTENSION_LABEL);
+            }
         }
     }
     saveConfig();
+}
+
+function addAgentInjectionTarget() {
+    persistAgentPanelFields();
+    const agent = getSelectedAgent();
+    if (!agent) return;
+
+    const usedAvatars = new Set(normalizeCharacterInjectionTargets(agent.characterInjectionTargets)
+        .map(target => target.characterAvatar)
+        .filter(Boolean));
+    const character = (SillyTavern.getContext().characters ?? [])
+        .find(item => item?.avatar && item?.name && !usedAvatars.has(String(item.avatar)));
+    if (!character) {
+        toastr.warning('No additional group character is available.', EXTENSION_LABEL);
+        return;
+    }
+
+    agent.characterInjectionTargets.push({
+        characterAvatar: String(character.avatar),
+        characterName: String(character.name),
+        mode: 'tag',
+        tag: String(character.name).trim().split(/\s+/)[0],
+    });
+    saveConfig();
+    refreshSceneDirectorPanel();
 }
 
 function createAgentFromPanel() {
@@ -6742,6 +7284,10 @@ function attachFloatingPanelEvents() {
 
         body.innerHTML = renderOperationLogBody(log);
         body.dataset.loaded = 'true';
+        window.setTimeout(refreshVisiblePromptTokenCounters, 0);
+    });
+    $('#scene-director-panel-body').on('click', '.sd-disclosure-summary', () => {
+        window.setTimeout(refreshVisiblePromptTokenCounters, 0);
     });
     $('#scene-director-panel-body').on('click', '[data-router-view]', function () {
         preserveVisiblePanelDrafts();
@@ -6782,6 +7328,13 @@ function attachFloatingPanelEvents() {
         await navigator.clipboard.writeText(getAgentRuntimeState(agent.id).output);
         toastr.success(`${agent.name} output copied.`, EXTENSION_LABEL);
     });
+    $('#scene-director-panel-body').on('click', '[data-agent-copy-snapshot]', async function () {
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        const index = Number($(this).attr('data-agent-copy-snapshot'));
+        if (!Number.isInteger(index) || index < 0) return;
+        await copyAgentOutputSnapshot(agent.id, index);
+    });
     $('#scene-director-panel-body').on('click', '#agent-clear-output', () => {
         const agent = getSelectedAgent();
         if (!agent || !window.confirm(`Clear the stored output for "${agent.name}" in this chat?`)) return;
@@ -6807,11 +7360,29 @@ function attachFloatingPanelEvents() {
         refreshSceneDirectorPanel();
     });
     $('#scene-director-panel-body').on('click', '#agent-delete', () => deleteSelectedAgent());
-    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-prompt, #agent-output', () => {
+    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-prompt, #agent-output, #agent-injection-depth, [data-agent-injection-tag]', () => {
         persistAgentPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character', () => {
+    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-vectfox-enabled, [data-agent-injection-character]', () => {
         persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-character-injection-enabled, input[name="agent-injection-position"], [data-agent-injection-mode]', () => {
+        persistAgentPanelFields();
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-injection-role', () => {
+        persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-injection-add', () => addAgentInjectionTarget());
+    $('#scene-director-panel-body').on('click', '[data-agent-injection-remove]', function () {
+        persistAgentPanelFields();
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        const index = Number($(this).attr('data-agent-injection-remove'));
+        if (!Number.isInteger(index) || index < 0) return;
+        agent.characterInjectionTargets.splice(index, 1);
+        saveConfig();
+        refreshSceneDirectorPanel();
     });
     $('#scene-director-panel-body').on('change', '#agent-world-info-books input[type="checkbox"]', () => {
         updateAgentWorldInfoCount();
@@ -7395,6 +7966,7 @@ jQuery(document).ready(async () => {
         clearCharacterNote();
         clearStoryGuideInjection();
         clearLorebookInjection();
+        clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
         clearActiveTriggerSettleMonitor();
@@ -7416,6 +7988,7 @@ jQuery(document).ready(async () => {
         clearCharacterNote();
         clearStoryGuideInjection();
         clearLorebookInjection();
+        clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearSceneDirection();
         clearActiveTriggerSettleMonitor();
