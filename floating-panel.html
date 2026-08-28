@@ -87,11 +87,11 @@
     }
 
     #scene-director-panel {
-        position: absolute;
-        right: 0;
-        bottom: 50px;
-        width: min(1540px, calc(100vw - 24px));
-        max-height: min(960px, calc(100vh - 128px));
+        position: fixed;
+        top: 20px;
+        right: 28px;
+        width: min(1760px, calc(100vw - 56px));
+        height: min(1040px, calc(100vh - 156px));
         display: flex;
         flex-direction: column;
         gap: 14px;
@@ -169,7 +169,7 @@
 
     #scene-director-panel .sd-shell {
         display: grid;
-        grid-template-columns: 280px minmax(0, 1fr);
+        grid-template-columns: 240px minmax(0, 1fr);
         gap: 16px;
         min-height: 0;
     }
@@ -730,7 +730,7 @@
 
     #scene-director-panel .sd-agent-shell {
         display: grid;
-        grid-template-columns: 250px minmax(0, 1fr);
+        grid-template-columns: 230px minmax(0, 1fr);
         gap: 16px;
         min-height: 560px;
     }
@@ -854,6 +854,81 @@
 
     #scene-director-panel .sd-agent-content {
         min-height: 0;
+    }
+
+    #scene-director-panel .sd-action-studio {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+        gap: 14px;
+        min-height: 620px;
+    }
+
+    #scene-director-panel .sd-action-editor-pane,
+    #scene-director-panel .sd-action-control-pane {
+        min-width: 0;
+        border: 1px solid var(--sd-border);
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.12);
+    }
+
+    #scene-director-panel .sd-action-editor-pane {
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+
+    #scene-director-panel .sd-action-control-pane {
+        padding: 14px;
+        overflow: auto;
+    }
+
+    #scene-director-panel .sd-action-pane-header,
+    #scene-director-panel .sd-editor-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    #scene-director-panel .sd-action-pane-header {
+        padding: 14px;
+        border-bottom: 1px solid var(--sd-border);
+    }
+
+    #scene-director-panel .sd-code-editor {
+        width: 100%;
+        min-height: 520px;
+        flex: 1 1 auto;
+        font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    #scene-director-panel .sd-editor-meta {
+        align-items: flex-start;
+        padding: 9px 12px;
+        border-top: 1px solid var(--sd-border);
+        color: var(--sd-text-dim);
+        font-size: 11px;
+        line-height: 1.4;
+    }
+
+    #scene-director-panel .sd-action-payload {
+        min-height: 150px;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    #scene-director-panel .sd-action-warning {
+        margin: 8px 0 12px;
+        padding: 9px 10px;
+        border-left: 3px solid var(--sd-warning);
+        background: rgba(255, 207, 117, 0.07);
+    }
+
+    #scene-director-panel .sd-action-result-summary {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 12px;
+        margin-bottom: 10px;
     }
 
     #scene-director-panel .sd-agent-empty {
@@ -1027,9 +1102,19 @@
         color: #ffd0c6;
     }
 
+    @media (max-width: 1650px) {
+        #scene-director-panel .sd-action-studio {
+            grid-template-columns: 1fr;
+        }
+
+        #scene-director-panel .sd-code-editor {
+            min-height: 460px;
+        }
+    }
+
     @media (max-width: 1050px) {
         #scene-director-panel {
-            width: calc(100vw - 20px);
+            width: calc(100vw - 36px);
         }
 
         #scene-director-panel .sd-shell,
@@ -1050,7 +1135,10 @@
         }
 
         #scene-director-panel {
-            max-height: calc(100vh - 136px);
+            width: calc(100vw - 20px);
+            height: calc(100vh - 136px);
+            top: 10px;
+            right: 10px;
             padding: 12px;
             border-radius: 18px;
         }
@@ -1079,6 +1167,10 @@
         }
 
         #scene-director-panel .sd-agent-injection-target {
+            grid-template-columns: 1fr;
+        }
+
+        #scene-director-panel .sd-action-result-summary {
             grid-template-columns: 1fr;
         }
     }

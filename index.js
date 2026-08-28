@@ -6,34 +6,54 @@ import {
     formatAgentInjectionPlacement,
     normalizeAgentInjectionPlacement,
 } from './agents/character-injection.js';
+import {
+    AGENT_LOG_LEVEL_OPTIONS,
+    LOG_LEVEL_OPTIONS,
+    backstageLogger,
+    normalizeLogLevel,
+} from './logging/logger.js';
+import {
+    executeAgentAction,
+    validateAgentActionScript,
+} from './agents/action-runner.js';
+import {
+    buildAgentGraphitiToolRuntime,
+    isValidGraphitiGroupId,
+} from './agents/graphiti-tools.js';
+import { runAgentToolConversation } from './agents/tool-call-runner.js';
+import { CancellationRegistry, isAbortError } from './runtime/cancellation.js';
+import {
+    destroyAgentScriptEditor,
+    getAgentScriptEditorValue,
+    mountAgentScriptEditor,
+} from './ui/agent-script-editor.js';
 
-console.log('[Backstage] Loading...');
+backstageLogger.info('Core', 'Loading extension');
 
 const EXTENSION_NAME = 'MultiCaller';
 const EXTENSION_DISPLAY_NAME = 'Backstage';
 const EXTENSION_LABEL = 'Backstage';
 const ROUTER_LABEL = 'Turn Router';
-const STORY_DIRECTOR_LABEL = 'Story Director';
 const AGENTS_LABEL = 'Agents';
-const CURRENT_CONFIG_VERSION = 12;
+const CURRENT_CONFIG_VERSION = 14;
 const DEFAULT_WORLD_CONTEXT_CHARS = 0;
 const PROFILE_SWITCH_SETTLE_QUIET_MS = 2000;
 const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
 const PROFILE_SWITCH_SETTLE_EVENT_LIMIT = 12;
-const STORY_GUIDE_SNAPSHOT_RETENTION = 3;
-const STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
 const AGENT_OUTPUT_SNAPSHOT_RETENTION = 3;
 const AGENT_OUTPUT_SNAPSHOT_MIN_INTERVAL_MS = 60 * 60 * 1000;
-const DEFAULT_PLANNER_CONTEXT_MESSAGES = 500;
 const MAX_OPERATION_LOGS = 100;
 const DEFAULT_AGENT_CONTEXT_MESSAGES = 100;
+const DEFAULT_AGENT_MAX_TOOL_ROUNDS = 16;
+const MAX_AGENT_TOOL_ROUNDS = 64;
 const AGENT_SCHEDULE_TYPES = new Set(['manual', 'user-turns', 'total-turns', 'character-turns']);
+const GRAPHITI_PERMISSION_TYPES = new Set(['search', 'remember', 'correct', 'forget']);
 const LOCAL_CONFIG_STORAGE_KEY = `st_${EXTENSION_NAME}_settings`;
 const LEGACY_CONFIG_BACKUP_KEY = `${LOCAL_CONFIG_STORAGE_KEY}_legacy_backup`;
 const NATIVE_SETTINGS_NAMESPACE = 'backstage';
 const NATIVE_SETTINGS_STORAGE_VERSION = 1;
 
-const DEFAULT_SCENE_DIRECTOR_PROMPT = `You are the RP Scene Director for a SillyTavern group roleplay.
+const DEFAULT_ROUTER_PROMPT = `You are the RP Turn Router for a SillyTavern group roleplay.
 
 You are invisible. You never write chat prose. You never narrate the scene.
 Your job is to decide who should speak next and provide a private direction for that character's next turn.
@@ -65,9 +85,6 @@ Recent chat:
 World context:
 {{worldContext}}
 
-StoryGuide:
-{{storyGuide}}
-
 Return:
 {
   "nextSpeaker": "name or USER",
@@ -77,115 +94,6 @@ Return:
   "avoid": "what the next speaker must not do"
 }`;
 
-const DEFAULT_STORY_PLANNER_PROMPT = `You are the private Story Planner for a long-form SillyTavern group RP.
-
-You are invisible. You never write chat prose, narration, dialogue, or a reply for any character.
-You do not choose the next speaker. You maintain a persistent StoryGuide used by the SceneDirector and GM.
-
-Your job is to act like a disciplined manga/anime series planner:
-- Keep the current arc moving toward a satisfying conclusion.
-- Track major plot threads, hidden reveals, character risks, emotional pressure, and continuity.
-- Build momentum for drama, death risk, betrayal risk, discoveries, reversals, and consequences without forcing the player character.
-- Preserve uncertainty. Do not solve mysteries too early. Do not remove tension just because the party found temporary safety.
-
-Inputs you will receive:
-- Current StoryGuide: the existing private plan, or empty if no plan exists.
-- Recent chat: the latest visible RP events.
-- World context: active lore/RAG context, when available.
-- Selected lorebook catalog: available lorebook entries from the books selected for planner scope.
-
-Mode A - no current StoryGuide:
-If Current StoryGuide is empty, create a strong plan for the current arc from the available chat and world context.
-The plan should cover the current arc from its present position to its likely conclusion.
-Also include a lightweight long-range runway for later arcs so the current arc can seed future payoffs.
-Infer only what is reasonably supported. Mark uncertain assumptions as "Candidate" instead of treating them as fact.
-
-Mode B - existing StoryGuide:
-If Current StoryGuide already exists, update it incrementally.
-Preserve useful structure, established facts, unresolved threads, and future payoffs.
-Advance completed beats, remove stale instructions, add new consequences, and revise the route when the RP changes direction.
-When the current arc appears concluded, close it cleanly and draft the next arc plan. Keep a long-range runway toward the eventual RP endgame.
-
-Output rules:
-- Return only the updated StoryGuide in concise Markdown. No code fences. No commentary outside the plan.
-- Be specific enough that the SceneDirector can create next-turn directions from it.
-- Do not script the player's actions, thoughts, emotions, dialogue, or success/failure.
-- Do not force NPC outcomes that should emerge in play. Express them as pressures, options, or conditional beats.
-- Do not reveal hidden information to characters; this is private planning state.
-- Prefer actionable planning over lore summary.
-
-Required StoryGuide structure:
-# Arc Header
-- Arc: Arc X - short arc name
-- Reference: #X Manga / #X lorebook, or Candidate if uncertain
-- Current stage: setup / travel / investigation / confrontation / fallout / transition
-- Current scene:
-- Immediate objective:
-- Arc end condition:
-- Current pressure:
-
-# Arc Route
-- Where we are now:
-- Next required beat:
-- Mid-arc turn:
-- Crisis / point of no return:
-- Possible arc conclusions:
-- Fallout into next arc:
-
-# Pending Plots
-- Active plot threads:
-- Waiting for payoff:
-- At risk of being forgotten:
-- Ready to reveal soon:
-- Should stay hidden:
-
-# Unknown User Skills
-- Unknown or partially known skills:
-- Foreshadowing already planted:
-- Next safe clue:
-- Reveal conditions:
-- Do not reveal yet:
-
-# Character Secrets
-- Leira hiding:
-- Eve hiding:
-- Lisbeth hiding:
-- Ayaka hiding:
-- Other NPC secrets:
-- Betrayal risk:
-
-# Goddess / World Facts
-- Known by the party:
-- Known only to the planner/GM:
-- False beliefs currently in play:
-- Facts that can pressure the current arc:
-- Facts that must remain delayed:
-
-# Scene Fuel
-- Drama levers:
-- Death or injury risk:
-- Trust stress:
-- Resource pressure:
-- External threat clock:
-
-# Beat Queue
-- Next 1-3 turns:
-- Next scene:
-- Before arc conclusion:
-- Seeds for later arcs:
-
-# Continuity Locks
-- Established facts:
-- Do not contradict:
-- Open questions:
-
-# Director Guidance
-- What the SceneDirector should prioritize:
-- What the SceneDirector should avoid:
-- When to call GM instead of a character:`;
-const PLANNER_OOC_DEFAULT_DRAFT = `OOC
-
-Planner pause the RP for a while`;
 const ROUTER_OOC_DEFAULT_DRAFT = `OOC
 
 Router pause the RP for a while`;
@@ -196,19 +104,11 @@ Pause the RP for a while`;
 const DEFAULT_CONFIG = {
     configVersion:     CURRENT_CONFIG_VERSION,
     routerProfileId:   '',
-    plannerProfileId:  '',
     routerInputTokenBudget: 0,
     worldContextChars: DEFAULT_WORLD_CONTEXT_CHARS,
-    plannerUserTurnInterval: 5,
-    plannerContextMessages: DEFAULT_PLANNER_CONTEXT_MESSAGES,
-    plannerWorldInfoBooks: [],
-    routerTimedLorebookBook: '',
-    routerTimedLorebookUid: '',
-    routerTimedLorebookName: '',
-    routerTimedLorebookTriggerRegex: '',
+    consoleLogLevel:  'debug',
     enabled:           true,
-    routerPrompt:      DEFAULT_SCENE_DIRECTOR_PROMPT,
-    plannerPrompt:     DEFAULT_STORY_PLANNER_PROMPT,
+    routerPrompt:      DEFAULT_ROUTER_PROMPT,
     characters: [],
     agents: [],
     // characters: [{ name, profileId, profileName }]
@@ -218,39 +118,29 @@ let config = { ...DEFAULT_CONFIG };
 let isProcessing = false;
 let lastActiveChar = null;
 let activeCharacterGenerationGuard = null;
-let isStoryGuideUpdateInProgress = false;
 let contextSnapshotQueue = Promise.resolve();
-const backgroundCalls = new Map();
 const activeOperationLogIds = new Map();
 let agentSchedulerQueue = Promise.resolve();
 const runningAgentIds = new Set();
+const runningAgentActionIds = new Set();
+const cancellableOperations = new CancellationRegistry();
 let sceneDirectorState = {
     panelOpen: false,
     activeTab: 'router',
-    directorView: 'workspace',
     routerView: 'workspace',
     agentView: 'workspace',
     activeAgentId: '',
     routerStatus: 'idle',
     routerUpdatedAt: null,
-    directorStatus: 'idle',
-    directorUpdatedAt: null,
     lastContext: null,
     lastDecision: null,
     lastReasoning: '',
     lastRawOutput: '',
-    plannerReasoning: '',
-    plannerRawOutput: '',
-    plannerError: '',
     lastPromptMessages: null,
-    lastPlannerPromptMessages: null,
     routerOocDraft: ROUTER_OOC_DEFAULT_DRAFT,
     routerOocHistory: [],
-    plannerOocDraft: PLANNER_OOC_DEFAULT_DRAFT,
-    plannerOocHistory: [],
     agentOocDrafts: {},
     agentOocHistories: {},
-    routerTimedLorebookSearch: '',
     persistentIssue: '',
     persistentIssueSource: '',
     persistentIssueAt: null,
@@ -270,18 +160,17 @@ let sceneDirectorState = {
         lastRouterMs: null,
         lastRouterAt: null,
         lastRouterModel: '',
-        lastPlannerMs: null,
-        lastPlannerAt: null,
-        lastPlannerModel: '',
         lastCharacterMs: null,
         lastCharacterAt: null,
         lastCharacterModel: '',
     },
 };
-let lastDirectorRequest = null;
+let lastRouterRequest = null;
 let forcedRouterSpeaker = null;
 let skipNextCharacterAutoRouter = false;
 let pendingAutoRouter = false;
+let pendingNativeCharacterMessage = null;
+const handledCharacterTurnMessages = new WeakSet();
 let activeTriggerSettleMonitor = null;
 
 // ================= FLOW LOG =================
@@ -290,21 +179,10 @@ const T0 = Date.now();
 function fl(direction, method, detail = '') {
     const t = ((Date.now() - T0) / 1000).toFixed(2);
     const det = detail ? ` | ${detail}` : '';
-    console.log(`[Backstage][${t}s] ${direction} ${method}${det}`);
+    backstageLogger.trace('Flow', `[${t}s] ${direction} ${method}${det}`);
 }
 
 // ================= CONFIG =================
-
-function buildLocalDirectorConfig() {
-    return {
-        configVersion: CURRENT_CONFIG_VERSION,
-        plannerProfileId: config.plannerProfileId,
-        plannerUserTurnInterval: config.plannerUserTurnInterval,
-        plannerContextMessages: config.plannerContextMessages,
-        plannerWorldInfoBooks: config.plannerWorldInfoBooks,
-        plannerPrompt: config.plannerPrompt,
-    };
-}
 
 function buildNativeRouterAgentConfig() {
     return {
@@ -315,15 +193,12 @@ function buildNativeRouterAgentConfig() {
             inputTokenBudget: config.routerInputTokenBudget,
             worldContextChars: config.worldContextChars,
             prompt: config.routerPrompt,
-            characters: config.characters,
-            timedLorebook: {
-                book: config.routerTimedLorebookBook,
-                uid: config.routerTimedLorebookUid,
-                name: config.routerTimedLorebookName,
-                triggerRegex: config.routerTimedLorebookTriggerRegex,
-            },
+            characters: structuredClone(config.characters),
         },
-        agents: config.agents,
+        logging: {
+            level: config.consoleLogLevel,
+        },
+        agents: structuredClone(config.agents),
     };
 }
 
@@ -334,12 +209,10 @@ function hasMeaningfulRouterAgentValues(value) {
     return agents.length > 0
         || !!String(source.routerProfileId ?? '').trim()
         || characters.some(character => String(character?.profileId ?? '').trim())
-        || (!!String(source.routerPrompt ?? '').trim() && source.routerPrompt !== DEFAULT_SCENE_DIRECTOR_PROMPT)
-        || !!String(source.routerTimedLorebookBook ?? '').trim()
-        || !!String(source.routerTimedLorebookUid ?? '').trim()
-        || !!String(source.routerTimedLorebookTriggerRegex ?? '').trim()
+        || (!!String(source.routerPrompt ?? '').trim() && source.routerPrompt !== DEFAULT_ROUTER_PROMPT)
         || Math.max(0, parseInt(source.routerInputTokenBudget) || 0) !== DEFAULT_CONFIG.routerInputTokenBudget
         || Math.max(0, parseInt(source.worldContextChars) || 0) !== DEFAULT_CONFIG.worldContextChars
+        || normalizeLogLevel(source.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel }) !== DEFAULT_CONFIG.consoleLogLevel
         || source.enabled === false;
 }
 
@@ -347,24 +220,22 @@ function applyNativeRouterAgentConfig(nativeSettings) {
     const router = nativeSettings?.router && typeof nativeSettings.router === 'object'
         ? nativeSettings.router
         : {};
-    const timedLorebook = router.timedLorebook && typeof router.timedLorebook === 'object'
-        ? router.timedLorebook
+    const logging = nativeSettings?.logging && typeof nativeSettings.logging === 'object'
+        ? nativeSettings.logging
         : {};
 
     config.enabled = router.enabled ?? config.enabled;
     config.routerProfileId = String(router.profileId ?? config.routerProfileId ?? '');
     config.routerInputTokenBudget = Math.max(0, parseInt(router.inputTokenBudget) || 0);
     config.worldContextChars = Math.max(0, parseInt(router.worldContextChars) || 0);
-    config.routerPrompt = String(router.prompt ?? config.routerPrompt ?? DEFAULT_SCENE_DIRECTOR_PROMPT);
+    config.routerPrompt = String(router.prompt ?? config.routerPrompt ?? DEFAULT_ROUTER_PROMPT);
     config.characters = Array.isArray(router.characters) ? router.characters : config.characters;
-    config.routerTimedLorebookBook = String(timedLorebook.book ?? config.routerTimedLorebookBook ?? '');
-    config.routerTimedLorebookUid = String(timedLorebook.uid ?? config.routerTimedLorebookUid ?? '');
-    config.routerTimedLorebookName = String(timedLorebook.name ?? config.routerTimedLorebookName ?? '');
-    config.routerTimedLorebookTriggerRegex = String(timedLorebook.triggerRegex ?? config.routerTimedLorebookTriggerRegex ?? '');
+    config.consoleLogLevel = normalizeLogLevel(logging.level ?? config.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel });
     config.agents = normalizeAgentDefinitions(nativeSettings?.agents);
 }
 
 function saveConfig() {
+    syncLoggerConfig();
     const ctx = SillyTavern.getContext();
     const nativeSettings = buildNativeRouterAgentConfig();
     const extensionSettingsRoot = ctx?.extensionSettings?.[EXTENSION_NAME];
@@ -378,11 +249,6 @@ function saveConfig() {
 
     if (!hasNativeSettings && hasMeaningfulNativeValues && !localStorage.getItem(LEGACY_CONFIG_BACKUP_KEY)) {
         localStorage.setItem(LEGACY_CONFIG_BACKUP_KEY, JSON.stringify(config));
-    }
-
-    const localJson = JSON.stringify(buildLocalDirectorConfig());
-    if (localStorage.getItem(LOCAL_CONFIG_STORAGE_KEY) !== localJson) {
-        localStorage.setItem(LOCAL_CONFIG_STORAGE_KEY, localJson);
     }
 
     if (!ctx?.extensionSettings || (!hasNativeSettings && !hasMeaningfulNativeValues)) return;
@@ -417,6 +283,22 @@ function createUniqueAgentId(name, agents = config.agents) {
     return `${base}-${suffix}`;
 }
 
+function normalizeGraphitiGroupIds(values) {
+    const source = Array.isArray(values)
+        ? values
+        : String(values ?? '').split(/[\s,]+/);
+    return [...new Set(source
+        .map(value => String(value ?? '').trim())
+        .filter(value => value && isValidGraphitiGroupId(value)))];
+}
+
+function normalizeGraphitiPermissions(values, defaults = []) {
+    const source = Array.isArray(values) ? values : defaults;
+    return [...new Set(source
+        .map(value => String(value ?? '').trim().toLowerCase())
+        .filter(value => GRAPHITI_PERMISSION_TYPES.has(value)))];
+}
+
 function normalizeAgentDefinition(agent, index = 0) {
     const name = String(agent?.name ?? `Agent ${index + 1}`).trim() || `Agent ${index + 1}`;
     const scheduleType = AGENT_SCHEDULE_TYPES.has(String(agent?.scheduleType ?? 'manual'))
@@ -440,8 +322,30 @@ function normalizeAgentDefinition(agent, index = 0) {
             ? agent.worldInfoBooks.map(name => String(name ?? '').trim()).filter(Boolean)
             : [],
         vectFoxEnabled: agent?.vectFoxEnabled === true,
+        graphitiOocEnabled: agent?.graphitiOocEnabled === true || agent?.graphitiToolEnabled === true,
+        graphitiAutomaticEnabled: agent?.graphitiAutomaticEnabled === true,
+        graphitiReadGroupIds: normalizeGraphitiGroupIds(agent?.graphitiReadGroupIds),
+        graphitiWriteGroupId: isValidGraphitiGroupId(agent?.graphitiWriteGroupId)
+            ? String(agent.graphitiWriteGroupId).trim()
+            : '',
+        graphitiOocPermissions: normalizeGraphitiPermissions(
+            agent?.graphitiOocPermissions,
+            ['search', 'remember', 'correct', 'forget'],
+        ),
+        graphitiAutomaticPermissions: normalizeGraphitiPermissions(
+            agent?.graphitiAutomaticPermissions,
+            ['search', 'remember'],
+        ),
+        logLevel: AGENT_LOG_LEVEL_OPTIONS.includes(String(agent?.logLevel ?? '').trim().toLowerCase())
+            ? String(agent.logLevel).trim().toLowerCase()
+            : 'inherit',
         contextMessages: Math.min(5000, Math.max(1, parseInt(agent?.contextMessages) || DEFAULT_AGENT_CONTEXT_MESSAGES)),
+        maxToolRounds: Math.min(MAX_AGENT_TOOL_ROUNDS, Math.max(1, parseInt(agent?.maxToolRounds) || DEFAULT_AGENT_MAX_TOOL_ROUNDS)),
         validateOutputFormat: agent?.validateOutputFormat === true,
+        actionEnabled: agent?.actionEnabled === true,
+        actionAutoRun: agent?.actionAutoRun === true,
+        actionScript: String(agent?.actionScript ?? ''),
+        actionTestPayload: String(agent?.actionTestPayload ?? '{\n    "example": true\n}'),
         characterInjectionEnabled: agent?.characterInjectionEnabled === true,
         characterInjectionPosition: injectionPlacement.position,
         characterInjectionDepth: injectionPlacement.depth,
@@ -491,34 +395,39 @@ function normalizeAgentDefinitions(agents) {
     return normalized;
 }
 
+function getAgentLogScope(agentOrId) {
+    const id = typeof agentOrId === 'object' ? agentOrId?.id : agentOrId;
+    return `Agent:${normalizeAgentId(id) || 'unknown'}`;
+}
+
+function syncLoggerConfig() {
+    backstageLogger.configure({
+        level: normalizeLogLevel(config.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel }),
+        scopes: Object.fromEntries(
+            normalizeAgentDefinitions(config.agents)
+                .filter(agent => agent.logLevel !== 'inherit')
+                .map(agent => [getAgentLogScope(agent), agent.logLevel]),
+        ),
+    });
+}
+
 function isLegacyRouterPrompt(prompt) {
     return String(prompt ?? '').includes('ONE WORD ONLY') || !String(prompt ?? '').includes('{{worldContext}}');
 }
 
-function needsSceneDirectorPromptRefresh(prompt) {
+function needsRouterPromptRefresh(prompt) {
     const value = String(prompt ?? '');
     return isLegacyRouterPrompt(value)
         || !value.includes('If nextSpeaker is USER')
         || !value.includes('Never instruct, command, script, or imply the user');
 }
 
-function needsStoryPlannerPromptRefresh(prompt) {
-    const value = String(prompt ?? '');
-    return !value
-        || (value.includes('Required sections:')
-            && value.includes('# Drama Policy')
-            && !value.includes('Mode A - no current StoryGuide'))
-        || (value.includes('# Story Position')
-            && value.includes('# Long-Range Runway')
-            && !value.includes('# Arc Header'));
-}
-
 function migrateConfig() {
     const previousVersion = Number(config.configVersion || 1);
 
     if (previousVersion < CURRENT_CONFIG_VERSION) {
-        if (needsSceneDirectorPromptRefresh(config.routerPrompt)) {
-            config.routerPrompt = DEFAULT_SCENE_DIRECTOR_PROMPT;
+        if (needsRouterPromptRefresh(config.routerPrompt)) {
+            config.routerPrompt = DEFAULT_ROUTER_PROMPT;
         }
         if (config.routerInputTokenBudget == null) {
             config.routerInputTokenBudget = 0;
@@ -526,34 +435,6 @@ function migrateConfig() {
         config.routerInputTokenBudget = Math.max(0, parseInt(config.routerInputTokenBudget) || 0);
         if (config.worldContextChars == null) {
             config.worldContextChars = DEFAULT_WORLD_CONTEXT_CHARS;
-        }
-        if (config.plannerProfileId == null) {
-            config.plannerProfileId = '';
-        }
-        if (config.plannerUserTurnInterval == null) {
-            config.plannerUserTurnInterval = DEFAULT_CONFIG.plannerUserTurnInterval;
-        }
-        if (config.plannerContextMessages == null) {
-            config.plannerContextMessages = DEFAULT_CONFIG.plannerContextMessages;
-        }
-        config.plannerContextMessages = Math.min(5000, Math.max(1, parseInt(config.plannerContextMessages) || DEFAULT_CONFIG.plannerContextMessages));
-        if (!Array.isArray(config.plannerWorldInfoBooks)) {
-            config.plannerWorldInfoBooks = [];
-        }
-        if (config.routerTimedLorebookBook == null) {
-            config.routerTimedLorebookBook = DEFAULT_CONFIG.routerTimedLorebookBook;
-        }
-        if (config.routerTimedLorebookUid == null) {
-            config.routerTimedLorebookUid = DEFAULT_CONFIG.routerTimedLorebookUid;
-        }
-        if (config.routerTimedLorebookName == null) {
-            config.routerTimedLorebookName = DEFAULT_CONFIG.routerTimedLorebookName;
-        }
-        if (config.routerTimedLorebookTriggerRegex == null) {
-            config.routerTimedLorebookTriggerRegex = DEFAULT_CONFIG.routerTimedLorebookTriggerRegex;
-        }
-        if (needsStoryPlannerPromptRefresh(config.plannerPrompt)) {
-            config.plannerPrompt = DEFAULT_STORY_PLANNER_PROMPT;
         }
         config.agents = normalizeAgentDefinitions(config.agents);
         delete config.maxTokens;
@@ -570,7 +451,7 @@ function parseStoredConfig(storageKey) {
         const value = JSON.parse(raw);
         return { raw, value: value && typeof value === 'object' ? value : null };
     } catch (error) {
-        console.warn(`[Backstage] Could not parse stored config ${storageKey}:`, error);
+        backstageLogger.warn('Config', `Could not parse stored config ${storageKey}`, error);
         return { raw, value: null };
     }
 }
@@ -602,22 +483,28 @@ function loadConfig() {
 
     migrateConfig();
     config.agents = normalizeAgentDefinitions(config.agents);
+    config.consoleLogLevel = normalizeLogLevel(config.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel });
+    syncLoggerConfig();
     if (!hasNativeSettings && legacySource) saveConfig();
 }
-
-const routerTimedLorebookEntryCache = new Map();
-let routerTimedLorebookLastTriggerSignature = '';
 
 // ================= SOUND =================
 
 const USER_SOUND_URL = '/scripts/extensions/third-party/MultiCaller/sounds/User.mp3';
+let userTurnAudio = null;
 
 function playUserSound() {
     try {
-        const audio = new Audio(USER_SOUND_URL);
-        audio.volume = 0.5;
-        audio.play().catch(() => {});
-    } catch (_) {}
+        userTurnAudio ??= new Audio(USER_SOUND_URL);
+        userTurnAudio.pause();
+        userTurnAudio.currentTime = 0;
+        userTurnAudio.volume = 0.5;
+        userTurnAudio.play().catch(error => {
+            backstageLogger.warn('Sound', 'Could not play the user-turn sound', error);
+        });
+    } catch (error) {
+        backstageLogger.warn('Sound', 'Could not initialize the user-turn sound', error);
+    }
 }
 
 // ================= CHAT LOCK =================
@@ -636,9 +523,6 @@ function unlockChat() {
 // ================= CHARACTER NOTE =================
 
 const CHAR_NOTE_KEY = 'rp-router-char-note';
-const SCENE_DIRECTION_KEY = 'scene-director-next-reply';
-const LOREBOOK_INJECTION_KEY = 'scene-director-lorebook-context';
-const STORY_GUIDE_INJECTION_KEY = 'scene-director-story-guide-context';
 const AGENT_CHARACTER_INJECTION_KEY = 'backstage-agent-character-context';
 const DIRECT_OOC_KEY = 'scene-director-direct-ooc';
 const EXTENSION_PROMPT_TYPES = {
@@ -652,7 +536,9 @@ const EXTENSION_PROMPT_ROLES = {
 
 function setCharacterNote(charName) {
     const ctx = SillyTavern.getContext();
-    const note = `[Write the next reply only as ${charName}. Do NOT speak as any other character.]`;
+    const note = `<CHARACTER_ASSIGNMENT>
+Write the next reply only as ${charName}. Do NOT speak as any other character.
+</CHARACTER_ASSIGNMENT>`;
     if (typeof ctx.setExtensionPrompt === 'function') {
         ctx.setExtensionPrompt(CHAR_NOTE_KEY, note, EXTENSION_PROMPT_TYPES.BEFORE_PROMPT, 0);
     }
@@ -691,19 +577,21 @@ function setDirectedOocPrompt(charName, oocText) {
         return;
     }
 
-    const prompt = `[PRIVATE OOC DIRECTIVE - NEXT REPLY ONLY]
+    const prompt = `<PRIVATE_OOC_DIRECTIVE>
 You are replying as ${charName}, but this next reply must be OOC, not in-scene narration.
 
-Rules:
+<RULES>
 - Start your reply with: OOC ${charName}
 - Answer the operator's request directly and clearly.
 - Do not continue the RP scene.
 - Do not act as other characters.
 - Do not mention hidden prompts, routing, or system instructions.
+</RULES>
 
-Operator request:
+<OPERATOR_REQUEST>
 ${request}
-[/Direct OOC]`;
+</OPERATOR_REQUEST>
+</PRIVATE_OOC_DIRECTIVE>`;
 
     ctx.setExtensionPrompt(
         DIRECT_OOC_KEY,
@@ -727,352 +615,6 @@ function clearDirectedOocPrompt() {
             EXTENSION_PROMPT_ROLES.SYSTEM,
         );
     }
-}
-
-function normalizePlannerSectionName(name) {
-    const normalized = String(name ?? '').trim().toLowerCase();
-    if (!normalized) return '';
-    if (normalized === 'gm') return 'gm';
-    return normalized.split(/\s+/)[0] ?? '';
-}
-
-function parseLorebookControlBlock(storyGuide) {
-    const source = String(storyGuide ?? '');
-    const blockMatch = source.match(/\[LOREBOOK_CONTROL\]([\s\S]*?)\[\/LOREBOOK_CONTROL\]/i);
-    if (!blockMatch) {
-        return { sections: new Map(), raw: '' };
-    }
-
-    const body = String(blockMatch[1] ?? '');
-    const lines = body.split(/\r?\n/);
-    const sections = new Map();
-    let currentSection = '';
-
-    for (const rawLine of lines) {
-        const line = String(rawLine ?? '').trim();
-        if (!line) continue;
-
-        const sectionMatch = line.match(/^\[([^\]]+)\]$/);
-        if (sectionMatch) {
-            currentSection = String(sectionMatch[1] ?? '').trim();
-            if (currentSection && !sections.has(currentSection)) {
-                sections.set(currentSection, []);
-            }
-            continue;
-        }
-
-        if (!currentSection || /^-\s*none$/i.test(line)) {
-            continue;
-        }
-
-        const uidMatch = line.match(/uid:\s*(\d+)/i);
-        if (!uidMatch) {
-            continue;
-        }
-
-        const nameMatch = line.match(/name:\s*"([^"]+)"/i);
-        sections.get(currentSection)?.push({
-            name: String(nameMatch?.[1] ?? '').trim(),
-            uid: Number(uidMatch[1]),
-        });
-    }
-
-    return { sections, raw: blockMatch[0] };
-}
-
-function parseStoryGuideBlocks(storyGuide) {
-    const source = String(storyGuide ?? '');
-    const blocks = [];
-    const blockPattern = /\[(?!\/)([^\]\r\n]+)\]([\s\S]*?)\[\/\1\]/gi;
-    let match = null;
-
-    while ((match = blockPattern.exec(source)) !== null) {
-        blocks.push({
-            name: String(match[1] ?? '').trim(),
-            body: String(match[2] ?? '').trim(),
-            raw: String(match[0] ?? '').trim(),
-        });
-    }
-
-    return blocks;
-}
-
-function parseStoryGuideTaggedSections(blockBody) {
-    const sections = new Map();
-    const lines = String(blockBody ?? '').split(/\r?\n/);
-    let currentSection = '';
-
-    for (const rawLine of lines) {
-        const line = String(rawLine ?? '');
-        const trimmed = line.trim();
-        if (!trimmed) {
-            if (currentSection) {
-                sections.get(currentSection)?.lines.push('');
-            }
-            continue;
-        }
-
-        const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
-        if (sectionMatch) {
-            currentSection = String(sectionMatch[1] ?? '').trim();
-            if (currentSection && !sections.has(currentSection)) {
-                sections.set(currentSection, { name: currentSection, lines: [] });
-            }
-            continue;
-        }
-
-        if (!currentSection) {
-            continue;
-        }
-
-        sections.get(currentSection)?.lines.push(line.trimEnd());
-    }
-
-    return Array.from(sections.values())
-        .map(section => ({
-            name: section.name,
-            text: section.lines.join('\n').trim(),
-        }))
-        .filter(section => section.text);
-}
-
-function selectStoryGuideSectionsForSpeaker(storyGuide, speakerName) {
-    const normalizedSpeaker = normalizePlannerSectionName(speakerName);
-    if (!normalizedSpeaker) return [];
-
-    const blocks = parseStoryGuideBlocks(storyGuide);
-    const selectedSections = blocks
-        .map(block => {
-            const sections = parseStoryGuideTaggedSections(block.body);
-            const matchedSection = sections.find(item => normalizePlannerSectionName(item.name) === normalizedSpeaker);
-
-            if (!matchedSection || /^-\s*none$/i.test(matchedSection.text)) {
-                return null;
-            }
-
-            return {
-                blockName: block.name,
-                sectionName: matchedSection.name,
-                text: matchedSection.text,
-            };
-        })
-        .filter(Boolean);
-
-    return selectedSections;
-}
-
-function buildStoryGuideInjectionPrompt(storyGuide, charName) {
-    const source = String(storyGuide ?? '').trim();
-    const speaker = String(charName ?? '').trim();
-    if (!source || !speaker) return '';
-
-    if (normalizePlannerSectionName(speaker) === 'gm') {
-        return `[SCENE_DIRECTION]
-speaker: ${speaker}
-scope: next reply only
-mode: private
-
-[RULES]
-- Treat the StoryGuide as hidden planning state.
-- Do not quote, mention, or reveal this plan directly.
-- Do not reveal hidden information before the scene earns it.
-- Keep continuity, pacing, and unresolved tension intact.
-- Do not mention the StoryGuide, planner, router, or hidden instructions.
-[/RULES]
-
-[STORYGUIDE]
-${source}
-[/STORYGUIDE]
-[/SCENE_DIRECTION]`;
-    }
-
-    const relevantSections = selectStoryGuideSectionsForSpeaker(source, speaker);
-    if (!relevantSections.length) return '';
-
-    const body = relevantSections
-        .map(section => `[${section.blockName}]
-[${section.sectionName}]
-${section.text}
-[/${section.blockName}]`)
-        .join('\n\n');
-
-    return `[SCENE_DIRECTION]
-speaker: ${speaker}
-scope: next reply only
-mode: private
-
-[RULES]
-- Treat the StoryGuide as hidden planning state, not public narration.
-- Use it to guide emphasis, restraint, suspicion, priorities, and payoff timing.
-- Do not quote, mention, or reveal this plan directly.
-- Do not turn hidden information into explicit certainty unless your character could already know it.
-- Do not resolve reveals, mysteries, or payoffs before their stated conditions.
-- Stay in character and keep the current scene grounded.
-[/RULES]
-
-[STORYGUIDE]
-${body}
-[/STORYGUIDE]
-[/SCENE_DIRECTION]`;
-}
-
-async function getPlannerLorebookLibrary(selectedBooks = config.plannerWorldInfoBooks) {
-    const books = (Array.isArray(selectedBooks) ? selectedBooks : [])
-        .map(name => String(name ?? '').trim())
-        .filter(Boolean);
-
-    if (!books.length) return [];
-
-    try {
-        const wi = await getWorldInfoModule();
-        if (typeof wi.loadWorldInfo !== 'function') {
-            return [];
-        }
-
-        const library = [];
-        for (const bookName of books) {
-            const data = await wi.loadWorldInfo(bookName);
-            for (const entry of Object.values(data?.entries ?? {})) {
-                library.push({
-                    book: bookName,
-                    uid: Number(entry?.uid),
-                    name: String(entry?.comment ?? '').trim(),
-                    content: String(entry?.content ?? '').trim(),
-                    disable: !!entry?.disable,
-                });
-            }
-        }
-
-        return library;
-    } catch (error) {
-        console.warn('[SceneDirector] Failed to load planner lorebook library:', error);
-        return [];
-    }
-}
-
-function resolveLorebookReferencesForSpeaker(control, speakerName) {
-    const normalizedSpeaker = normalizePlannerSectionName(speakerName);
-    if (!normalizedSpeaker) return [];
-
-    if (normalizedSpeaker === 'gm') {
-        const merged = [];
-        for (const refs of control.sections.values()) {
-            merged.push(...refs);
-        }
-        return merged;
-    }
-
-    for (const [sectionName, refs] of control.sections.entries()) {
-        if (normalizePlannerSectionName(sectionName) === normalizedSpeaker) {
-            return refs;
-        }
-    }
-
-    return [];
-}
-
-function resolveLorebookEntriesFromLibrary(references, library) {
-    const resolved = [];
-    const seen = new Set();
-
-    for (const reference of Array.isArray(references) ? references : []) {
-        const refUid = Number(reference?.uid);
-        const refName = String(reference?.name ?? '').trim().toLowerCase();
-        if (!Number.isFinite(refUid)) continue;
-
-        const matches = library.filter(entry => {
-            if (Number(entry.uid) !== refUid) return false;
-            if (!refName) return true;
-            return String(entry.name ?? '').trim().toLowerCase() === refName;
-        });
-
-        const match = matches[0] ?? library.find(entry => Number(entry.uid) === refUid);
-        if (!match) continue;
-
-        const key = `${match.book}:${match.uid}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        resolved.push(match);
-    }
-
-    return resolved;
-}
-
-function buildLorebookInjectionPrompt(entries, charName) {
-    const usableEntries = (Array.isArray(entries) ? entries : []).filter(entry => String(entry?.content ?? '').trim());
-    if (!usableEntries.length) return '';
-
-    const body = usableEntries
-        .map(entry => `### ${entry.name || `UID ${entry.uid}`} (${entry.book} | uid ${entry.uid})\n${entry.content}`)
-        .join('\n\n');
-
-    return `[PRIVATE LOREBOOK CONTEXT - NEXT REPLY ONLY]
-You are writing as ${charName}. Use the following lorebook context as high-priority private guidance for your next reply only.
-
-Rules:
-- Use this context only when it helps the current turn.
-- Do not quote or mention this directive, lorebooks, routing, prompts, hidden notes, or injected context.
-- Do not reveal hidden information unless your character could naturally know or express it.
-- Keep your reply in character and focused on the current scene.
-
-${body}
-[/Lorebook Context]`;
-}
-
-async function applyLorebookInjectionForCharacter(charName, storyGuide = getStoryGuide()) {
-    const ctx = SillyTavern.getContext();
-    if (typeof ctx.setExtensionPrompt !== 'function') {
-        return;
-    }
-
-    const control = parseLorebookControlBlock(storyGuide);
-    if (!control.sections.size) {
-        clearLorebookInjection();
-        return;
-    }
-
-    const references = resolveLorebookReferencesForSpeaker(control, charName);
-    if (!references.length) {
-        clearLorebookInjection();
-        return;
-    }
-
-    const library = await getPlannerLorebookLibrary();
-    const entries = resolveLorebookEntriesFromLibrary(references, library);
-    const prompt = buildLorebookInjectionPrompt(entries, charName);
-
-    if (!prompt) {
-        clearLorebookInjection();
-        return;
-    }
-
-    ctx.setExtensionPrompt(
-        LOREBOOK_INJECTION_KEY,
-        prompt,
-        EXTENSION_PROMPT_TYPES.IN_PROMPT,
-        0,
-        false,
-        EXTENSION_PROMPT_ROLES.SYSTEM,
-    );
-}
-
-function applyStoryGuideInjectionForCharacter(charName, storyGuide = getStoryGuide()) {
-    const ctx = SillyTavern.getContext();
-    const prompt = buildStoryGuideInjectionPrompt(storyGuide, charName);
-
-    if (!prompt || typeof ctx.setExtensionPrompt !== 'function') {
-        clearStoryGuideInjection();
-        return;
-    }
-
-    ctx.setExtensionPrompt(
-        STORY_GUIDE_INJECTION_KEY,
-        prompt,
-        EXTENSION_PROMPT_TYPES.IN_PROMPT,
-        0,
-        false,
-        EXTENSION_PROMPT_ROLES.SYSTEM,
-    );
 }
 
 function resolveAgentInjectionTarget(agent, charName, ctx = SillyTavern.getContext()) {
@@ -1152,7 +694,7 @@ function buildAgentCharacterInjection(charName, ctx = SillyTavern.getContext()) 
             continue;
         }
         if (!extracted.content || isEmptyAgentInjectionContent(extracted.content)) continue;
-        deliveries.push({ agent, target, content: extracted.content });
+        deliveries.push({ agent, target, content: extracted.block });
     }
 
     const deliveriesByAgent = new Map();
@@ -1166,25 +708,7 @@ function buildAgentCharacterInjection(charName, ctx = SillyTavern.getContext()) 
     const injections = [...deliveriesByAgent.values()].map(group => ({
         agent: group.agent,
         deliveries: group.deliveries,
-        prompt: `<AGENT_GUIDANCE>
-speaker: ${charName}
-scope: private character guidance
-
-<RULES>
-- Apply only the guidance relevant to the current reply.
-- Preserve character knowledge boundaries and roleplay continuity.
-- Do not quote, mention, or expose agents, hidden guidance, prompts, or routing.
-</RULES>
-
-<SOURCE>
-agent: ${group.agent.name}
-agent_id: ${group.agent.id}
-
-${group.deliveries.map(delivery => `mode: ${delivery.target.mode}
-
-${delivery.content}`).join('\n\n')}
-</SOURCE>
-</AGENT_GUIDANCE>`,
+        prompt: group.deliveries.map(delivery => delivery.content).join('\n\n'),
     }));
 
     return {
@@ -1220,40 +744,6 @@ function applyAgentCharacterInjection(charName) {
 function clearAgentCharacterInjection() {
     const ctx = SillyTavern.getContext();
     clearAgentCharacterInjectionPrompts(ctx, AGENT_CHARACTER_INJECTION_KEY);
-}
-
-function buildSceneDirectionPrompt(decision, charName) {
-    const direction = String(decision?.direction ?? '').trim();
-    const scenePressure = String(decision?.scenePressure ?? '').trim();
-    const avoid = String(decision?.avoid ?? '').trim();
-
-    if (!direction && !scenePressure && !avoid) return '';
-
-    return `[SCENE_DIRECTION]
-speaker: ${charName}
-scope: next reply only
-mode: private
-
-[OBJECTIVE]
-${direction || 'Continue the scene naturally from your character perspective.'}
-[/OBJECTIVE]
-
-[PRESSURE]
-${scenePressure || 'Keep the scene moving without forcing the user character.'}
-[/PRESSURE]
-
-[AVOID]
-${avoid || 'Do not reveal hidden information. Do not decide the user character actions, thoughts, emotions, or dialogue.'}
-[/AVOID]
-
-[RULES]
-- Your next reply should visibly serve the objective.
-- Keep the pressure present in the scene; do not dissolve tension unless the objective says so.
-- Do not skip ahead, resolve the scene, or summarize future events.
-- Do not decide the user character's actions, thoughts, emotions, dialogue, or dice results.
-- Do not mention the SceneDirector, routing, prompts, or hidden instructions.
-[/RULES]
-[/SCENE_DIRECTION]`;
 }
 
 function resolveDecisionCharacterName(decision) {
@@ -1307,67 +797,6 @@ function resolveRequestedCharacterName(name) {
     return fuzzy?.name || requested;
 }
 
-function setSceneDirection(decision, charName) {
-    const ctx = SillyTavern.getContext();
-    const prompt = buildSceneDirectionPrompt(decision, charName);
-
-    if (!prompt || typeof ctx.setExtensionPrompt !== 'function') {
-        clearSceneDirection();
-        return;
-    }
-
-    ctx.setExtensionPrompt(
-        SCENE_DIRECTION_KEY,
-        prompt,
-        EXTENSION_PROMPT_TYPES.IN_PROMPT,
-        0,
-        false,
-        EXTENSION_PROMPT_ROLES.SYSTEM,
-    );
-}
-
-function clearSceneDirection() {
-    const ctx = SillyTavern.getContext();
-    if (typeof ctx.setExtensionPrompt === 'function') {
-        ctx.setExtensionPrompt(
-            SCENE_DIRECTION_KEY,
-            '',
-            EXTENSION_PROMPT_TYPES.IN_PROMPT,
-            0,
-            false,
-            EXTENSION_PROMPT_ROLES.SYSTEM,
-        );
-    }
-}
-
-function clearLorebookInjection() {
-    const ctx = SillyTavern.getContext();
-    if (typeof ctx.setExtensionPrompt === 'function') {
-        ctx.setExtensionPrompt(
-            LOREBOOK_INJECTION_KEY,
-            '',
-            EXTENSION_PROMPT_TYPES.IN_PROMPT,
-            0,
-            false,
-            EXTENSION_PROMPT_ROLES.SYSTEM,
-        );
-    }
-}
-
-function clearStoryGuideInjection() {
-    const ctx = SillyTavern.getContext();
-    if (typeof ctx.setExtensionPrompt === 'function') {
-        ctx.setExtensionPrompt(
-            STORY_GUIDE_INJECTION_KEY,
-            '',
-            EXTENSION_PROMPT_TYPES.IN_PROMPT,
-            0,
-            false,
-            EXTENSION_PROMPT_ROLES.SYSTEM,
-        );
-    }
-}
-
 // ================= CONNECTION SERVICE =================
 
 let _connService = null;
@@ -1379,14 +808,16 @@ async function getConnService() {
     return _connService;
 }
 
-async function sendPlannerStreamingRequest(profileId, messages) {
+async function sendAgentStreamingRequest(profileId, messages, signal = null) {
     const service = await getConnService();
+    signal?.throwIfAborted();
     const response = await service.sendRequest(
         profileId,
         messages,
         undefined,
-        { stream: true, extractData: true },
+        { stream: true, extractData: true, signal },
     );
+    signal?.throwIfAborted();
 
     if (typeof response !== 'function') {
         return response;
@@ -1397,11 +828,69 @@ async function sendPlannerStreamingRequest(profileId, messages) {
     const generator = response();
 
     for await (const chunk of generator) {
+        signal?.throwIfAborted();
         content = String(chunk?.text ?? content);
         reasoning = String(chunk?.state?.reasoning ?? reasoning);
     }
 
+    signal?.throwIfAborted();
     return { content, reasoning };
+}
+
+async function sendAgentToolRequest(profileId, messages, logId, toolRuntime, maxRounds, signal = null) {
+    const service = await getConnService();
+
+    return runAgentToolConversation({
+        messages,
+        tools: toolRuntime.schemas,
+        validateToolCall: toolRuntime.validateCall,
+        sendRawRequest: (roundMessages, tools) => service.sendRequest(
+            profileId,
+            roundMessages,
+            undefined,
+            { stream: false, extractData: false, signal },
+            { tools, tool_choice: 'auto' },
+        ),
+        onEvent: event => {
+            if (event.type === 'request') {
+                appendOperationLogDetail(
+                    logId,
+                    `Tool-call round ${event.round}: sending ${event.messageCount} messages.`,
+                );
+                const current = (sceneDirectorState.operationLogs ?? []).find(log => log.id === logId);
+                const requestPayload = sanitizeRequestPayloadForLog({
+                    messages: event.messages,
+                    tools: event.tools,
+                    tool_choice: 'auto',
+                });
+                const requestBlock = `# Agent Tool API Request ${event.round}\n${JSON.stringify(requestPayload, null, 2)}`;
+                updateOperationLog(logId, {
+                    request: current?.request ? `${current.request}\n\n${requestBlock}` : requestBlock,
+                });
+                return;
+            }
+
+            if (event.type === 'response') {
+                const calls = event.toolCalls?.map(call => call.function?.name).filter(Boolean) ?? [];
+                appendOperationLogDetail(
+                    logId,
+                    `Tool-call round ${event.round}: ${calls.length ? `requested ${calls.join(', ')}` : 'returned final text'}.`,
+                );
+                return;
+            }
+
+            if (event.type === 'tool-result') {
+                appendOperationLogDetail(logId, [
+                    `Tool execution: ${event.name}`,
+                    `Arguments: ${event.arguments}`,
+                    `Status: ${event.error ? 'error' : 'success'}`,
+                    `Result: ${event.result}`,
+                ].join('\n'));
+            }
+        },
+        maxRounds,
+        signal,
+    });
 }
 
 function resolveCharacterProfileForSwitch(char, ctx = SillyTavern.getContext()) {
@@ -1521,14 +1010,20 @@ async function waitForStableChatRecovery(anchor, stableMs = PROFILE_SWITCH_SETTL
     return false;
 }
 
-function clearActiveTriggerSettleMonitor() {
+function clearActiveTriggerSettleMonitor(reason = 'Profile settle monitor cleared.') {
     if (!activeTriggerSettleMonitor) {
         return;
     }
 
-    clearTimeout(activeTriggerSettleMonitor.quietTimer);
-    clearTimeout(activeTriggerSettleMonitor.maxTimer);
-    clearTimeout(activeTriggerSettleMonitor.pollTimer);
+    const monitor = activeTriggerSettleMonitor;
+    if (typeof monitor.cancel === 'function') {
+        monitor.cancel(reason);
+        return;
+    }
+
+    clearTimeout(monitor.quietTimer);
+    clearTimeout(monitor.maxTimer);
+    clearTimeout(monitor.pollTimer);
     activeTriggerSettleMonitor = null;
 }
 
@@ -1555,6 +1050,7 @@ function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWIT
         recoveryAnchor: null,
         resolve: null,
         promise: null,
+        cancel: null,
     };
 
     const scheduleQuietTimer = () => {
@@ -1589,6 +1085,7 @@ function beginTriggerSettleMonitor(charName, profileName, quietMs = PROFILE_SWIT
             maxWaitMs: monitor.maxWaitMs,
         });
     };
+    monitor.cancel = note => finish('cancelled', String(note || 'Profile settle monitor cancelled.'));
 
     const checkChatRecovery = () => {
         if (monitor.finished || !monitor.armed) {
@@ -1741,103 +1238,6 @@ function getAvailableWorldInfoNames(wi = null) {
         .filter(Boolean);
 }
 
-function getRouterTimedLorebookConfig() {
-    return {
-        book: String(config.routerTimedLorebookBook ?? '').trim(),
-        uid: Number(config.routerTimedLorebookUid),
-        name: String(config.routerTimedLorebookName ?? '').trim(),
-        triggerRegex: String(config.routerTimedLorebookTriggerRegex ?? '').trim(),
-    };
-}
-
-function getRealChatTurnCount(ctx = SillyTavern.getContext()) {
-    return (ctx.chat ?? []).filter(m =>
-        !m.is_system &&
-        m.extra?.type !== 'tool_call' &&
-        m.extra?.type !== 'tool_response' &&
-        m.mes != null &&
-        String(m.mes).trim() &&
-        !isBackstageOocMessage(m.mes)
-    ).length;
-}
-
-function tryBuildRouterTimedLorebookRegex() {
-    const source = String(config.routerTimedLorebookTriggerRegex ?? '').trim();
-    if (!source) return null;
-
-    const wrappedMatch = source.match(/^\/([\s\S]*)\/([a-z]*)$/i);
-    try {
-        if (wrappedMatch) {
-            return new RegExp(wrappedMatch[1], wrappedMatch[2] || 'i');
-        }
-
-        return new RegExp(source, 'i');
-    } catch (error) {
-        console.warn('[SceneDirector] Invalid timed lorebook regex:', source, error);
-        return null;
-    }
-}
-
-function getRouterTimedLorebookCachedEntry() {
-    const timedConfig = getRouterTimedLorebookConfig();
-    if (!timedConfig.book || !Number.isFinite(timedConfig.uid) || timedConfig.uid <= 0) {
-        return null;
-    }
-
-    const entries = routerTimedLorebookEntryCache.get(timedConfig.book) ?? [];
-    return entries.find(entry => entry.uid === timedConfig.uid) ?? null;
-}
-
-function getRouterTimedLorebookEffectMode(entry) {
-    if (!entry) return '';
-    if (Number(entry.sticky) > 0) return 'sticky';
-    if (Number(entry.cooldown) > 0) return 'cooldown';
-    return '';
-}
-
-async function getRouterTimedLorebookEntries(bookName) {
-    const cleanBookName = String(bookName ?? '').trim();
-    if (!cleanBookName) return [];
-    if (routerTimedLorebookEntryCache.has(cleanBookName)) {
-        return routerTimedLorebookEntryCache.get(cleanBookName) ?? [];
-    }
-
-    const wi = await getWorldInfoModule();
-    if (typeof wi.loadWorldInfo !== 'function') {
-        return [];
-    }
-
-    const data = await wi.loadWorldInfo(cleanBookName);
-    const entries = Object.values(data?.entries ?? {})
-        .map(entry => {
-            const comment = String(entry?.comment ?? '').trim();
-            const keys = Array.isArray(entry?.key) ? entry.key.filter(Boolean).join(', ') : '';
-            const content = String(entry?.content ?? '').replace(/\s+/g, ' ').trim();
-            const preview = content.slice(0, 140);
-            return {
-                uid: Number(entry?.uid),
-                comment,
-                keys,
-                preview,
-                disable: !!entry?.disable,
-                sticky: Number(entry?.sticky) || 0,
-                cooldown: Number(entry?.cooldown) || 0,
-                content,
-                label: comment || preview || `UID ${entry?.uid}`,
-                searchText: [comment, keys, content, String(entry?.uid ?? '')].join(' ').toLowerCase(),
-            };
-        })
-        .filter(entry => Number.isFinite(entry.uid))
-        .sort((a, b) => {
-            const aLabel = a.label.toLowerCase();
-            const bLabel = b.label.toLowerCase();
-            return aLabel.localeCompare(bLabel) || a.uid - b.uid;
-        });
-
-    routerTimedLorebookEntryCache.set(cleanBookName, entries);
-    return entries;
-}
-
 function summarizeWorldInfoEntries(scan) {
     const entries = scan?.activated?.entries;
     if (!entries || typeof entries.values !== 'function') return [];
@@ -1878,7 +1278,7 @@ function formatWorldInfoPromptResult(result) {
     return parts.join('\n\n');
 }
 
-async function getSelectedWorldInfoContext(ctx, selectedBooks = config.plannerWorldInfoBooks) {
+async function getSelectedWorldInfoContext(ctx, selectedBooks = []) {
     const books = (Array.isArray(selectedBooks) ? selectedBooks : [])
         .map(name => String(name ?? '').trim())
         .filter(Boolean);
@@ -1942,7 +1342,7 @@ async function getSelectedWorldInfoContext(ctx, selectedBooks = config.plannerWo
     }
 }
 
-async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldInfoBooks, options = {}) {
+async function getSelectedWorldInfoCatalog(selectedBooks = [], options = {}) {
     const books = (Array.isArray(selectedBooks) ? selectedBooks : [])
         .map(name => String(name ?? '').trim())
         .filter(Boolean);
@@ -2021,7 +1421,7 @@ async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldIn
             entryCount,
         };
     } catch (error) {
-        console.warn('[SceneDirector] Failed to build World Info catalog:', error);
+        backstageLogger.warn('WorldInfo', 'Failed to build World Info catalog', error);
         return {
             text: '',
             source: 'error',
@@ -2031,82 +1431,11 @@ async function getSelectedWorldInfoCatalog(selectedBooks = config.plannerWorldIn
     }
 }
 
-function isRouterTimedLorebookGmMessage(message) {
-    const name = String(message?.name ?? '').trim();
-    return /\bgm\b/i.test(name);
-}
-
-async function maybeTriggerRouterTimedLorebookFromMessage(message, ctx = SillyTavern.getContext()) {
-    const timedConfig = getRouterTimedLorebookConfig();
-    const regex = tryBuildRouterTimedLorebookRegex();
-
-    if (!timedConfig.book || !Number.isFinite(timedConfig.uid) || timedConfig.uid <= 0 || !regex) {
-        return null;
-    }
-
-    if (!isRouterTimedLorebookGmMessage(message)) {
-        return null;
-    }
-
-    const content = String(message?.mes ?? '').trim();
-    if (!content || !regex.test(content)) {
-        return null;
-    }
-
-    const signature = [
-        String(ctx.groupId ?? ctx.characterId ?? ''),
-        (ctx.chat ?? []).length - 1,
-        String(message?.name ?? '').trim(),
-        content,
-        timedConfig.book,
-        timedConfig.uid,
-    ].join('|');
-
-    if (routerTimedLorebookLastTriggerSignature === signature) {
-        return null;
-    }
-
-    try {
-        const entries = await getRouterTimedLorebookEntries(timedConfig.book);
-        const entry = entries.find(item => item.uid === timedConfig.uid);
-        if (!entry) {
-            console.warn('[SceneDirector] Timed lorebook trigger target entry not found:', timedConfig);
-            return null;
-        }
-
-        const effect = getRouterTimedLorebookEffectMode(entry);
-        if (!effect) {
-            console.warn('[SceneDirector] Timed lorebook trigger target has no sticky/cooldown configured:', {
-                book: timedConfig.book,
-                uid: timedConfig.uid,
-                sticky: entry.sticky,
-                cooldown: entry.cooldown,
-            });
-            return null;
-        }
-
-        const escapedBook = timedConfig.book.replace(/"/g, '\\"');
-        await ctx.executeSlashCommandsWithOptions(`/wi-set-timed-effect file="${escapedBook}" uid=${timedConfig.uid} effect=${effect} on`);
-        routerTimedLorebookLastTriggerSignature = signature;
-        console.log('[SceneDirector] Triggered timed lorebook effect from GM message', {
-            book: timedConfig.book,
-            uid: timedConfig.uid,
-            effect,
-            regex: timedConfig.triggerRegex,
-            speaker: message?.name,
-        });
-        return { effect, entry };
-    } catch (error) {
-        console.warn('[SceneDirector] Failed to trigger timed lorebook effect from GM message:', error);
-        return null;
-    }
-}
-
 async function testWorldInfoPrompt(caller = 'manual') {
     const ctx = SillyTavern.getContext();
 
     if (typeof ctx.getWorldInfoPrompt !== 'function') {
-        console.warn('[RP Router][WI Test] ctx.getWorldInfoPrompt is not available in this SillyTavern build.', ctx);
+        backstageLogger.warn('Test:WorldInfo', 'ctx.getWorldInfoPrompt is unavailable in this SillyTavern build', ctx);
         toastr.error('ctx.getWorldInfoPrompt nao esta disponivel.', 'RP Router');
         return null;
     }
@@ -2115,8 +1444,8 @@ async function testWorldInfoPrompt(caller = 'manual') {
     const globalScanData = buildWorldInfoScanData(ctx);
     const scanPromise = waitForWorldInfoScan(ctx);
 
-    console.group(`[RP Router][WI Test] ${caller}`);
-    console.log('Input', {
+    backstageLogger.info('Test:WorldInfo', `Test started by ${caller}`);
+    backstageLogger.info('Test:WorldInfo', 'Input', {
         chatMessages: chatForWI.length,
         maxContext: ctx.maxContext,
         groupId: ctx.groupId,
@@ -2129,32 +1458,22 @@ async function testWorldInfoPrompt(caller = 'manual') {
         const scan = await scanPromise;
         const activatedEntries = summarizeWorldInfoEntries(scan);
 
-        console.log('WorldInfo result', result);
-        console.log('worldInfoBefore', result.worldInfoBefore || '');
-        console.log('worldInfoAfter', result.worldInfoAfter || '');
-        console.log('worldInfoString', result.worldInfoString || '');
-        console.log('worldInfoDepth', result.worldInfoDepth || []);
-        console.log('worldInfoExamples', result.worldInfoExamples || []);
-        console.log('outletEntries', result.outletEntries || {});
-        console.log('WORLDINFO_SCAN_DONE raw', scan);
-        console.table(activatedEntries.map(entry => ({
-            world: entry.world,
-            uid: entry.uid,
-            comment: entry.comment,
-            keys: Array.isArray(entry.key) ? entry.key.join(', ') : '',
-            position: entry.position,
-            depth: entry.depth,
-        })));
-        console.log('Activated entries', activatedEntries);
+        backstageLogger.info('Test:WorldInfo', 'WorldInfo result', result);
+        backstageLogger.debug('Test:WorldInfo', 'worldInfoBefore', result.worldInfoBefore || '');
+        backstageLogger.debug('Test:WorldInfo', 'worldInfoAfter', result.worldInfoAfter || '');
+        backstageLogger.debug('Test:WorldInfo', 'worldInfoString', result.worldInfoString || '');
+        backstageLogger.debug('Test:WorldInfo', 'worldInfoDepth', result.worldInfoDepth || []);
+        backstageLogger.debug('Test:WorldInfo', 'worldInfoExamples', result.worldInfoExamples || []);
+        backstageLogger.debug('Test:WorldInfo', 'outletEntries', result.outletEntries || {});
+        backstageLogger.debug('Test:WorldInfo', 'WORLDINFO_SCAN_DONE raw', scan);
+        backstageLogger.info('Test:WorldInfo', 'Activated entries', activatedEntries);
 
         toastr.info(`WI dry-run: ${activatedEntries.length} entradas ativadas. Veja o console.`, 'RP Router');
         return { result, scan, activatedEntries };
     } catch (error) {
-        console.error('[RP Router][WI Test] Error while testing World Info prompt:', error);
+        backstageLogger.error('Test:WorldInfo', 'Test failed', error);
         toastr.error('Erro no teste de World Info. Veja o console.', 'RP Router');
         return null;
-    } finally {
-        console.groupEnd();
     }
 }
 
@@ -2165,7 +1484,7 @@ async function getExtensionSettings() {
         const mod = await import('/scripts/extensions.js');
         return mod.extension_settings ?? window.extension_settings ?? null;
     } catch (error) {
-        console.warn('[RP Router][VectFox Test] Could not import extension_settings:', error);
+        backstageLogger.warn('VectFox', 'Could not import extension settings', error);
         return window.extension_settings ?? null;
     }
 }
@@ -2321,7 +1640,7 @@ async function getVectFoxRouterContext(ctx, options = {}) {
             truncated: maxChars > 0 && injectionText.length > maxChars,
         };
     } catch (error) {
-        console.warn('[SceneDirector] Failed to get VectFox router context:', error);
+        backstageLogger.warn('VectFox', 'Failed to get Router context', error);
         return { text: '', source: 'error', entryCount: 0, originalLength: 0, error };
     }
 }
@@ -2388,22 +1707,21 @@ async function testVectFoxPrompt(caller = 'manual', options = {}) {
     const runtime = buildVectFoxRuntimeSummary(settings);
     const existingPrompts = inspectVectFoxExtensionPrompts(ctx);
 
-    console.group(`[RP Router][VectFox Test] ${caller}`);
-    console.log('Runtime', runtime);
-    console.log('Existing VectFox-ish extension prompts summary', summarizeVectFoxPrompts(existingPrompts));
-    if (verbose) console.log('Existing VectFox-ish extension prompts full', existingPrompts);
+    backstageLogger.info('Test:VectFox', `Test started by ${caller}`);
+    backstageLogger.info('Test:VectFox', 'Runtime', runtime);
+    backstageLogger.debug('Test:VectFox', 'Existing extension prompts summary', summarizeVectFoxPrompts(existingPrompts));
+    if (verbose) backstageLogger.trace('Test:VectFox', 'Existing extension prompts full', existingPrompts);
 
     if (!settings) {
-        console.warn('[RP Router][VectFox Test] extension_settings.vectfox was not found.');
+        backstageLogger.warn('Test:VectFox', 'extension_settings.vectfox was not found');
         toastr.warning('VectFox settings nao encontradas. Veja o console.', 'RP Router');
-        console.groupEnd();
         return { runtime, existingPrompts };
     }
 
     const recentMessages = buildVectFoxRecentMessages(ctx, settings);
     const keywordQuery = getLastUserMessage(ctx);
 
-    console.log('Query input', {
+    backstageLogger.debug('Test:VectFox', 'Query input', {
         recentMessageCount: recentMessages.length,
         recentMessagesStart: recentMessages.map(text => String(text ?? '').slice(0, 180)),
         keywordQuery,
@@ -2426,20 +1744,14 @@ async function testVectFoxPrompt(caller = 'manual', options = {}) {
             semanticInjectionText = formatVectFoxLorebookInjection(semanticEntries, settings);
 
             const summarizedEntries = summarizeVectFoxEntries(semanticEntries);
-            console.table(summarizedEntries.map(entry => ({
-                world: entry.world,
-                uid: entry.uid,
-                comment: entry.comment,
-                score: entry.score,
-                contentLength: entry.contentLength,
-            })));
-            console.log('Semantic injection preview', semanticInjectionText.slice(0, 1200));
+            backstageLogger.info('Test:VectFox', 'Semantic entries', summarizedEntries);
+            backstageLogger.debug('Test:VectFox', 'Semantic injection preview', semanticInjectionText.slice(0, 1200));
             if (verbose) {
-                console.log('Semantic entries raw', semanticEntries);
-                console.log('Semantic injection full', semanticInjectionText);
+                backstageLogger.trace('Test:VectFox', 'Semantic entries raw', semanticEntries);
+                backstageLogger.trace('Test:VectFox', 'Semantic injection full', semanticInjectionText);
             }
         } else {
-            console.warn('[RP Router][VectFox Test] window.VectFox_WorldInfo.getSemanticEntries is not available.');
+            backstageLogger.warn('Test:VectFox', 'window.VectFox_WorldInfo.getSemanticEntries is unavailable');
         }
 
         const lorebookDryRun = await runVectFoxLorebookDryRun(ctx, settings);
@@ -2454,8 +1766,8 @@ async function testVectFoxPrompt(caller = 'manual', options = {}) {
             existingPrompts,
         });
 
-        console.log('Compact result', compact);
-        if (verbose) console.log('VectFox runLorebookWIDryRun full', lorebookDryRun);
+        backstageLogger.info('Test:VectFox', 'Compact result', compact);
+        if (verbose) backstageLogger.trace('Test:VectFox', 'runLorebookWIDryRun full', lorebookDryRun);
 
         const entryCount = Array.isArray(semanticEntries)
             ? semanticEntries.length
@@ -2473,11 +1785,9 @@ async function testVectFoxPrompt(caller = 'manual', options = {}) {
             compact,
         };
     } catch (error) {
-        console.error('[RP Router][VectFox Test] Error while testing VectFox:', error);
+        backstageLogger.error('Test:VectFox', 'Test failed', error);
         toastr.error('Erro no teste do VectFox. Veja o console.', 'RP Router');
         return null;
-    } finally {
-        console.groupEnd();
     }
 }
 
@@ -2504,9 +1814,6 @@ function buildRouterSystemPrompt(routerContext) {
         players: routerContext.playerNames,
         recentChat: routerContext.recentChat,
         worldContext: routerContext.worldContext.text,
-        storyGuide: routerContext.storyGuide,
-        lorebookContext: routerContext.lorebookContext?.text ?? '',
-        lorebookCatalog: routerContext.lorebookCatalog?.text ?? '',
         user: routerContext.humanName,
     });
 }
@@ -2537,7 +1844,7 @@ function buildRouterMessages(routerContext, options = {}) {
     return [
         { role: 'system', content: systemPrompt },
         ...(forcedSpeakerInstruction ? [{ role: 'user', content: forcedSpeakerInstruction }] : []),
-        { role: 'user', content: 'Return the SceneDirector JSON now.' },
+        { role: 'user', content: 'Return the Turn Router JSON now.' },
     ];
 }
 
@@ -2592,7 +1899,7 @@ async function resolveConnectionInputTokenBudget(profileId, explicitBudget = 0) 
             }
         }
     } catch (error) {
-        console.warn('[SceneDirector] Could not resolve input budget from connection profile:', error);
+        backstageLogger.warn('Connection', 'Could not resolve input budget from connection profile', error);
     }
 
     const context = SillyTavern.getContext();
@@ -2653,14 +1960,6 @@ function shrinkObjectTextField(target, options = {}) {
     return true;
 }
 
-function shrinkPlainTextField(object, fieldName, options = {}) {
-    const current = String(object?.[fieldName] ?? '').trim();
-    const next = shrinkTextBlock(current, options);
-    if (next === current) return false;
-    object[fieldName] = next;
-    return true;
-}
-
 async function fitContextMessagesToInputBudget(profileId, sourceContext, buildMessagesFn, options = {}) {
     const budgetResult = await resolveConnectionInputTokenBudget(profileId, options.explicitBudget);
     const budget = budgetResult.budget;
@@ -2696,8 +1995,6 @@ async function fitContextMessagesToInputBudget(profileId, sourceContext, buildMe
     const shrinkers = [
         () => shrinkObjectTextField(workingContext.lorebookCatalog, { ratio: 0.25 }),
         () => shrinkObjectTextField(workingContext.lorebookContext, { ratio: 0.2 }),
-        () => shrinkPlainTextField(workingContext, 'storyGuide', { ratio: 0.18 }),
-        () => shrinkPlainTextField(workingContext, 'currentGuide', { ratio: 0.18 }),
         () => shrinkObjectTextField(workingContext.worldContext, { ratio: 0.2 }),
     ];
 
@@ -2797,7 +2094,7 @@ function escapeHtml(value) {
         .replace(/'/g, '&#39;');
 }
 
-function parseSceneDirectorDecision(text) {
+function parseRouterDecision(text) {
     const raw = String(text ?? '').trim();
     const unfenced = stripJsonFence(raw);
     const jsonStart = unfenced.indexOf('{');
@@ -2816,7 +2113,7 @@ function parseSceneDirectorDecision(text) {
                 parsed,
             };
         } catch (error) {
-            console.warn('[SceneDirector] Failed to parse JSON response, falling back to raw text:', error, raw);
+            backstageLogger.warn('Router', 'Failed to parse JSON response; using raw text', { error, raw });
         }
     }
 
@@ -2850,21 +2147,6 @@ function updateRouterState(patch) {
         ...sceneDirectorState,
         ...normalized,
         routerUpdatedAt: new Date(),
-    };
-    refreshSceneDirectorPanel();
-}
-
-function updateStoryDirectorState(patch) {
-    const normalized = { ...patch };
-    if (Object.hasOwn(normalized, 'status')) {
-        normalized.directorStatus = normalized.status;
-        delete normalized.status;
-    }
-
-    sceneDirectorState = {
-        ...sceneDirectorState,
-        ...normalized,
-        directorUpdatedAt: new Date(),
     };
     refreshSceneDirectorPanel();
 }
@@ -3005,6 +2287,8 @@ function summarizeCompletionMessagesForLog(messages) {
     return {
         total: source.length,
         nonSystem: source.filter(message => message?.role !== 'system').length,
+        toolCalls: source.filter(message => Array.isArray(message?.tool_calls) && message.tool_calls.length > 0).length,
+        toolResults: source.filter(message => message?.role === 'tool').length,
         roles,
     };
 }
@@ -3015,6 +2299,11 @@ function summarizeHostChatForLog(ctx = SillyTavern.getContext()) {
     const characterCount = chat.filter(message => !message?.is_user && !message?.is_system).length;
     const systemCount = chat.filter(message => message?.is_system).length;
     const toolCount = chat.filter(isToolInvocationChatMessage).length;
+    const latestToolIndex = chat.findLastIndex(isToolInvocationChatMessage);
+    const latestToolMessage = latestToolIndex >= 0 ? chat[latestToolIndex] : null;
+    const latestToolInvocations = Array.isArray(latestToolMessage?.extra?.tool_invocations)
+        ? latestToolMessage.extra.tool_invocations
+        : [];
     const lastMessages = chat
         .slice(-3)
         .map(message => {
@@ -3032,6 +2321,12 @@ function summarizeHostChatForLog(ctx = SillyTavern.getContext()) {
         characterCount,
         systemCount,
         toolCount,
+        latestToolIndex,
+        latestToolDistanceFromEnd: latestToolIndex >= 0 ? chat.length - 1 - latestToolIndex : null,
+        latestToolType: String(latestToolMessage?.extra?.type ?? ''),
+        latestToolNames: latestToolInvocations
+            .map(invocation => String(invocation?.name ?? invocation?.displayName ?? '').trim())
+            .filter(Boolean),
         lastMessages,
     };
 }
@@ -3104,6 +2399,8 @@ function formatCharacterRequestSummary(payload, requestNumber, messageCharacters
         .map(([role, count]) => `${role}=${count}`)
         .join(', ') || 'none';
     const toolCount = Array.isArray(payload?.tools) ? payload.tools.length : 0;
+    const historyToolCalls = messages.filter(message => Array.isArray(message?.tool_calls) && message.tool_calls.length > 0).length;
+    const historyToolResults = messages.filter(message => message?.role === 'tool').length;
 
     return [
         `API request ${requestNumber}`,
@@ -3114,7 +2411,9 @@ function formatCharacterRequestSummary(payload, requestNumber, messageCharacters
         `Source: ${String(payload?.chat_completion_source ?? '-')}`,
         `Max output tokens: ${String(payload?.max_tokens ?? '-')}`,
         `Streaming: ${String(!!payload?.stream)}`,
-        `Tools: ${toolCount}`,
+        `Registered tools: ${toolCount}`,
+        `History tool calls: ${historyToolCalls}`,
+        `History tool results: ${historyToolResults}`,
     ].join('\n');
 }
 
@@ -3196,8 +2495,6 @@ function captureCharacterApiRequest(payload) {
 
 function resolveIssueOperationKind(source) {
     const normalized = String(source ?? '').trim().toLowerCase();
-    if (normalized.includes('planner ooc')) return 'planner-ooc';
-    if (normalized.includes('story director') || normalized.includes('planner')) return 'planner-update';
     if (normalized.includes('router ooc')) return 'router-ooc';
     if (normalized.includes('router')) return 'router-request';
     if (normalized.includes('direct ooc') || normalized.includes('character')) return 'character-turn';
@@ -3262,9 +2559,6 @@ function cloneRuntimeTiming() {
         lastRouterMs: Number.isFinite(Number(current.lastRouterMs)) ? Number(current.lastRouterMs) : null,
         lastRouterAt: current.lastRouterAt ? new Date(current.lastRouterAt) : null,
         lastRouterModel: String(current.lastRouterModel ?? ''),
-        lastPlannerMs: Number.isFinite(Number(current.lastPlannerMs)) ? Number(current.lastPlannerMs) : null,
-        lastPlannerAt: current.lastPlannerAt ? new Date(current.lastPlannerAt) : null,
-        lastPlannerModel: String(current.lastPlannerModel ?? ''),
         lastCharacterMs: Number.isFinite(Number(current.lastCharacterMs)) ? Number(current.lastCharacterMs) : null,
         lastCharacterAt: current.lastCharacterAt ? new Date(current.lastCharacterAt) : null,
         lastCharacterModel: String(current.lastCharacterModel ?? ''),
@@ -3349,12 +2643,6 @@ function finishRuntimePhase(expectedKinds = null, status = 'success') {
         nextTiming.lastRouterModel = current.activeModel;
     }
 
-    if (current.activeKind === 'planner-update' || current.activeKind === 'planner-ooc') {
-        nextTiming.lastPlannerMs = durationMs;
-        nextTiming.lastPlannerAt = finishedAt;
-        nextTiming.lastPlannerModel = current.activeModel;
-    }
-
     if (current.activeKind === 'character-turn') {
         nextTiming.lastCharacterMs = durationMs;
         nextTiming.lastCharacterAt = finishedAt;
@@ -3367,58 +2655,6 @@ function finishRuntimePhase(expectedKinds = null, status = 'success') {
     };
     refreshSceneDirectorPanel();
     completeOperationLog(getActiveOperationLogId(current.activeKind), status, finishedAt);
-}
-
-function finishBackgroundPlannerTiming(startedAt, label, model, operationLogId = '') {
-    const finishedAt = new Date();
-    const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
-    const current = cloneRuntimeTiming();
-
-    sceneDirectorState = {
-        ...sceneDirectorState,
-        runtimeTiming: {
-            ...current,
-            lastPlannerMs: durationMs,
-            lastPlannerAt: finishedAt,
-            lastPlannerModel: String(model ?? '').trim(),
-            ...(!current.activeKind ? {
-                lastCompletedKind: 'planner-update',
-                lastCompletedLabel: String(label ?? '').trim(),
-                lastCompletedMs: durationMs,
-                lastCompletedAt: finishedAt,
-            } : {}),
-        },
-    };
-    refreshSceneDirectorPanel();
-    completeOperationLog(operationLogId, 'success', finishedAt);
-}
-
-function runBackgroundCall(key, operation) {
-    const normalizedKey = String(key ?? '').trim();
-    if (!normalizedKey || typeof operation !== 'function') {
-        return Promise.resolve(null);
-    }
-
-    const running = backgroundCalls.get(normalizedKey);
-    if (running) {
-        return running;
-    }
-
-    const promise = Promise.resolve()
-        .then(operation)
-        .catch(error => {
-            console.error(`[SceneDirector] Background call "${normalizedKey}" failed:`, error);
-            recordBackstageIssue(`Background: ${normalizedKey}`, error?.message ?? String(error));
-            return null;
-        })
-        .finally(() => {
-            if (backgroundCalls.get(normalizedKey) === promise) {
-                backgroundCalls.delete(normalizedKey);
-            }
-        });
-
-    backgroundCalls.set(normalizedKey, promise);
-    return promise;
 }
 
 async function withContextSnapshotLock(operation) {
@@ -3443,7 +2679,7 @@ function getChatContextKey(ctx = SillyTavern.getContext()) {
     ].join(':');
 }
 
-function cloneDirectorRequestPayload(payload) {
+function cloneRouterRequestPayload(payload) {
     return JSON.parse(JSON.stringify(payload));
 }
 
@@ -3477,10 +2713,18 @@ function getAgentRuntimeState(agentId, ctx = SillyTavern.getContext()) {
         pendingTurns: Math.max(0, Number(current.pendingTurns) || 0),
         lastTrigger: String(current.lastTrigger ?? ''),
         snapshots: (Array.isArray(current.snapshots) ? current.snapshots : [])
-            .map(normalizeStoryGuideSnapshot)
+            .map(normalizePersistedSnapshot)
             .filter(Boolean)
             .slice(0, AGENT_OUTPUT_SNAPSHOT_RETENTION),
         lastSnapshotAt: String(current.lastSnapshotAt ?? ''),
+        lastActionStatus: String(current.lastActionStatus ?? 'idle'),
+        lastActionResult: String(current.lastActionResult ?? ''),
+        lastActionError: String(current.lastActionError ?? ''),
+        lastActionPayload: String(current.lastActionPayload ?? ''),
+        lastActionLogs: String(current.lastActionLogs ?? ''),
+        lastActionTrigger: String(current.lastActionTrigger ?? ''),
+        lastActionExecutedAt: String(current.lastActionExecutedAt ?? ''),
+        lastActionDurationMs: Math.max(0, Number(current.lastActionDurationMs) || 0),
     };
 }
 
@@ -3755,7 +2999,8 @@ function formatAgentContextForLog(agentContext) {
 
 function getLatestAgentOperation(agentId) {
     const cleanId = normalizeAgentId(agentId);
-    return (sceneDirectorState.operationLogs ?? []).find(log => log.agentId === cleanId) ?? null;
+    return (sceneDirectorState.operationLogs ?? [])
+        .find(log => log.agentId === cleanId && log.kind === `agent:${cleanId}`) ?? null;
 }
 
 function sortScheduledAgents(agentIds) {
@@ -3796,6 +3041,106 @@ function agentScheduleMatchesEvent(agent, event) {
     return target === speaker || target.split(/\s+/)[0] === speaker.split(/\s+/)[0];
 }
 
+function formatAgentActionTrigger(trigger) {
+    const type = String(trigger?.type ?? 'manual').trim() || 'manual';
+    const label = String(trigger?.label ?? '').trim();
+    return label || type;
+}
+
+async function executeConfiguredAgentAction(agent, rawOutput, trigger, ctx = SillyTavern.getContext()) {
+    if (!agent?.actionEnabled) {
+        throw new Error(`JavaScript actions are disabled for ${agent?.name || 'this agent'}.`);
+    }
+    if (runningAgentActionIds.has(agent.id)) {
+        throw new Error(`${agent.name} already has a JavaScript action running.`);
+    }
+
+    const triggerLabel = formatAgentActionTrigger(trigger);
+    const operationKind = `agent-action:${agent.id}`;
+    const logScope = getAgentLogScope(agent);
+    const logId = beginOperationLog(operationKind, `Agent action: ${agent.name}`, triggerLabel, 'Browser JavaScript');
+    updateOperationLog(logId, {
+        agentId: agent.id,
+        context: String(agent.actionScript ?? ''),
+        request: String(rawOutput ?? ''),
+    });
+    runningAgentActionIds.add(agent.id);
+    saveAgentRuntimeState(agent.id, {
+        lastActionStatus: 'running',
+        lastActionError: '',
+        lastActionTrigger: triggerLabel,
+    }, ctx);
+    refreshSceneDirectorPanel();
+
+    try {
+        const execution = await executeAgentAction({
+            script: agent.actionScript,
+            rawOutput,
+            agent: Object.freeze({ ...agent }),
+            trigger: Object.freeze({ ...trigger, label: triggerLabel }),
+            context: ctx,
+            onLog: line => backstageLogger.debug(logScope, `Action: ${line}`),
+        });
+        const executedAt = new Date().toISOString();
+        const actionLogs = execution.logs.join('\n');
+        saveAgentRuntimeState(agent.id, {
+            lastActionStatus: 'success',
+            lastActionResult: execution.resultText,
+            lastActionError: '',
+            lastActionPayload: execution.payloadText,
+            lastActionLogs: actionLogs,
+            lastActionTrigger: triggerLabel,
+            lastActionExecutedAt: executedAt,
+            lastActionDurationMs: execution.durationMs,
+        }, ctx);
+        updateOperationLog(logId, {
+            response: execution.resultText,
+            detail: [
+                `Trigger: ${triggerLabel}`,
+                `Duration: ${formatDurationMs(execution.durationMs)}`,
+                actionLogs ? `Script logs:\n${actionLogs}` : 'Script logs: none',
+            ].join('\n'),
+        });
+        completeOperationLog(logId, 'success');
+        backstageLogger.info(logScope, 'Action completed', {
+            trigger: triggerLabel,
+            durationMs: execution.durationMs,
+        });
+        return execution;
+    } catch (error) {
+        const stage = String(error?.stage ?? 'runtime');
+        const message = error?.message ?? String(error);
+        const detail = error?.stack ? `${message}\n\n${error.stack}` : message;
+        saveAgentRuntimeState(agent.id, {
+            lastActionStatus: 'error',
+            lastActionResult: '',
+            lastActionError: message,
+            lastActionPayload: String(rawOutput ?? ''),
+            lastActionLogs: '',
+            lastActionTrigger: triggerLabel,
+            lastActionExecutedAt: new Date().toISOString(),
+            lastActionDurationMs: 0,
+        }, ctx);
+        updateOperationLog(logId, {
+            error: `[${stage}] ${detail}`,
+            detail: `Trigger: ${triggerLabel}\nFailure stage: ${stage}`,
+        });
+        completeOperationLog(logId, 'error');
+        backstageLogger.error(logScope, `Action failed at ${stage}`, error);
+        sceneDirectorState = {
+            ...sceneDirectorState,
+            persistentIssue: message,
+            persistentIssueSource: `Agent action: ${agent.name}`,
+            persistentIssueAt: new Date(),
+        };
+        refreshSceneDirectorPanel();
+        throw error;
+    } finally {
+        runningAgentActionIds.delete(agent.id);
+        refreshSceneDirectorPanel();
+    }
+}
+
 async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual run' }) {
     const agent = getAgentDefinition(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
@@ -3804,9 +3149,15 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
     const ctx = SillyTavern.getContext();
     const originChatKey = getChatContextKey(ctx);
     const operationKind = `agent:${agent.id}`;
+    const logScope = getAgentLogScope(agent);
     const model = getTimingModelLabel(agent.profileId, agent.profileName);
     const logId = beginOperationLog(operationKind, `Agent: ${agent.name}`, trigger.label || trigger.type, model);
     updateOperationLog(logId, { agentId: agent.id });
+    const cancellation = cancellableOperations.start(`agent:${agent.id}`, {
+        logId,
+        mode: 'run',
+        agentId: agent.id,
+    });
     runningAgentIds.add(agent.id);
     saveAgentRuntimeState(agent.id, {
         lastStatus: 'running',
@@ -3814,18 +3165,25 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         lastTrigger: trigger.label || trigger.type,
     }, ctx);
     refreshSceneDirectorPanel();
+    backstageLogger.info(logScope, 'Execution started', {
+        trigger: trigger.label || trigger.type,
+        profile: agent.profileName || agent.profileId || 'not configured',
+    });
 
     try {
         if (!agent.profileId) throw new Error(`Agent ${agent.name} has no Connection Profile.`);
         if (!agent.prompt.trim()) throw new Error(`Agent ${agent.name} has an empty prompt.`);
+        cancellableOperations.assertActive(cancellation);
         sortScheduledAgents([agent.id]);
 
         const agentContext = await buildAgentContextSnapshot(agent, trigger, ctx);
+        cancellableOperations.assertActive(cancellation);
         const budgetedRequest = await fitContextMessagesToInputBudget(
             agent.profileId,
             agentContext,
             buildAgentMessages,
         );
+        cancellableOperations.assertActive(cancellation);
         const messages = budgetedRequest.messages;
         updateOperationLog(logId, {
             context: formatAgentContextForLog(budgetedRequest.context),
@@ -3839,14 +3197,31 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
                 `VectFox: ${agent.vectFoxEnabled ? `${budgetedRequest.context?.worldContext?.text?.length ?? 0} chars from ${budgetedRequest.context?.worldContext?.source ?? 'unknown'}` : 'disabled'}`,
                 `Recent RP messages: ${budgetedRequest.context?.recentChatEntries?.length ?? 0}`,
                 `Output validation: ${agent.validateOutputFormat ? 'enabled' : 'disabled'}`,
+                `JavaScript action: ${agent.actionEnabled ? (agent.actionAutoRun ? 'enabled, automatic' : 'enabled, manual') : 'disabled'}`,
                 `Character injection targets: ${normalizeCharacterInjectionTargets(agent.characterInjectionTargets).map(target => `${target.characterName}:${target.mode}${target.mode === 'tag' ? `:<${target.tag}>` : ''}`).join(', ') || 'none'}`,
                 `Character injection placement: ${formatAgentInjectionPlacement(agent)}`,
+                `Tool-call round limit: ${agent.maxToolRounds}`,
                 `Input budget: ${budgetedRequest.budget}`,
                 `Input trimmed: ${budgetedRequest.trimmed}`,
             ].join('\n'),
         });
+        backstageLogger.debug(logScope, 'Request context prepared', {
+            inputTokens: budgetedRequest.inputTokens,
+            inputBudget: budgetedRequest.budget,
+            trimmed: budgetedRequest.trimmed,
+            recentMessages: budgetedRequest.context?.recentChatEntries?.length ?? 0,
+            vectFox: agent.vectFoxEnabled,
+            lorebooks: agent.worldInfoBooks ?? [],
+        });
 
-        const response = await sendPlannerStreamingRequest(agent.profileId, messages);
+        const automaticToolRuntime = buildAgentGraphitiToolRuntime(agent, 'automatic');
+        if (automaticToolRuntime) {
+            appendOperationLogDetail(logId, `Long-term memory tools: ${automaticToolRuntime.summary}`);
+        }
+        const response = automaticToolRuntime
+            ? await sendAgentToolRequest(agent.profileId, messages, logId, automaticToolRuntime, agent.maxToolRounds, cancellation.controller.signal)
+            : await sendAgentStreamingRequest(agent.profileId, messages, cancellation.controller.signal);
+        cancellableOperations.assertActive(cancellation);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
         updateOperationLog(logId, {
@@ -3858,15 +3233,35 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         if (!outputValidation.valid) {
             throw new Error(`${agent.name} output was rejected: ${outputValidation.error}`);
         }
-        if (getChatContextKey(SillyTavern.getContext()) !== originChatKey) {
+        const completionCtx = SillyTavern.getContext();
+        if (getChatContextKey(completionCtx) !== originChatKey) {
             throw new Error(`Chat changed while agent ${agent.name} was running. Output was not saved.`);
         }
 
-        const currentRuntime = getAgentRuntimeState(agent.id, ctx);
+        const currentRuntime = getAgentRuntimeState(agent.id, completionCtx);
         const consumedTurns = trigger.type === 'manual'
             ? currentRuntime.pendingTurns
             : Math.max(1, Number(trigger.consumedTurns) || agent.interval);
         const runId = `agent-run-${Date.now()}-${agent.id}`;
+        cancellableOperations.assertActive(cancellation);
+        try {
+            const snapshot = await maybePersistAgentOutputSnapshot(
+                agent.id,
+                responseText,
+                completionCtx,
+                cancellation.controller.signal,
+            );
+            if (snapshot) {
+                appendOperationLogDetail(logId, `Agent output snapshot saved: ${snapshot.fileName}`);
+            }
+        } catch (snapshotError) {
+            if (isAbortError(snapshotError) || cancellation.controller.signal.aborted) throw snapshotError;
+            const snapshotMessage = snapshotError?.message ?? String(snapshotError);
+            backstageLogger.error(logScope, 'Output updated, but snapshot persistence failed', snapshotError);
+            appendOperationLogDetail(logId, `Agent output snapshot failed: ${snapshotMessage}`);
+            toastr.warning(`${agent.name} updated, but its snapshot was not saved.`, EXTENSION_LABEL);
+        }
+        cancellableOperations.assertActive(cancellation);
         saveAgentRuntimeState(agent.id, {
             output: responseText,
             updatedAt: new Date().toISOString(),
@@ -3875,25 +3270,37 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             lastError: '',
             lastTrigger: trigger.label || trigger.type,
             pendingTurns: Math.max(0, currentRuntime.pendingTurns - consumedTurns),
-        }, ctx);
-        try {
-            const snapshot = await maybePersistAgentOutputSnapshot(agent.id, responseText, ctx);
-            if (snapshot) {
-                appendOperationLogDetail(logId, `Agent output snapshot saved: ${snapshot.fileName}`);
-            }
-        } catch (snapshotError) {
-            const snapshotMessage = snapshotError?.message ?? String(snapshotError);
-            console.error(`[Backstage] ${agent.name} updated, but snapshot persistence failed:`, snapshotError);
-            appendOperationLogDetail(logId, `Agent output snapshot failed: ${snapshotMessage}`);
-            toastr.warning(`${agent.name} updated, but its snapshot was not saved.`, EXTENSION_LABEL);
-        }
+        }, completionCtx);
         updateOperationLog(logId, {
             runId,
         });
+        if (agent.actionEnabled && agent.actionAutoRun) {
+            try {
+                await executeConfiguredAgentAction(agent, responseText, {
+                    ...trigger,
+                    type: trigger.type || 'manual',
+                    label: `${trigger.label || trigger.type} / automatic action`,
+                }, completionCtx);
+                appendOperationLogDetail(logId, 'Automatic JavaScript action completed successfully.');
+            } catch (actionError) {
+                appendOperationLogDetail(logId, `Automatic JavaScript action failed: ${actionError?.message ?? String(actionError)}`);
+                toastr.error(`${agent.name} output was saved, but its action failed.`, EXTENSION_LABEL);
+            }
+        }
         completeOperationLog(logId, 'success');
+        backstageLogger.info(logScope, 'Execution completed', {
+            outputCharacters: responseText.length,
+            runId,
+        });
         return responseText;
     } catch (error) {
         const message = error?.message ?? String(error);
+        if (isAbortError(error) || cancellation.controller.signal.aborted) {
+            appendOperationLogDetail(logId, 'Execution stopped by operator. Any tool side effect already accepted by its backend was not rolled back.');
+            completeOperationLog(logId, 'stopped');
+            backstageLogger.info(logScope, 'Execution stopped');
+            return null;
+        }
         saveAgentRuntimeState(agent.id, {
             lastStatus: 'error',
             lastError: message,
@@ -3901,6 +3308,7 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         }, ctx);
         updateOperationLog(logId, { error: message });
         completeOperationLog(logId, 'error');
+        backstageLogger.error(logScope, 'Execution failed', error);
         sceneDirectorState = {
             ...sceneDirectorState,
             persistentIssue: message,
@@ -3910,7 +3318,9 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         refreshSceneDirectorPanel();
         throw error;
     } finally {
-        runningAgentIds.delete(agent.id);
+        if (cancellableOperations.finish(cancellation)) {
+            runningAgentIds.delete(agent.id);
+        }
         refreshSceneDirectorPanel();
     }
 }
@@ -3962,6 +3372,7 @@ async function runAgentOocRequest(agentId) {
     const ctx = SillyTavern.getContext();
     const originChatKey = getChatContextKey(ctx);
     const operationKind = `agent-ooc:${agent.id}`;
+    const logScope = getAgentLogScope(agent);
     const logId = beginOperationLog(
         operationKind,
         `Agent OOC: ${agent.name}`,
@@ -3969,15 +3380,23 @@ async function runAgentOocRequest(agentId) {
         getTimingModelLabel(agent.profileId, agent.profileName),
     );
     updateOperationLog(logId, { agentId: agent.id });
+    const cancellation = cancellableOperations.start(`agent:${agent.id}`, {
+        logId,
+        mode: 'ooc',
+        agentId: agent.id,
+    });
     runningAgentIds.add(agent.id);
     refreshSceneDirectorPanel();
+    backstageLogger.info(logScope, 'OOC request started');
 
     try {
+        cancellableOperations.assertActive(cancellation);
         const agentContext = await buildAgentContextSnapshot(
             agent,
             { type: 'ooc', label: 'Manual OOC request from Agents workspace' },
             ctx,
         );
+        cancellableOperations.assertActive(cancellation);
         const priorHistory = getAgentOocHistory(agent.id)
             .slice(-12)
             .map(message => ({
@@ -3993,6 +3412,7 @@ async function runAgentOocRequest(agentId) {
                 oocRequest,
             }),
         );
+        cancellableOperations.assertActive(cancellation);
         const messages = budgetedRequest.messages;
         updateOperationLog(logId, {
             context: formatAgentContextForLog(budgetedRequest.context),
@@ -4004,12 +3424,21 @@ async function runAgentOocRequest(agentId) {
                 `Persisted output: ${agentContext.previousOutput.length} chars (${routerPromptUsesTag('previousOutput', agent.prompt) ? 'prompt tag' : 'dedicated OOC system message'})`,
                 `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
                 `VectFox: ${agent.vectFoxEnabled ? `${budgetedRequest.context?.worldContext?.text?.length ?? 0} chars from ${budgetedRequest.context?.worldContext?.source ?? 'unknown'}` : 'disabled'}`,
+                `Long-term memory OOC tools: ${agent.graphitiOocEnabled ? 'enabled' : 'disabled'}`,
+                `Tool-call round limit: ${agent.maxToolRounds}`,
                 `Input budget: ${budgetedRequest.budget}`,
                 `Input trimmed: ${budgetedRequest.trimmed}`,
             ].join('\n'),
         });
 
-        const response = await sendPlannerStreamingRequest(agent.profileId, messages);
+        const oocToolRuntime = buildAgentGraphitiToolRuntime(agent, 'ooc');
+        if (oocToolRuntime) {
+            appendOperationLogDetail(logId, `Long-term memory tools: ${oocToolRuntime.summary}`);
+        }
+        const response = oocToolRuntime
+            ? await sendAgentToolRequest(agent.profileId, messages, logId, oocToolRuntime, agent.maxToolRounds, cancellation.controller.signal)
+            : await sendAgentStreamingRequest(agent.profileId, messages, cancellation.controller.signal);
+        cancellableOperations.assertActive(cancellation);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
         if (!responseText) throw new Error(`Agent ${agent.name} returned an empty OOC response.`);
@@ -4031,11 +3460,19 @@ async function runAgentOocRequest(agentId) {
             reasoning: String(reasoning ?? ''),
         });
         completeOperationLog(logId, 'success');
+        backstageLogger.info(logScope, 'OOC request completed', { responseCharacters: responseText.length });
         return responseText;
     } catch (error) {
         const message = error?.message ?? String(error);
+        if (isAbortError(error) || cancellation.controller.signal.aborted) {
+            appendOperationLogDetail(logId, 'OOC request stopped by operator. Any tool side effect already accepted by its backend was not rolled back.');
+            completeOperationLog(logId, 'stopped');
+            backstageLogger.info(logScope, 'OOC request stopped');
+            return null;
+        }
         updateOperationLog(logId, { error: message });
         completeOperationLog(logId, 'error');
+        backstageLogger.error(logScope, 'OOC request failed', error);
         sceneDirectorState = {
             ...sceneDirectorState,
             persistentIssue: message,
@@ -4045,9 +3482,30 @@ async function runAgentOocRequest(agentId) {
         toastr.error(message, EXTENSION_LABEL);
         return null;
     } finally {
-        runningAgentIds.delete(agent.id);
+        if (cancellableOperations.finish(cancellation)) {
+            runningAgentIds.delete(agent.id);
+        }
         refreshSceneDirectorPanel();
     }
+}
+
+function stopAgentExecution(agentId) {
+    const agent = getAgentDefinition(agentId);
+    if (!agent) return false;
+
+    const operation = cancellableOperations.stop(`agent:${agent.id}`, `${agent.name} stopped by operator.`);
+    if (!operation) return false;
+
+    runningAgentIds.delete(agent.id);
+    saveAgentRuntimeState(agent.id, {
+        lastStatus: 'stopped',
+        lastError: '',
+    });
+    appendOperationLogDetail(operation.metadata.logId, 'Stop requested by operator. Waiting code and late responses have been detached.');
+    completeOperationLog(operation.metadata.logId, 'stopped');
+    backstageLogger.info(getAgentLogScope(agent), 'Stop requested', { mode: operation.metadata.mode });
+    refreshSceneDirectorPanel();
+    return true;
 }
 
 async function runDueAgents(agentIds, event) {
@@ -4078,7 +3536,7 @@ async function runDueAgents(agentIds, event) {
                 consumedTurns: agent.interval,
             });
         } catch (error) {
-            console.error(`[Backstage] Scheduled agent ${id} failed:`, error);
+            backstageLogger.error(getAgentLogScope(id), 'Scheduled execution failed', error);
         }
     }
 }
@@ -4106,18 +3564,7 @@ function scheduleAgentsForTurn(event) {
         .then(() => runDueAgents(dueIds, event));
 }
 
-function getStoryGuide(ctx = SillyTavern.getContext()) {
-    return String(getSceneDirectorMetadata(ctx).storyGuide ?? '');
-}
-
-function saveStoryGuide(value, ctx = SillyTavern.getContext()) {
-    const metadata = getSceneDirectorMetadata(ctx);
-    metadata.storyGuide = String(value ?? '');
-    metadata.storyGuideUpdatedAt = new Date().toISOString();
-    ctx.saveMetadata?.();
-}
-
-function normalizeStoryGuideSnapshot(snapshot) {
+function normalizePersistedSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') {
         return null;
     }
@@ -4133,52 +3580,6 @@ function normalizeStoryGuideSnapshot(snapshot) {
     return { savedAt, path, fileName, content };
 }
 
-function getStoryGuideSnapshots(ctx = SillyTavern.getContext()) {
-    const rawSnapshots = getSceneDirectorMetadata(ctx).storyGuideSnapshots;
-    if (!Array.isArray(rawSnapshots)) {
-        return [];
-    }
-
-    return rawSnapshots
-        .map(normalizeStoryGuideSnapshot)
-        .filter(Boolean)
-        .slice(0, STORY_GUIDE_SNAPSHOT_RETENTION);
-}
-
-function saveStoryGuideSnapshots(snapshots, ctx = SillyTavern.getContext()) {
-    const metadata = getSceneDirectorMetadata(ctx);
-    const normalized = Array.isArray(snapshots)
-        ? snapshots
-            .map(normalizeStoryGuideSnapshot)
-            .filter(Boolean)
-            .slice(0, STORY_GUIDE_SNAPSHOT_RETENTION)
-        : [];
-
-    metadata.storyGuideSnapshots = normalized;
-    metadata.lastStoryGuideSnapshotAt = normalized[0]?.savedAt ?? '';
-    ctx.saveMetadata?.();
-    return normalized;
-}
-
-function getLastStoryGuideSnapshotAt(ctx = SillyTavern.getContext()) {
-    const metadata = getSceneDirectorMetadata(ctx);
-    return String(metadata.lastStoryGuideSnapshotAt ?? '').trim();
-}
-
-function shouldPersistStoryGuideSnapshot(now = new Date(), ctx = SillyTavern.getContext()) {
-    const lastSavedAt = getLastStoryGuideSnapshotAt(ctx);
-    if (!lastSavedAt) {
-        return true;
-    }
-
-    const lastSavedMs = Date.parse(lastSavedAt);
-    if (!Number.isFinite(lastSavedMs)) {
-        return true;
-    }
-
-    return now.getTime() - lastSavedMs >= STORY_GUIDE_SNAPSHOT_MIN_INTERVAL_MS;
-}
-
 function encodeBase64Utf8(value) {
     const bytes = new TextEncoder().encode(String(value ?? ''));
     let binary = '';
@@ -4191,18 +3592,12 @@ function encodeBase64Utf8(value) {
     return btoa(binary);
 }
 
-function buildStoryGuideSnapshotFileName(savedAt = new Date()) {
-    const stamp = savedAt.toISOString().replace(/[:.]/g, '-');
-    const suffix = Math.random().toString(36).slice(2, 8);
-    return `backstage-storyguide-${stamp}-${suffix}.md`;
-}
-
 async function getStRequestHeaders() {
     const { getRequestHeaders } = await import('/script.js');
     return getRequestHeaders();
 }
 
-async function uploadUserFile(name, content) {
+async function uploadUserFile(name, content, signal = null) {
     const response = await fetch('/api/files/upload', {
         method: 'POST',
         headers: await getStRequestHeaders(),
@@ -4210,6 +3605,7 @@ async function uploadUserFile(name, content) {
             name,
             data: encodeBase64Utf8(content),
         }),
+        signal,
     });
 
     if (!response.ok) {
@@ -4242,54 +3638,6 @@ async function deleteUserFile(path) {
     }
 }
 
-async function maybePersistStoryGuideSnapshot(value, ctx = SillyTavern.getContext()) {
-    const storyGuide = String(value ?? '');
-    if (!storyGuide.trim()) {
-        return null;
-    }
-
-    const now = new Date();
-    if (!shouldPersistStoryGuideSnapshot(now, ctx)) {
-        return null;
-    }
-
-    const fileName = buildStoryGuideSnapshotFileName(now);
-    const path = await uploadUserFile(fileName, storyGuide);
-    const snapshot = {
-        savedAt: now.toISOString(),
-        path,
-        fileName,
-        content: storyGuide,
-    };
-    const existing = getStoryGuideSnapshots(ctx);
-    const nextSnapshots = [snapshot, ...existing].slice(0, STORY_GUIDE_SNAPSHOT_RETENTION);
-    const prunedSnapshots = existing.slice(Math.max(0, STORY_GUIDE_SNAPSHOT_RETENTION - 1));
-
-    saveStoryGuideSnapshots(nextSnapshots, ctx);
-
-    await Promise.allSettled(
-        prunedSnapshots
-            .map(entry => entry?.path)
-            .filter(Boolean)
-            .map(pathToDelete => deleteUserFile(pathToDelete)),
-    );
-
-    return snapshot;
-}
-
-async function copyStoryGuideSnapshot(index, ctx = SillyTavern.getContext()) {
-    const snapshots = getStoryGuideSnapshots(ctx);
-    const snapshot = snapshots[index];
-    if (!snapshot) {
-        toastr.info(`Snapshot ${index + 1} indisponivel.`, EXTENSION_LABEL);
-        return false;
-    }
-
-    await navigator.clipboard.writeText(snapshot.content);
-    toastr.success(`Snapshot ${index + 1} copiado.`, EXTENSION_LABEL);
-    return true;
-}
-
 function getAgentOutputSnapshots(agentId, ctx = SillyTavern.getContext()) {
     return getAgentRuntimeState(agentId, ctx).snapshots;
 }
@@ -4311,7 +3659,7 @@ function buildAgentOutputSnapshotFileName(agentId, savedAt = new Date()) {
     return `backstage-agent-${safeAgentId}-${stamp}-${suffix}.md`;
 }
 
-async function maybePersistAgentOutputSnapshot(agentId, value, ctx = SillyTavern.getContext()) {
+async function maybePersistAgentOutputSnapshot(agentId, value, ctx = SillyTavern.getContext(), signal = null) {
     const output = String(value ?? '');
     if (!output.trim()) return null;
 
@@ -4319,7 +3667,9 @@ async function maybePersistAgentOutputSnapshot(agentId, value, ctx = SillyTavern
     if (!shouldPersistAgentOutputSnapshot(agentId, now, ctx)) return null;
 
     const fileName = buildAgentOutputSnapshotFileName(agentId, now);
-    const path = await uploadUserFile(fileName, output);
+    signal?.throwIfAborted();
+    const path = await uploadUserFile(fileName, output, signal);
+    signal?.throwIfAborted();
     const snapshot = {
         savedAt: now.toISOString(),
         path,
@@ -4331,6 +3681,7 @@ async function maybePersistAgentOutputSnapshot(agentId, value, ctx = SillyTavern
     const nextSnapshots = [snapshot, ...existing].slice(0, AGENT_OUTPUT_SNAPSHOT_RETENTION);
     const prunedSnapshots = existing.slice(Math.max(0, AGENT_OUTPUT_SNAPSHOT_RETENTION - 1));
 
+    signal?.throwIfAborted();
     saveAgentRuntimeState(agentId, {
         snapshots: nextSnapshots,
         lastSnapshotAt: snapshot.savedAt,
@@ -4356,25 +3707,6 @@ async function copyAgentOutputSnapshot(agentId, index, ctx = SillyTavern.getCont
     await navigator.clipboard.writeText(snapshot.content);
     toastr.success(`Agent snapshot ${index + 1} copied.`, EXTENSION_LABEL);
     return true;
-}
-
-function getPlannerUserTurnCounter(ctx = SillyTavern.getContext()) {
-    return Math.max(0, Number(getSceneDirectorMetadata(ctx).userTurnsSincePlannerUpdate ?? 0));
-}
-
-function getStoryGuideUpdatedAt(ctx = SillyTavern.getContext()) {
-    return String(getSceneDirectorMetadata(ctx).storyGuideUpdatedAt ?? '').trim();
-}
-
-function setPlannerUserTurnCounter(value, ctx = SillyTavern.getContext()) {
-    const metadata = getSceneDirectorMetadata(ctx);
-    metadata.userTurnsSincePlannerUpdate = Math.max(0, Number(value) || 0);
-    ctx.saveMetadata?.();
-    return metadata.userTurnsSincePlannerUpdate;
-}
-
-function incrementPlannerUserTurnCounter(ctx = SillyTavern.getContext()) {
-    return setPlannerUserTurnCounter(getPlannerUserTurnCounter(ctx) + 1, ctx);
 }
 
 function stripMarkdownFence(text) {
@@ -4410,7 +3742,7 @@ function parseXmlOutput(text, requiredNames = null) {
     const tokens = tokenizeXmlOutput(source);
     const namesWithClosers = new Set(tokens.filter(token => token.closing).map(token => token.name));
     const structuralNames = requiredNames instanceof Set
-        ? new Set([...requiredNames, ...namesWithClosers])
+        ? new Set(requiredNames)
         : namesWithClosers;
     const stack = [];
     const nodes = [];
@@ -4534,34 +3866,9 @@ function extractTaggedOutputSection(output, tagName) {
     return {
         valid: true,
         content: parsed.source.slice(matches[0].openEnd, matches[0].closeStart).trim(),
+        block: parsed.source.slice(matches[0].start, matches[0].closeEnd).trim(),
         error: '',
     };
-}
-
-async function buildPlannerContextSnapshot(ctx) {
-    const messageLimit = Math.min(5000, Math.max(1, parseInt(config.plannerContextMessages) || DEFAULT_CONFIG.plannerContextMessages));
-    const realMessages = getRpContextMessages(ctx.chat).slice(-messageLimit);
-    const humanName = ctx.name1 || '';
-    const recentChatEntries = formatRpContextMessages(realMessages, humanName);
-    const [worldContext, lorebookContext] = await Promise.all([
-        getVectFoxRouterContext(ctx, { forceEnabled: true, maxChars: 0 }),
-        getSelectedWorldInfoContext(ctx),
-    ]);
-    const lorebookCatalog = await getSelectedWorldInfoCatalog(config.plannerWorldInfoBooks, { fullContent: true });
-
-    return {
-        humanName,
-        recentChatEntries,
-        recentChat: recentChatEntries.join('\n'),
-        worldContext,
-        lorebookContext,
-        lorebookCatalog,
-        currentGuide: getStoryGuide(ctx),
-    };
-}
-
-async function getPlannerContextSnapshot(ctx = SillyTavern.getContext()) {
-    return withContextSnapshotLock(() => buildPlannerContextSnapshot(ctx));
 }
 
 function getRpContextMessages(chat) {
@@ -4579,6 +3886,16 @@ function isToolInvocationChatMessage(message) {
     return type === 'tool_call'
         || type === 'tool_response'
         || (Array.isArray(message?.extra?.tool_invocations) && message.extra.tool_invocations.length > 0);
+}
+
+function summarizeToolInvocationsForConsole(invocations) {
+    return (Array.isArray(invocations) ? invocations : []).map(invocation => ({
+        id: String(invocation?.id ?? ''),
+        name: String(invocation?.name ?? invocation?.displayName ?? 'unknown'),
+        error: !!invocation?.error,
+        parameterCharacters: String(invocation?.parameters ?? '').length,
+        resultCharacters: String(invocation?.result ?? '').length,
+    }));
 }
 
 function formatRpContextMessages(messages, humanName = '') {
@@ -4602,37 +3919,15 @@ async function buildRouterContextSnapshot(chatHistory, ctx) {
     const recentChatEntries = routerPromptUsesTag('recentChat')
         ? formatRpContextMessages(realMessages, humanName)
         : [];
-    const storyGuide = routerPromptUsesTag('storyGuide') ? getStoryGuide(ctx) : '';
-    const [worldContext, lorebookContext, lorebookCatalog] = await Promise.all([
-        routerPromptUsesTag('worldContext')
-            ? getVectFoxRouterContext(ctx)
-            : Promise.resolve({
-                text: '',
-                source: 'router-template-tag-not-used',
-                entryCount: 0,
-                originalLength: 0,
-                truncated: false,
-            }),
-        routerPromptUsesTag('lorebookContext')
-            ? getSelectedWorldInfoContext(ctx)
-            : Promise.resolve({
-                text: '',
-                source: 'router-template-tag-not-used',
-                selectedBooks: [],
-                activatedEntries: [],
-                length: 0,
-            }),
-        routerPromptUsesTag('lorebookCatalog')
-            ? getSelectedWorldInfoCatalog()
-            : Promise.resolve({
-                text: '',
-                source: 'router-template-tag-not-used',
-                selectedBooks: [],
-                entries: [],
-                entryCount: 0,
-                length: 0,
-            }),
-    ]);
+    const worldContext = routerPromptUsesTag('worldContext')
+        ? await getVectFoxRouterContext(ctx)
+        : {
+            text: '',
+            source: 'router-template-tag-not-used',
+            entryCount: 0,
+            originalLength: 0,
+            truncated: false,
+        };
 
     return {
         lastSpeaker,
@@ -4640,360 +3935,12 @@ async function buildRouterContextSnapshot(chatHistory, ctx) {
         humanName,
         recentChatEntries,
         recentChat: recentChatEntries.join('\n'),
-        storyGuide,
         worldContext,
-        lorebookContext,
-        lorebookCatalog,
     };
 }
 
 async function getRouterContextSnapshot(chatHistory = null, ctx = SillyTavern.getContext()) {
     return withContextSnapshotLock(() => buildRouterContextSnapshot(chatHistory, ctx));
-}
-
-function buildPlannerMessages(plannerContext, options = {}) {
-    const plannerPrompt = renderTemplate(resolveAgentTagsInText(config.plannerPrompt || DEFAULT_STORY_PLANNER_PROMPT), {
-        user: plannerContext.humanName,
-    });
-    const contextBlock = `Current StoryGuide:
-${plannerContext.currentGuide || '(empty)'}
-
-Recent chat:
-${plannerContext.recentChat || '(empty)'}
-
-World context:
-${plannerContext.worldContext?.text || '(empty)'}
-
-Selected lorebook context:
-${plannerContext.lorebookContext?.text || '(empty)'}
-
-Selected lorebook catalog:
-${plannerContext.lorebookCatalog?.text || '(empty)'}`;
-
-    if (options.mode === 'ooc') {
-        return [
-            { role: 'system', content: plannerPrompt },
-            {
-                role: 'system',
-                content: 'Planner workspace mode. Respond directly to the operator in OOC. Do not rewrite or replace the StoryGuide unless the operator explicitly asks for that. Do not narrate in-character prose.',
-            },
-            {
-                role: 'system',
-                content: `${contextBlock}
-
-Treat the messages that follow as an ongoing OOC conversation with the operator about this current RP state.`,
-            },
-            ...(Array.isArray(options.priorHistory) ? options.priorHistory : []),
-            { role: 'user', content: String(options.oocRequest ?? '').trim() },
-        ];
-    }
-
-    return [
-        { role: 'system', content: plannerPrompt },
-        {
-            role: 'user',
-            content: `${contextBlock}
-
-Update the StoryGuide now.`,
-        },
-    ];
-}
-
-function logPlannerRequestBudget(mode, profileId, budgetedRequest) {
-    const context = budgetedRequest?.context ?? {};
-    console.log('[SceneDirector] Planner request context', {
-        mode,
-        profileId,
-        budgetSource: budgetedRequest?.budgetSource ?? 'unknown',
-        profileMaxContext: budgetedRequest?.maxContext ?? null,
-        profileMaxOutput: budgetedRequest?.maxOutput ?? null,
-        inputTokenBudget: budgetedRequest?.budget ?? 0,
-        estimatedInputTokens: budgetedRequest?.inputTokens ?? 0,
-        rpMessageLimit: config.plannerContextMessages,
-        rpMessagesIncluded: context.recentChatEntries?.length ?? 0,
-        vectFoxSource: context.worldContext?.source ?? 'unknown',
-        vectFoxCharacters: context.worldContext?.text?.length ?? 0,
-        vectFoxOriginalCharacters: context.worldContext?.originalLength ?? 0,
-        selectedLorebookCharacters: context.lorebookContext?.text?.length ?? 0,
-        lorebookCatalogCharacters: context.lorebookCatalog?.text?.length ?? 0,
-        storyGuideCharacters: String(context.currentGuide ?? '').length,
-        trimmed: !!budgetedRequest?.trimmed,
-    });
-}
-
-async function updateStoryGuideFromContext(options = {}) {
-    const source = String(options.source ?? 'manual');
-    const showMissingProfileToast = options.showMissingProfileToast ?? (source !== 'auto');
-    const showSuccessToast = options.showSuccessToast ?? (source !== 'auto');
-    const showErrorToast = options.showErrorToast ?? true;
-    const activateDirectorTab = options.activateDirectorTab ?? (source !== 'auto');
-    const background = !!options.background;
-    const ctx = SillyTavern.getContext();
-    const originChatKey = getChatContextKey(ctx);
-    const originStoryGuide = getStoryGuide(ctx);
-    const phaseStartedAt = new Date();
-    const phaseLabel = 'StoryGuide update';
-    const phaseModel = getTimingModelLabel(config.plannerProfileId);
-    let operationLogId = '';
-    if (!config.plannerProfileId) {
-        if (showMissingProfileToast) {
-            toastr.warning('Configure um perfil do Planner primeiro.', EXTENSION_LABEL);
-        }
-        return null;
-    }
-
-    if (isStoryGuideUpdateInProgress) {
-        if (source === 'manual') {
-            toastr.info('StoryGuide update already in progress.', EXTENSION_LABEL);
-        }
-        return null;
-    }
-
-    isStoryGuideUpdateInProgress = true;
-    updateStoryDirectorState({
-        status: 'updating-story-guide',
-        ...(activateDirectorTab ? { activeTab: 'director' } : {}),
-        directorView: 'workspace',
-        plannerError: '',
-        lastError: '',
-    });
-
-    try {
-        if (background) {
-            operationLogId = beginOperationLog('planner-update', phaseLabel, source, phaseModel);
-        } else {
-            beginRuntimePhase('planner-update', phaseLabel, source, phaseModel);
-            operationLogId = getActiveOperationLogId('planner-update');
-        }
-        const plannerContext = await getPlannerContextSnapshot(ctx);
-        const budgetedRequest = await fitContextMessagesToInputBudget(
-            config.plannerProfileId,
-            plannerContext,
-            currentContext => buildPlannerMessages(currentContext, { mode: 'update' }),
-            { trimContext: false },
-        );
-        const messages = budgetedRequest.messages;
-        logPlannerRequestBudget('update', config.plannerProfileId, budgetedRequest);
-        updateStoryDirectorState({ lastPlannerPromptMessages: messages });
-        updateOperationLog(operationLogId, {
-            request: formatPromptMessages(messages),
-            inputTokens: budgetedRequest.inputTokens,
-        });
-        const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
-        const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
-        const responseText = extractResponseText(response);
-        const updatedGuide = stripMarkdownFence(responseText);
-        updateOperationLog(operationLogId, {
-            response: responseText,
-            reasoning,
-        });
-
-        if (!updatedGuide) {
-            recordBackstageIssue('Story Director', 'StoryGuide updater returned empty output.');
-            updateStoryDirectorState({
-                status: 'story-guide-empty-response',
-                plannerReasoning: reasoning,
-                plannerRawOutput: responseText,
-                plannerError: 'StoryGuide updater returned empty output.',
-                lastError: 'StoryGuide updater returned empty output.',
-            });
-            toastr.error('Updater retornou vazio.', EXTENSION_LABEL);
-            return null;
-        }
-
-        const plannerSystemPrompt = messages.find(message => message?.role === 'system')?.content ?? '';
-        const formatValidation = validateTaggedOutputFormat(plannerSystemPrompt, updatedGuide);
-        if (!formatValidation.valid) {
-            recordBackstageIssue('Story Director', formatValidation.error);
-            updateStoryDirectorState({
-                status: 'story-guide-format-error',
-                plannerReasoning: reasoning,
-                plannerRawOutput: responseText,
-                plannerError: formatValidation.error,
-                lastError: formatValidation.error,
-            });
-            toastr.error('Planner retornou um StoryGuide fora do OUTPUT FORMAT.', EXTENSION_LABEL);
-            return null;
-        }
-
-        let saveContext = ctx;
-        if (background) {
-            const activeContext = SillyTavern.getContext();
-            const activeChatKey = getChatContextKey(activeContext);
-            if (activeChatKey !== originChatKey) {
-                const message = 'Background Planner result was discarded because the active chat changed.';
-                recordBackstageIssue('Story Director', message);
-                updateStoryDirectorState({
-                    status: 'story-guide-stale-result',
-                    plannerReasoning: reasoning,
-                    plannerRawOutput: responseText,
-                    plannerError: message,
-                    lastError: message,
-                });
-                return null;
-            }
-
-            if (getStoryGuide(activeContext) !== originStoryGuide) {
-                const message = 'Background Planner result was discarded because the StoryGuide changed while it was running.';
-                recordBackstageIssue('Story Director', message);
-                updateStoryDirectorState({
-                    status: 'story-guide-stale-result',
-                    plannerReasoning: reasoning,
-                    plannerRawOutput: responseText,
-                    plannerError: message,
-                    lastError: message,
-                });
-                return null;
-            }
-
-            saveContext = activeContext;
-        }
-
-        saveStoryGuide(updatedGuide, saveContext);
-        try {
-            await maybePersistStoryGuideSnapshot(updatedGuide, saveContext);
-        } catch (snapshotError) {
-            console.error('[SceneDirector] StoryGuide updated, but snapshot persistence failed:', snapshotError);
-            toastr.warning('StoryGuide atualizado, mas o snapshot nao foi salvo. Veja o console.', EXTENSION_LABEL);
-        }
-        setPlannerUserTurnCounter(0, saveContext);
-        updateStoryDirectorState({
-            status: 'story-guide-updated',
-            ...(activateDirectorTab ? { activeTab: 'director' } : {}),
-            plannerReasoning: reasoning,
-            plannerRawOutput: responseText,
-            plannerError: '',
-        });
-        if (showSuccessToast) {
-            toastr.success('StoryGuide atualizado.', EXTENSION_LABEL);
-        }
-        return updatedGuide;
-    } catch (error) {
-        console.error('[SceneDirector] Failed to update StoryGuide:', error);
-        recordBackstageIssue('Story Director', error?.message ?? String(error));
-        updateStoryDirectorState({
-            status: 'error',
-            plannerError: error?.message ?? String(error),
-            lastError: error?.message ?? String(error),
-        });
-        if (showErrorToast) {
-            toastr.error('Erro ao atualizar StoryGuide. Veja o console.', EXTENSION_LABEL);
-        }
-        return null;
-    } finally {
-        if (background) {
-            finishBackgroundPlannerTiming(phaseStartedAt, phaseLabel, phaseModel, operationLogId);
-        } else {
-            finishRuntimePhase(['planner-update']);
-        }
-        isStoryGuideUpdateInProgress = false;
-    }
-}
-
-async function runPlannerOocRequest() {
-    if (!config.plannerProfileId) {
-        toastr.warning('Configure um perfil do Planner primeiro.', EXTENSION_LABEL);
-        return null;
-    }
-
-    const oocRequest = String(sceneDirectorState.plannerOocDraft ?? '').trim();
-    if (!oocRequest) {
-        toastr.info('Escreva um request OOC para falar com o planner.', EXTENSION_LABEL);
-        return null;
-    }
-
-    if (isStoryGuideUpdateInProgress) {
-        toastr.info('Planner already running.', EXTENSION_LABEL);
-        return null;
-    }
-
-    const ctx = SillyTavern.getContext();
-    isStoryGuideUpdateInProgress = true;
-    updateStoryDirectorState({
-        status: 'planner-ooc-running',
-        activeTab: 'director',
-        directorView: 'workspace',
-        plannerError: '',
-        lastError: '',
-    });
-
-    try {
-        beginRuntimePhase('planner-ooc', 'Planner OOC', 'Direct planner workspace request', getTimingModelLabel(config.plannerProfileId));
-        const plannerContext = await getPlannerContextSnapshot(ctx);
-        const priorHistory = Array.isArray(sceneDirectorState.plannerOocHistory)
-            ? sceneDirectorState.plannerOocHistory.slice(-12).map(message => ({
-                role: message?.role === 'user' ? 'user' : 'assistant',
-                content: String(message?.content ?? ''),
-            }))
-            : [];
-        const budgetedRequest = await fitContextMessagesToInputBudget(
-            config.plannerProfileId,
-            plannerContext,
-            currentContext => buildPlannerMessages(currentContext, {
-                mode: 'ooc',
-                priorHistory,
-                oocRequest,
-            }),
-            { trimContext: false },
-        );
-        const messages = budgetedRequest.messages;
-        logPlannerRequestBudget('ooc', config.plannerProfileId, budgetedRequest);
-
-        updateStoryDirectorState({ lastPlannerPromptMessages: messages });
-        updateActiveOperationLog('planner-ooc', {
-            request: formatPromptMessages(messages),
-            inputTokens: budgetedRequest.inputTokens,
-        });
-        const response = await sendPlannerStreamingRequest(config.plannerProfileId, messages);
-        const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
-        const responseText = stripMarkdownFence(extractResponseText(response));
-        updateActiveOperationLog('planner-ooc', {
-            response: responseText,
-            reasoning,
-        });
-
-        if (!responseText) {
-            recordBackstageIssue('Planner OOC', 'Planner workspace returned empty output.');
-            updateStoryDirectorState({
-                status: 'planner-ooc-empty-response',
-                plannerReasoning: reasoning,
-                plannerRawOutput: '',
-                plannerError: 'Planner workspace returned empty output.',
-                lastError: 'Planner workspace returned empty output.',
-            });
-            toastr.error('Planner retornou vazio.', EXTENSION_LABEL);
-            return null;
-        }
-
-        const nextHistory = [
-            ...(Array.isArray(sceneDirectorState.plannerOocHistory) ? sceneDirectorState.plannerOocHistory : []),
-            { role: 'user', content: oocRequest },
-            { role: 'assistant', content: responseText },
-        ];
-
-        updateStoryDirectorState({
-            status: 'planner-ooc-ready',
-            plannerReasoning: reasoning,
-            plannerRawOutput: formatPlannerOocTranscript(nextHistory),
-            plannerOocDraft: PLANNER_OOC_DEFAULT_DRAFT,
-            plannerOocHistory: nextHistory,
-            plannerError: '',
-        });
-        return responseText;
-    } catch (error) {
-        console.error('[SceneDirector] Failed to run planner workspace request:', error);
-        recordBackstageIssue('Planner OOC', error?.message ?? String(error));
-        updateStoryDirectorState({
-            status: 'planner-ooc-error',
-            plannerError: error?.message ?? String(error),
-            lastError: error?.message ?? String(error),
-        });
-        toastr.error('Erro ao falar com o planner. Veja o console.', EXTENSION_LABEL);
-        return null;
-    } finally {
-        finishRuntimePhase(['planner-ooc']);
-        isStoryGuideUpdateInProgress = false;
-    }
 }
 
 async function runRouterOocRequest() {
@@ -5008,12 +3955,13 @@ async function runRouterOocRequest() {
         return null;
     }
 
-    if (isProcessing) {
+    if (isProcessing || cancellableOperations.isActive('router')) {
         toastr.info('Router already running.', EXTENSION_LABEL);
         return null;
     }
 
     const ctx = SillyTavern.getContext();
+    const cancellation = cancellableOperations.start('router', { mode: 'ooc' });
     updateRouterState({
         status: 'router-ooc-running',
         activeTab: 'router',
@@ -5023,7 +3971,9 @@ async function runRouterOocRequest() {
 
     try {
         beginRuntimePhase('router-ooc', 'Router OOC', 'Direct router workspace request', getTimingModelLabel(config.routerProfileId));
+        cancellation.metadata.logId = getActiveOperationLogId('router-ooc');
         const routerContext = await getRouterContextSnapshot(ctx.chat, ctx);
+        cancellableOperations.assertActive(cancellation);
         const priorHistory = Array.isArray(sceneDirectorState.routerOocHistory)
             ? sceneDirectorState.routerOocHistory.slice(-12).map(message => ({
                 role: message?.role === 'user' ? 'user' : 'assistant',
@@ -5052,8 +4002,9 @@ async function runRouterOocRequest() {
             config.routerProfileId,
             messages,
             undefined,
-            { stream: false, extractData: true },
+            { stream: false, extractData: true, signal: cancellation.controller.signal },
         );
+        cancellableOperations.assertActive(cancellation);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
         updateActiveOperationLog('router-ooc', {
@@ -5091,7 +4042,11 @@ async function runRouterOocRequest() {
         });
         return responseText;
     } catch (error) {
-        console.error('[SceneDirector] Failed to run router workspace request:', error);
+        if (isAbortError(error) || cancellation.controller.signal.aborted) {
+            backstageLogger.info('Router', 'Workspace request stopped');
+            return null;
+        }
+        backstageLogger.error('Router', 'Workspace request failed', error);
         recordBackstageIssue('Router OOC', error?.message ?? String(error));
         updateRouterState({
             status: 'router-ooc-error',
@@ -5100,7 +4055,9 @@ async function runRouterOocRequest() {
         toastr.error('Erro ao falar com o router. Veja o console.', EXTENSION_LABEL);
         return null;
     } finally {
-        finishRuntimePhase(['router-ooc']);
+        if (cancellableOperations.finish(cancellation)) {
+            finishRuntimePhase(['router-ooc']);
+        }
     }
 }
 
@@ -5153,15 +4110,12 @@ async function runDirectedCharacterOoc(targetName, oocText) {
         await triggerChar(char, null, { directOocText: oocText });
         return true;
     } catch (error) {
-        console.error('[SceneDirector] Failed direct OOC trigger:', error);
+        backstageLogger.error('Router', 'Direct OOC trigger failed', error);
         recordBackstageIssue('Direct OOC', error?.message ?? String(error));
         skipNextCharacterAutoRouter = false;
         clearCharacterNote();
-        clearStoryGuideInjection();
-        clearLorebookInjection();
         clearAgentCharacterInjection();
         clearDirectedOocPrompt();
-        clearSceneDirection();
         finishRuntimePhase(['character-turn'], 'error');
         isProcessing = false;
         unlockChat();
@@ -5181,25 +4135,58 @@ async function handleUserTurnPipeline() {
         await runDirectedCharacterOoc(directedOoc.target, directedOoc.request);
         return;
     }
-    const userTurnsSincePlannerUpdate = incrementPlannerUserTurnCounter(ctx);
-    const plannerInterval = Math.max(1, Number(config.plannerUserTurnInterval || DEFAULT_CONFIG.plannerUserTurnInterval));
-    const shouldAutoUpdateStoryGuide = !!config.plannerProfileId && userTurnsSincePlannerUpdate >= plannerInterval;
-
-    if (shouldAutoUpdateStoryGuide) {
-        void runBackgroundCall('planner-auto-update', () => updateStoryGuideFromContext({
-            source: 'auto',
-            showMissingProfileToast: false,
-            showSuccessToast: false,
-            showErrorToast: true,
-            activateDirectorTab: false,
-            background: true,
-        }));
-    }
-
     await runRouter('USER_MESSAGE_RENDERED');
 }
 
-async function callRouterAgent(chatHistory) {
+async function processCompletedCharacterMessage(message, triggerEvent) {
+    if (!message || typeof message !== 'object' || handledCharacterTurnMessages.has(message)) {
+        return;
+    }
+
+    const ctx = SillyTavern.getContext();
+    if (ctx.chat?.[ctx.chat.length - 1] !== message || isToolInvocationChatMessage(message)) {
+        return;
+    }
+
+    if (await isHostGenerationActive()) {
+        pendingNativeCharacterMessage = message;
+        fl('  =', 'CHARACTER_MESSAGE_RENDERED', 'geração nativa ainda ativa — turno mantido pendente');
+        return;
+    }
+
+    handledCharacterTurnMessages.add(message);
+    pendingNativeCharacterMessage = null;
+    scheduleAgentsForTurn({
+        type: 'character',
+        label: `Scheduled after ${String(message?.name ?? 'character')} turn`,
+        characterName: String(message?.name ?? ''),
+    });
+    if (skipNextCharacterAutoRouter) {
+        skipNextCharacterAutoRouter = false;
+        return;
+    }
+    runRouter(triggerEvent);
+}
+
+async function handleCharacterTurnCandidate(messageId, triggerEvent) {
+    const currentContext = SillyTavern.getContext();
+    const renderedMessage = currentContext.chat?.[Number(messageId)] ?? currentContext.chat?.[currentContext.chat.length - 1];
+    if (!renderedMessage || isToolInvocationChatMessage(renderedMessage)) {
+        return;
+    }
+
+    if (await isHostGenerationActive()) {
+        pendingNativeCharacterMessage = renderedMessage;
+        fl('  =', triggerEvent, 'geracao nativa ainda ativa - router adiado');
+        return;
+    }
+
+    setTimeout(() => {
+        processCompletedCharacterMessage(renderedMessage, triggerEvent);
+    }, 300);
+}
+
+async function callRouterAgent(chatHistory, cancellation = null) {
     if (!config.enabled || !config.routerProfileId) {
         forcedRouterSpeaker = null;
         return null;
@@ -5207,6 +4194,7 @@ async function callRouterAgent(chatHistory) {
 
     const ctx = SillyTavern.getContext();
     const routerContext = await getRouterContextSnapshot(chatHistory, ctx);
+    if (cancellation) cancellableOperations.assertActive(cancellation);
     const contextSummary = {
         recentMessages: routerContext.recentChatEntries?.length ?? 0,
         worldContextSource: routerContext.worldContext.source,
@@ -5214,8 +4202,6 @@ async function callRouterAgent(chatHistory) {
         worldContextOriginalLength: routerContext.worldContext.originalLength,
         worldContextLength: routerContext.worldContext.text.length,
         worldContextTruncated: !!routerContext.worldContext.truncated,
-        lorebookContextLength: routerContext.lorebookContext?.text?.length ?? 0,
-        lorebookCatalogEntries: routerContext.lorebookCatalog?.entryCount ?? 0,
         forcedSpeaker: forcedRouterSpeaker || '',
     };
     updateRouterState({
@@ -5238,7 +4224,7 @@ async function callRouterAgent(chatHistory) {
     contextSummary.inputTokenBudgetSource = budgetedRequest.budgetSource;
     contextSummary.inputTokens = budgetedRequest.inputTokens;
     contextSummary.inputTrimmed = budgetedRequest.trimmed;
-    lastDirectorRequest = cloneDirectorRequestPayload({
+    lastRouterRequest = cloneRouterRequestPayload({
         profileId: config.routerProfileId,
         inputTokenBudget: budgetedRequest.budget,
         inputTokens: budgetedRequest.inputTokens,
@@ -5246,27 +4232,29 @@ async function callRouterAgent(chatHistory) {
         messages,
     });
     if (window.MultiCaller) {
-        window.MultiCaller.lastDirectorRequest = lastDirectorRequest;
+        window.MultiCaller.lastRouterRequest = lastRouterRequest;
     }
     updateRouterState({
-        lastPromptMessages: lastDirectorRequest.messages,
+        lastPromptMessages: lastRouterRequest.messages,
     });
 
     try {
         beginRuntimePhase('router-request', 'Router request', forcedRouterSpeaker ? `Forced speaker: ${forcedRouterSpeaker}` : 'Normal routing', getTimingModelLabel(config.routerProfileId));
+        if (cancellation) cancellation.metadata.logId = getActiveOperationLogId('router-request');
         updateActiveOperationLog('router-request', {
-            request: formatPromptMessages(lastDirectorRequest.messages),
+            request: formatPromptMessages(lastRouterRequest.messages),
             inputTokens: budgetedRequest.inputTokens,
         });
         updateRouterState({ status: 'calling-director' });
 
         const service  = await getConnService();
         const response = await service.sendRequest(
-            lastDirectorRequest.profileId,
-            lastDirectorRequest.messages,
+            lastRouterRequest.profileId,
+            lastRouterRequest.messages,
             undefined,
-            lastDirectorRequest.options,
+            { ...lastRouterRequest.options, signal: cancellation?.controller.signal ?? null },
         );
+        if (cancellation) cancellableOperations.assertActive(cancellation);
 
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? null;
 
@@ -5276,7 +4264,7 @@ async function callRouterAgent(chatHistory) {
             reasoning: reasoning ?? '',
         });
         if (!responseText) {
-            console.warn('[SceneDirector] Formato de resposta desconhecido:', response);
+            backstageLogger.warn('Router', 'Unknown response format', response);
             recordBackstageIssue('Router', 'Resposta vazia ou formato desconhecido.');
             updateRouterState({
                 status: 'empty-response',
@@ -5288,7 +4276,7 @@ async function callRouterAgent(chatHistory) {
             return null;
         }
 
-        const decision = parseSceneDirectorDecision(responseText);
+        const decision = parseRouterDecision(responseText);
         updateRouterState({
             status: decision.nextSpeaker ? 'decision-ready' : 'no-decision',
             lastReasoning: reasoning ?? '',
@@ -5299,7 +4287,10 @@ async function callRouterAgent(chatHistory) {
         return decision.nextSpeaker ? decision : null;
 
     } catch (error) {
-        console.error('[SceneDirector] Erro no sendRequest:', error);
+        if (isAbortError(error) || cancellation?.controller.signal.aborted) {
+            throw error;
+        }
+        backstageLogger.error('Router', 'Request failed', error);
         recordBackstageIssue('Router', error?.message ?? String(error));
         updateRouterState({
             status: 'error',
@@ -5307,8 +4298,51 @@ async function callRouterAgent(chatHistory) {
         });
         return null;
     } finally {
-        finishRuntimePhase(['router-request']);
-        forcedRouterSpeaker = null;
+        if (!cancellation?.controller.signal.aborted) {
+            finishRuntimePhase(['router-request']);
+            forcedRouterSpeaker = null;
+        }
+    }
+}
+
+let hostScriptModulePromise = null;
+let toolCallingModulePromise = null;
+
+async function getHostScriptModule() {
+    hostScriptModulePromise ??= import('/script.js').catch(error => {
+        hostScriptModulePromise = null;
+        throw error;
+    });
+    return hostScriptModulePromise;
+}
+
+async function isHostGenerationActive() {
+    try {
+        const host = await getHostScriptModule();
+        return typeof host.isGenerating === 'function' && !!host.isGenerating();
+    } catch (error) {
+        backstageLogger.warn('Generation', 'Failed to inspect native generation state', error);
+        return false;
+    }
+}
+
+async function getToolCallingDiagnostics(type) {
+    try {
+        toolCallingModulePromise ??= import('/scripts/tool-calling.js').catch(error => {
+            toolCallingModulePromise = null;
+            throw error;
+        });
+        const { ToolManager } = await toolCallingModulePromise;
+        return {
+            supported: !!ToolManager?.isToolCallingSupported?.(),
+            canPerform: !!ToolManager?.canPerformToolCalls?.(type),
+        };
+    } catch (error) {
+        return {
+            supported: null,
+            canPerform: null,
+            error: error?.message ?? String(error),
+        };
     }
 }
 
@@ -5320,6 +4354,9 @@ async function backstageGenerationInterceptor(chat, contextSize, abort, type) {
 
     guard.interceptorCalls += 1;
     const coreChatLength = Array.isArray(chat) ? chat.length : 0;
+    const coreToolCount = Array.isArray(chat) ? chat.filter(isToolInvocationChatMessage).length : 0;
+    const toolDiagnostics = await getToolCallingDiagnostics(type);
+    const hostChat = summarizeHostChatForLog();
     let hasChatHistory = null;
     let promptManagerError = '';
 
@@ -5337,12 +4374,32 @@ async function backstageGenerationInterceptor(chat, contextSize, abort, type) {
         `Character: ${guard.charName}`,
         `Type: ${String(type ?? 'normal')}`,
         `Core chat messages: ${coreChatLength}`,
+        `Core chat tool blocks: ${coreToolCount}`,
+        `Tool calling supported: ${toolDiagnostics.supported == null ? 'inspection failed' : String(toolDiagnostics.supported)}`,
+        `Can perform tools for ${String(type ?? 'normal')}: ${toolDiagnostics.canPerform == null ? 'inspection failed' : String(toolDiagnostics.canPerform)}`,
         `Prompt Manager chatHistory: ${hasChatHistory === null ? 'inspection failed' : (hasChatHistory ? 'present' : 'missing')}`,
         `Context size: ${Math.max(0, Number(contextSize) || 0)}`,
+        toolDiagnostics.error ? `Tool calling inspection error: ${toolDiagnostics.error}` : '',
         promptManagerError ? `Prompt Manager inspection error: ${promptManagerError}` : '',
     ].filter(Boolean).join('\n');
 
     appendOperationLogDetail(guard.operationLogId, details);
+    backstageLogger.debug('ToolCall', 'Generation interceptor after native coreChat filter', {
+        interceptorCall: guard.interceptorCalls,
+        attempt: Math.max(1, Number(guard.attempt) || 1),
+        character: guard.charName,
+        type: String(type ?? 'normal'),
+        coreChatMessages: coreChatLength,
+        coreChatToolBlocks: coreToolCount,
+        toolCallingSupported: toolDiagnostics.supported,
+        canPerformTools: toolDiagnostics.canPerform,
+        hostMessages: hostChat.total,
+        hostToolBlocks: hostChat.toolCount,
+        latestHostToolIndex: hostChat.latestToolIndex,
+        latestHostToolDistanceFromEnd: hostChat.latestToolDistanceFromEnd,
+        latestHostToolType: hostChat.latestToolType,
+        latestHostToolNames: hostChat.latestToolNames,
+    });
 
     const abortReason = coreChatLength === 0
         ? 'ST captured an empty coreChat before prompt assembly.'
@@ -5365,7 +4422,13 @@ globalThis.backstageGenerationInterceptor = backstageGenerationInterceptor;
 
 async function triggerChar(char, decision = null, options = {}) {
     fl('→ START', 'triggerChar', `char=${char.name} | last=${lastActiveChar} | profile=${char.profileName}`);
+    backstageLogger.info(`Character:${char.name}`, 'Turn started', {
+        profile: char.profileName || char.profileId || 'not configured',
+        directOoc: !!options.directOocText,
+    });
     let ctx = SillyTavern.getContext();
+    const cancellation = options.cancellation ?? null;
+    if (cancellation) cancellableOperations.assertActive(cancellation);
     const targetProfile = resolveCharacterProfileForSwitch(char, ctx);
 
     if (char.name !== lastActiveChar && targetProfile.profileName) {
@@ -5379,14 +4442,21 @@ async function triggerChar(char, decision = null, options = {}) {
         try {
             fl('  →', 'triggerChar', `/profile await=true "${targetProfile.profileName}" | source=${targetProfile.source}${targetProfile.profileId ? ` | id=${targetProfile.profileId}` : ''}`);
             await ctx.executeSlashCommandsWithOptions(`/profile await=true "${targetProfile.profileName}"`);
+            if (cancellation) cancellableOperations.assertActive(cancellation);
             settleMonitor.armRecovery(recoveryAnchor);
             const settleResult = await settleMonitor.promise;
             ctx = SillyTavern.getContext();
 
             fl('  ←', 'triggerChar', `profile settled | status=${settleResult.status} | events=${settleResult.events.length} | chatLength=${Array.isArray(ctx.chat) ? ctx.chat.length : 0}`);
+            backstageLogger.debug(`Character:${char.name}`, 'Connection profile settled', {
+                profile: targetProfile.profileName,
+                status: settleResult.status,
+                events: settleResult.events.map(event => event.name),
+                chatLength: Array.isArray(ctx.chat) ? ctx.chat.length : 0,
+            });
             if (settleResult.status !== 'settled') {
                 const error = new Error(`Profile switch did not recover a stable chat for ${char.name}.`);
-                console.error('[Backstage] Character generation cancelled after profile switch', {
+                backstageLogger.error(`Character:${char.name}`, 'Generation cancelled after profile switch', {
                     char: char.name,
                     profileName: targetProfile.profileName,
                     status: settleResult.status,
@@ -5424,15 +4494,7 @@ async function triggerChar(char, decision = null, options = {}) {
     }
 
     setCharacterNote(char.name);
-    // Legacy Story Director delivery is disabled while agent character injection replaces it.
-    // applyStoryGuideInjectionForCharacter(char.name);
-    await applyLorebookInjectionForCharacter(char.name);
     setDirectedOocPrompt(char.name, options.directOocText);
-    if (decision) {
-        setSceneDirection(decision, char.name);
-    } else {
-        clearSceneDirection();
-    }
     const agentInjection = applyAgentCharacterInjection(char.name);
     beginRuntimePhase(
         'character-turn',
@@ -5472,6 +4534,7 @@ async function triggerChar(char, decision = null, options = {}) {
             const callsBeforeAttempt = generationGuard.interceptorCalls;
 
             await ctx.executeSlashCommandsWithOptions(`/trigger await=true "${char.name}"`);
+            if (cancellation) cancellableOperations.assertActive(cancellation);
 
             if (!generationGuard.aborted) {
                 if (generationGuard.interceptorCalls === callsBeforeAttempt) {
@@ -5504,15 +4567,19 @@ async function triggerChar(char, decision = null, options = {}) {
         }
     } catch (error) {
         const message = error?.message ?? String(error);
+        const stopped = isAbortError(error) || cancellation?.controller.signal.aborted;
+        if (stopped) {
+            appendOperationLogDetail(characterOperationLogId, 'Character generation stopped by operator.');
+            completeOperationLog(characterOperationLogId, 'stopped');
+            throw error;
+        }
+
         updateOperationLog(characterOperationLogId, { error: message });
         appendOperationLogDetail(characterOperationLogId, `Character generation failed: ${message}`);
         recordBackstageIssue(`Character turn: ${char.name}`, message);
         clearCharacterNote();
-        clearStoryGuideInjection();
-        clearLorebookInjection();
         clearAgentCharacterInjection();
         clearDirectedOocPrompt();
-        clearSceneDirection();
         finishRuntimePhase(['character-turn'], 'error');
         skipNextCharacterAutoRouter = false;
         pendingAutoRouter = false;
@@ -5533,7 +4600,7 @@ async function triggerChar(char, decision = null, options = {}) {
 
 // ================= EXECUÇÃO =================
 
-async function executeDecision(decision, caller = 'unknown') {
+async function executeDecision(decision, caller = 'unknown', cancellation = null) {
     const nextSpeaker = typeof decision === 'string' ? decision : decision?.nextSpeaker;
     fl('→ START', 'executeDecision', `caller=${caller} | nextSpeaker="${nextSpeaker}"`);
     updateRouterState({
@@ -5544,12 +4611,10 @@ async function executeDecision(decision, caller = 'unknown') {
     });
 
     const ctx = SillyTavern.getContext();
+    if (cancellation) cancellableOperations.assertActive(cancellation);
     const clean = String(nextSpeaker ?? '').trim().toLowerCase();
 
     if (!clean || clean === 'user' || clean === 'player' || clean === String(ctx.name1 ?? '').trim().toLowerCase()) {
-        clearSceneDirection();
-        clearStoryGuideInjection();
-        clearLorebookInjection();
         clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearCharacterNote();
@@ -5567,9 +4632,6 @@ async function executeDecision(decision, caller = 'unknown') {
     });
 
     if (!char) {
-        clearSceneDirection();
-        clearStoryGuideInjection();
-        clearLorebookInjection();
         clearAgentCharacterInjection();
         clearDirectedOocPrompt();
         clearCharacterNote();
@@ -5582,39 +4644,88 @@ async function executeDecision(decision, caller = 'unknown') {
     }
 
     lockChat();
-    await triggerChar(char, decision);
+    await triggerChar(char, decision, { cancellation });
 
     fl('← END', 'executeDecision', `char=${char.name}`);
     // isProcessing fica true — só libera via GENERATION_ENDED
 }
 
+function recoverStaleCharacterGeneration(reason) {
+    const operationLogId = getActiveOperationLogId('character-turn');
+    if (!operationLogId) {
+        return false;
+    }
+
+    const message = String(reason ?? 'Character generation state was reset.');
+    updateOperationLog(operationLogId, { error: message });
+    appendOperationLogDetail(operationLogId, `RECOVERED WITHOUT PAGE RELOAD: ${message}`);
+    finishRuntimePhase(['character-turn'], 'error');
+    clearCharacterNote();
+    clearAgentCharacterInjection();
+    clearDirectedOocPrompt();
+    clearActiveTriggerSettleMonitor();
+    activeCharacterGenerationGuard = null;
+    skipNextCharacterAutoRouter = false;
+    pendingAutoRouter = false;
+    pendingNativeCharacterMessage = null;
+    isProcessing = false;
+    unlockChat();
+    backstageLogger.warn('Generation', 'Recovered stale character generation state', { reason: message });
+    return true;
+}
+
 async function runRouter(triggerEvent = 'unknown') {
+    const isManualTrigger = triggerEvent === 'floating-panel' || String(triggerEvent).startsWith('manual');
+    if (cancellableOperations.isActive('router') && !isProcessing) {
+        forcedRouterSpeaker = null;
+        if (!isManualTrigger) pendingAutoRouter = true;
+        fl('  =', 'runRouter', `adiado | router anterior finalizando | trigger=${triggerEvent}`);
+        updateRouterState({ status: isManualTrigger ? 'blocked-processing' : 'queued' });
+        return;
+    }
+    if (isProcessing) {
+        const hasStaleCharacterOperation = !!getActiveOperationLogId('character-turn');
+        if (isManualTrigger && hasStaleCharacterOperation && !await isHostGenerationActive()) {
+            recoverStaleCharacterGeneration(`Manual router call detected an inactive ST generation (${triggerEvent}).`);
+        }
+    }
+
     if (isProcessing) {
         forcedRouterSpeaker = null;
-        if (triggerEvent === 'CHARACTER_MESSAGE_RENDERED') {
-            pendingAutoRouter = true;
-        }
+        if (!isManualTrigger) pendingAutoRouter = true;
         fl('  =', 'runRouter', `bloqueado | isProcessing=true | trigger=${triggerEvent}`);
         updateRouterState({ status: 'blocked-processing' });
         return;
     }
     pendingAutoRouter = false;
     isProcessing = true;
+    const cancellation = cancellableOperations.start('router', { mode: 'route', triggerEvent });
     fl('→ START', 'runRouter', `trigger=${triggerEvent}`);
+    backstageLogger.info('Router', 'Routing started', { trigger: triggerEvent });
     updateRouterState({ status: 'running', lastError: '' });
 
     try {
         const ctx      = SillyTavern.getContext();
-        const decision = await callRouterAgent(ctx.chat);
+        const decision = await callRouterAgent(ctx.chat, cancellation);
+        cancellableOperations.assertActive(cancellation);
         if (decision) {
-            await executeDecision(decision, 'runRouter');
+            backstageLogger.info('Router', 'Decision ready', {
+                nextSpeaker: decision.nextSpeaker,
+                reason: decision.reason,
+            });
+            await executeDecision(decision, 'runRouter', cancellation);
         } else {
             fl('← END', 'runRouter', 'sem decisão');
             isProcessing = false;
             updateRouterState({ status: 'no-decision' });
+            backstageLogger.warn('Router', 'No routing decision returned');
         }
     } catch (e) {
-        console.error('[SceneDirector] Erro no router:', e);
+        if (isAbortError(e) || cancellation.controller.signal.aborted) {
+            fl('← END', 'runRouter', 'stopped');
+            return;
+        }
+        backstageLogger.error('Router', 'Routing failed', e);
         fl('← END', 'runRouter', `erro: ${e.message}`);
         isProcessing = false;
         recordBackstageIssue('Router', e?.message ?? String(e));
@@ -5622,6 +4733,74 @@ async function runRouter(triggerEvent = 'unknown') {
             status: 'error',
             lastError: e?.message ?? String(e),
         });
+    } finally {
+        cancellableOperations.finish(cancellation);
+        if (pendingAutoRouter && !isProcessing) {
+            pendingAutoRouter = false;
+            setTimeout(() => {
+                runRouter('queued-after-router-finish');
+            }, 0);
+        }
+    }
+}
+
+async function stopRouterExecution() {
+    const operation = cancellableOperations.stop('router', 'Router stopped by operator.');
+    const hadCharacterOperation = !!getActiveOperationLogId('character-turn');
+    const hadWork = !!operation || isProcessing || hadCharacterOperation;
+    if (!hadWork) return false;
+
+    if (operation?.metadata?.logId) {
+        appendOperationLogDetail(operation.metadata.logId, 'Stop requested by operator. Late router responses will be ignored.');
+    }
+    clearCharacterNote();
+    clearAgentCharacterInjection();
+    clearDirectedOocPrompt();
+    clearActiveTriggerSettleMonitor();
+    activeCharacterGenerationGuard = null;
+    skipNextCharacterAutoRouter = false;
+    pendingAutoRouter = false;
+    pendingNativeCharacterMessage = null;
+    isProcessing = false;
+    finishRuntimePhase(['router-request', 'router-ooc', 'character-turn'], 'stopped');
+    unlockChat();
+    updateRouterState({ status: 'stopped', lastError: '' });
+
+    if (await isHostGenerationActive()) {
+        try {
+            const host = await getHostScriptModule();
+            host.stopGeneration?.();
+        } catch (error) {
+            backstageLogger.warn('Router', 'Native generation stop failed after local state was released', error);
+        }
+    }
+
+    backstageLogger.info('Router', 'Stop requested; routing state released', {
+        requestAborted: !!operation,
+        characterGenerationActive: hadCharacterOperation,
+    });
+    return true;
+}
+
+async function runRouterTestRequest() {
+    if (isProcessing || cancellableOperations.isActive('router')) {
+        toastr.info('Router already running.', EXTENSION_LABEL);
+        return null;
+    }
+
+    isProcessing = true;
+    const cancellation = cancellableOperations.start('router', { mode: 'test' });
+    try {
+        const ctx = SillyTavern.getContext();
+        return await callRouterAgent(ctx.chat, cancellation);
+    } catch (error) {
+        if (isAbortError(error) || cancellation.controller.signal.aborted) return null;
+        throw error;
+    } finally {
+        if (cancellableOperations.finish(cancellation)) {
+            isProcessing = false;
+        }
+        refreshSceneDirectorPanel();
     }
 }
 
@@ -5720,31 +4899,8 @@ function renderPersistentIssueBanner() {
     `;
 }
 
-function isActiveStatus(value) {
-    const normalized = String(value ?? '').toLowerCase();
-    return [
-        'running',
-        'building-context',
-        'calling-director',
-        'settling-profile',
-        'executing',
-        'direct-ooc',
-        'blocked-processing',
-        'router-ooc-running',
-        'updating-story-guide',
-        'planner-ooc-running',
-    ].includes(normalized);
-}
-
 function getTogglePipelineStatus() {
     const runtimeView = getRuntimeTimingView();
-    const directorStatus = String(sceneDirectorState.directorStatus ?? '').toLowerCase();
-    if (isActiveStatus(directorStatus)) {
-        return runtimeView.activeElapsedText !== 'Idle'
-            ? `Director ${runtimeView.activeElapsedText}`
-            : 'Director';
-    }
-
     const routerStatus = String(sceneDirectorState.routerStatus ?? '').toLowerCase();
     if (routerStatus === 'player-turn') {
         return 'Your turn';
@@ -5874,15 +5030,6 @@ function formatOocTranscript(history = []) {
         .join('\n\n');
 }
 
-function formatPlannerOocTranscript(history = []) {
-    return formatOocTranscript(history);
-}
-
-function getPlannerWorkspaceResponseText() {
-    const transcript = formatPlannerOocTranscript(sceneDirectorState.plannerOocHistory);
-    return transcript || String(sceneDirectorState.plannerRawOutput ?? '');
-}
-
 function getRouterWorkspaceResponseText() {
     const transcript = formatOocTranscript(sceneDirectorState.routerOocHistory);
     return transcript || String(sceneDirectorState.lastRawOutput ?? '');
@@ -5967,48 +5114,6 @@ function formatPromptMessages(messages) {
         .join('\n\n');
 }
 
-function renderRouterInjectionPreview(decision) {
-    if (!decision) {
-        return '<div class="sd-muted">No router decision yet.</div>';
-    }
-
-    const targetName = resolveDecisionCharacterName(decision);
-    if (!targetName || targetName === 'USER') {
-        return '<div class="sd-muted">No character injection for player turns.</div>';
-    }
-
-    const prompt = buildSceneDirectionPrompt(decision, targetName);
-    if (!prompt) {
-        return `<div class="sd-muted">No scene directive generated for ${escapeHtml(targetName)}.</div>`;
-    }
-
-    return `
-        <div class="sd-kv"><span>Target</span><b>${escapeHtml(targetName)}</b></div>
-        ${renderTokenCountedConsole(prompt, '', 'sd-console--tall')}
-    `;
-}
-
-function renderRouterTimedLorebookStatus() {
-    const timedConfig = getRouterTimedLorebookConfig();
-    const regex = tryBuildRouterTimedLorebookRegex();
-    const entry = getRouterTimedLorebookCachedEntry();
-    const effectMode = getRouterTimedLorebookEffectMode(entry);
-
-    if (!timedConfig.book || !Number.isFinite(timedConfig.uid) || timedConfig.uid <= 0) {
-        return '<div class="sd-muted">No trigger target selected.</div>';
-    }
-
-    return `
-        <div class="sd-kv"><span>Entry</span><b>${escapeHtml(timedConfig.name || `UID ${timedConfig.uid}`)}</b></div>
-        <div class="sd-kv"><span>Book</span><b>${escapeHtml(timedConfig.book)}</b></div>
-        <div class="sd-kv"><span>Regex</span><b>${escapeHtml(timedConfig.triggerRegex || '(empty)')}</b></div>
-        <div class="sd-kv"><span>Regex valid</span><b>${regex ? 'yes' : 'no'}</b></div>
-        <div class="sd-kv"><span>Trigger effect</span><b>${escapeHtml(effectMode || 'none')}</b></div>
-        <div class="sd-kv"><span>Entry sticky</span><b>${escapeHtml(String(Number(entry?.sticky) || 0))}</b></div>
-        <div class="sd-kv"><span>Entry cooldown</span><b>${escapeHtml(String(Number(entry?.cooldown) || 0))}</b></div>
-    `;
-}
-
 function getSelectedAgent() {
     const agents = Array.isArray(config.agents) ? config.agents : [];
     const selected = agents.find(agent => agent.id === sceneDirectorState.activeAgentId) ?? agents[0] ?? null;
@@ -6085,6 +5190,10 @@ function renderAgentWorkspacePanel(agent) {
                 ${renderEditorMeta('Stored per chat. Autosaves when focus leaves the field.', 'agent-output-token-counter')}
             `, { open: true })}
 
+            ${agent.actionEnabled || runtime.lastActionStatus !== 'idle'
+                ? renderAgentActionResult(agent, { open: runtime.lastActionStatus === 'error' })
+                : ''}
+
             ${renderDisclosure('Output Contract', 'Validation and character delivery for the latest stored output.', `
                 <div class="sd-kv"><span>Format validation</span><b>${agent.validateOutputFormat ? (outputValidation.valid ? 'valid' : 'invalid') : 'disabled'}</b></div>
                 <div class="sd-kv"><span>Character injection</span><b>${agent.characterInjectionEnabled ? 'enabled' : 'disabled'}</b></div>
@@ -6109,6 +5218,36 @@ function renderAgentWorkspacePanel(agent) {
     `;
 }
 
+function renderAgentActionResult(agent, { open = false, emptyMessage = 'No JavaScript action has run for this agent in this chat.' } = {}) {
+    const runtime = getAgentRuntimeState(agent.id);
+    const hasExecution = runtime.lastActionStatus !== 'idle'
+        || runtime.lastActionResult
+        || runtime.lastActionError
+        || runtime.lastActionPayload;
+    const executedAt = runtime.lastActionExecutedAt
+        ? formatPanelTime(new Date(runtime.lastActionExecutedAt))
+        : 'never';
+    const body = hasExecution ? `
+        <div class="sd-action-result-summary">
+            <div class="sd-kv"><span>Status</span><b>${escapeHtml(formatStateLabel(runtime.lastActionStatus))}</b></div>
+            <div class="sd-kv"><span>Trigger</span><b>${escapeHtml(runtime.lastActionTrigger || '-')}</b></div>
+            <div class="sd-kv"><span>Duration</span><b>${escapeHtml(formatDurationMs(runtime.lastActionDurationMs))}</b></div>
+            <div class="sd-kv"><span>Executed</span><b>${escapeHtml(executedAt)}</b></div>
+        </div>
+        ${runtime.lastActionPayload ? `<div class="sd-log-detail-title">Payload</div>${renderTokenCountedConsole(runtime.lastActionPayload, '')}` : ''}
+        ${runtime.lastActionResult ? `<div class="sd-log-detail-title">Result</div>${renderTokenCountedConsole(runtime.lastActionResult, '')}` : ''}
+        ${runtime.lastActionLogs ? `<div class="sd-log-detail-title">Script log</div>${renderTokenCountedConsole(runtime.lastActionLogs, '')}` : ''}
+        ${runtime.lastActionError ? `<div class="sd-log-detail-title">Error</div>${renderTokenCountedConsole(runtime.lastActionError, '', 'sd-console--error')}` : ''}
+    ` : `<div class="sd-muted">${escapeHtml(emptyMessage)}</div>`;
+
+    return renderDisclosure(
+        'Action Result',
+        'Latest browser-side JavaScript execution for this agent.',
+        body,
+        { open: open || hasExecution },
+    );
+}
+
 function renderAgentOocPanel(agent) {
     const history = getAgentOocHistory(agent.id);
     const transcript = formatOocTranscript(history);
@@ -6131,6 +5270,14 @@ function renderAgentOocPanel(agent) {
                 ${renderTokenCountedConsole(transcript, 'No OOC conversation yet.', 'sd-console--tall')}
             `, { open: true })}
 
+            ${agent.actionEnabled ? `
+                <div class="sd-inline-actions">
+                    <button id="agent-run-ooc-action" class="menu_button primary" ${getLatestAgentOocAssistantOutput(agent.id) && !runningAgentActionIds.has(agent.id) ? '' : 'disabled'}>Run Action from Latest OOC</button>
+                    <span class="sd-muted">OOC responses never execute automatically.</span>
+                </div>
+                ${renderAgentActionResult(agent)}
+            ` : ''}
+
             ${renderDisclosure('Reasoning', 'Reasoning captured from the latest OOC request in this session.', `
                 ${renderTokenCountedConsole(latestLog?.reasoning, 'No OOC reasoning captured in this session.', 'sd-console--tall')}
             `)}
@@ -6143,6 +5290,54 @@ function renderAgentOocPanel(agent) {
             ${latestLog?.error ? renderDisclosure('Error', 'Latest OOC request failure.', `
                 ${renderTokenCountedConsole(latestLog.error, '', 'sd-console--error')}
             `, { open: true }) : ''}
+        </div>
+    `;
+}
+
+function getLatestAgentOocAssistantOutput(agentId) {
+    return [...getAgentOocHistory(agentId)]
+        .reverse()
+        .find(message => message?.role === 'assistant')?.content ?? '';
+}
+
+function renderAgentScriptPanel(agent) {
+    const validation = validateAgentActionScript(agent.actionScript);
+    return `
+        <div class="sd-action-studio">
+            <section class="sd-action-editor-pane">
+                <div class="sd-action-pane-header">
+                    <div>
+                        <div class="sd-card-title">JavaScript Action</div>
+                        <div class="sd-card-subtitle">Runs inside the SillyTavern page with the agent JSON as <code>payload</code>.</div>
+                    </div>
+                    <span class="sd-status-badge sd-status-badge--${validation.valid ? 'success' : 'danger'}">${validation.valid ? 'valid' : 'invalid'}</span>
+                </div>
+                <div id="agent-action-editor" class="sd-code-editor" aria-label="Agent JavaScript action editor"></div>
+                <div class="sd-editor-meta">
+                    <span>Available: <code>payload</code>, <code>rawOutput</code>, <code>agent</code>, <code>trigger</code>, <code>context</code>, <code>log()</code></span>
+                    <span>Saved when focus leaves the editor.</span>
+                </div>
+            </section>
+            <aside class="sd-action-control-pane">
+                <label class="sd-checkbox-row" for="agent-action-enabled">
+                    <input id="agent-action-enabled" type="checkbox" ${agent.actionEnabled ? 'checked' : ''}>
+                    <span>Enable JavaScript action</span>
+                </label>
+                <label class="sd-checkbox-row" for="agent-action-auto-run">
+                    <input id="agent-action-auto-run" type="checkbox" ${agent.actionAutoRun ? 'checked' : ''} ${agent.actionEnabled ? '' : 'disabled'}>
+                    <span>Run automatically after normal agent updates</span>
+                </label>
+                <div class="sd-footnote sd-action-warning">Trusted scripts only. This code runs with access to the current SillyTavern page.</div>
+                <div class="sd-footnote">The complete agent response must be valid JSON. Markdown fences are removed before parsing.</div>
+                <div class="sd-inline-actions">
+                    <button id="agent-action-validate" class="menu_button">Validate</button>
+                    <button id="agent-action-test" class="menu_button primary" ${agent.actionEnabled && !runningAgentActionIds.has(agent.id) ? '' : 'disabled'}>Run Test</button>
+                </div>
+                ${validation.valid ? '' : renderTokenCountedConsole(validation.error, '', 'sd-console--error')}
+                <label for="agent-action-test-payload">Test payload</label>
+                <textarea id="agent-action-test-payload" class="text_pole sd-action-payload" spellcheck="false">${escapeHtml(agent.actionTestPayload)}</textarea>
+                ${renderAgentActionResult(agent, { open: true })}
+            </aside>
         </div>
     `;
 }
@@ -6207,6 +5402,31 @@ function renderAgentInjectionTargets(agent) {
     `).join('');
 }
 
+function renderGraphitiPermissionOptions(agent, mode) {
+    const automatic = mode === 'automatic';
+    const selected = new Set(automatic
+        ? agent.graphitiAutomaticPermissions
+        : agent.graphitiOocPermissions);
+    const labels = {
+        search: 'Search',
+        remember: 'Remember',
+        correct: 'Correct',
+        forget: 'Forget',
+    };
+    return [...GRAPHITI_PERMISSION_TYPES].map(permission => `
+        <label class="sd-checkbox-row" for="agent-graphiti-${mode}-${permission}">
+            <input
+                id="agent-graphiti-${mode}-${permission}"
+                type="checkbox"
+                data-agent-graphiti-permission="${permission}"
+                data-agent-graphiti-mode="${mode}"
+                ${selected.has(permission) ? 'checked' : ''}
+            >
+            <span>${labels[permission]}</span>
+        </label>
+    `).join('');
+}
+
 function renderAgentConfigPanel(agent) {
     const characterSchedule = agent.scheduleType === 'character-turns';
     const selectedLorebookCount = Array.isArray(agent.worldInfoBooks) ? agent.worldInfoBooks.length : 0;
@@ -6247,6 +5467,14 @@ function renderAgentConfigPanel(agent) {
                 <input id="agent-character-name" class="text_pole" type="text" value="${escapeHtml(agent.characterName)}" ${characterSchedule ? '' : 'disabled'} placeholder="Exact or first name">
                 <label>Recent RP messages available to {{recentChat}}</label>
                 <input id="agent-context-messages" class="text_pole" type="number" min="1" max="5000" value="${agent.contextMessages}">
+                <label>Maximum tool-call rounds</label>
+                <input id="agent-max-tool-rounds" class="text_pole" type="number" min="1" max="${MAX_AGENT_TOOL_ROUNDS}" value="${agent.maxToolRounds}">
+                <div class="sd-footnote">Shared by automatic and OOC runs. A round may contain multiple tool calls before the agent returns its final answer.</div>
+                <label for="agent-log-level">Console log level</label>
+                <select id="agent-log-level" class="text_pole">
+                    ${renderLogLevelOptions(agent.logLevel, { includeInherit: true })}
+                </select>
+                <div class="sd-footnote">Overrides the global console level only for <code>[${escapeHtml(getAgentLogScope(agent))}]</code>. Operation History is never disabled.</div>
             `)}
             ${renderCard('Prompt Template', 'The complete system prompt for this specialized agent.', `
                 <div class="sd-template-tags">
@@ -6304,6 +5532,28 @@ function renderAgentConfigPanel(agent) {
                     <span>Include VectFox context in every agent request</span>
                 </label>
                 <div class="sd-footnote">VectFox is sent automatically as a private system message in normal and OOC calls. When disabled, the integration is not called for this agent.</div>
+                <label class="sd-checkbox-row" for="agent-graphiti-ooc-enabled">
+                    <input id="agent-graphiti-ooc-enabled" type="checkbox" ${agent.graphitiOocEnabled ? 'checked' : ''}>
+                    <span>Enable long-term memory (RAG) tools in OOC</span>
+                </label>
+                <label class="sd-checkbox-row" for="agent-graphiti-automatic-enabled">
+                    <input id="agent-graphiti-automatic-enabled" type="checkbox" ${agent.graphitiAutomaticEnabled ? 'checked' : ''}>
+                    <span>Enable long-term memory (RAG) tools during normal agent runs</span>
+                </label>
+                <label>Readable memory groups</label>
+                <textarea id="agent-graphiti-read-groups" class="text_pole sd-editor-textarea" rows="2" spellcheck="false" placeholder="rp-arifureta-char-mirella">${escapeHtml(agent.graphitiReadGroupIds.join('\n'))}</textarea>
+                <div class="sd-footnote">One group per line. IDs allow only letters, numbers, dashes and underscores.</div>
+                <label>Writable memory group</label>
+                <input id="agent-graphiti-write-group" class="text_pole" type="text" value="${escapeHtml(agent.graphitiWriteGroupId)}" placeholder="rp-arifureta-char-mirella">
+                <label>OOC permissions</label>
+                <div class="sd-checkbox-list">
+                    ${renderGraphitiPermissionOptions(agent, 'ooc')}
+                </div>
+                <label>Automatic-run permissions</label>
+                <div class="sd-checkbox-list">
+                    ${renderGraphitiPermissionOptions(agent, 'automatic')}
+                </div>
+                <div class="sd-footnote">Status is always available when memory tools are enabled. Search is restricted to readable groups. Remember, Correct and Forget are restricted to the single writable group. Every tool round appears in Operation History.</div>
                 <div class="sd-inline-actions">
                     <button id="agent-world-info-all" class="menu_button">Select All</button>
                     <button id="agent-world-info-none" class="menu_button">Clear All</button>
@@ -6326,11 +5576,12 @@ function renderAgentConfigPanel(agent) {
 function renderAgentViewPanel(agent, view) {
     if (view === 'config') return renderAgentConfigPanel(agent);
     if (view === 'ooc') return renderAgentOocPanel(agent);
+    if (view === 'script') return renderAgentScriptPanel(agent);
     return renderAgentWorkspacePanel(agent);
 }
 
 function switchAgentView(nextView) {
-    const view = ['workspace', 'ooc', 'config'].includes(nextView) ? nextView : 'workspace';
+    const view = ['workspace', 'ooc', 'script', 'config'].includes(nextView) ? nextView : 'workspace';
     const agent = getSelectedAgent();
     preserveVisiblePanelDrafts();
     sceneDirectorState.agentView = view;
@@ -6351,17 +5602,21 @@ function switchAgentView(nextView) {
     content.html(agent
         ? renderAgentViewPanel(agent, view)
         : '<div class="sd-agent-empty"><h4>Create the first agent</h4><p>Give it a name, assign a Connection Profile and write one focused task.</p></div>');
+    const panelBody = document.getElementById('scene-director-panel-body');
+    if (panelBody) panelBody.scrollTop = 0;
 
     if (agent && view === 'config') {
         initAgentProfileDropdown();
         initAgentWorldInfoSelect();
+    } else if (agent && view === 'script') {
+        initAgentScriptEditor(agent);
     }
     refreshVisiblePromptTokenCounters();
 }
 
 function renderAgentsWorkspace() {
     const agent = getSelectedAgent();
-    const view = ['workspace', 'ooc', 'config'].includes(sceneDirectorState.agentView)
+    const view = ['workspace', 'ooc', 'script', 'config'].includes(sceneDirectorState.agentView)
         ? sceneDirectorState.agentView
         : 'workspace';
     const runtime = agent ? getAgentRuntimeState(agent.id) : null;
@@ -6382,12 +5637,15 @@ function renderAgentsWorkspace() {
             ${renderPersistentIssueBanner()}
             <div class="sd-toolbar">
                 ${agent ? `<button id="agent-run" data-agent-workspace-action class="menu_button primary${view === 'workspace' ? '' : ' sd-hidden'}" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Run Now</button>` : ''}
+                ${agent && runningAgentIds.has(agent.id) ? '<button data-agent-stop class="menu_button">Stop</button>' : ''}
+                ${agent?.actionEnabled ? `<button id="agent-run-action" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${runtime?.output && !runningAgentIds.has(agent.id) && !runningAgentActionIds.has(agent.id) ? '' : 'disabled'}>Run Action</button>` : ''}
                 ${agent ? `<button id="agent-copy-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Copy Output</button>` : ''}
                 ${agent ? [0, 1, 2].map(index => `<button data-agent-copy-snapshot="${index}" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${snapshots.length <= index ? 'disabled' : ''} title="${snapshots[index]?.savedAt ? escapeHtml(new Date(snapshots[index].savedAt).toLocaleString()) : 'No snapshot'}">Snapshot ${index + 1}</button>`).join('') : ''}
                 ${agent ? `<button id="agent-clear-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Clear Output</button>` : ''}
                 <div class="sd-subnav">
                     <button class="menu_button sd-subnav-button${view === 'workspace' ? ' sd-subnav-button--active' : ''}" data-agent-view="workspace">Workspace</button>
                     <button class="menu_button sd-subnav-button${view === 'ooc' ? ' sd-subnav-button--active' : ''}" data-agent-view="ooc">OOC</button>
+                    <button class="menu_button sd-subnav-button${view === 'script' ? ' sd-subnav-button--active' : ''}" data-agent-view="script">Script</button>
                     <button class="menu_button sd-subnav-button${view === 'config' ? ' sd-subnav-button--active' : ''}" data-agent-view="config">Config</button>
                 </div>
             </div>
@@ -6412,11 +5670,6 @@ function renderWorkspaceNav() {
             copy: 'Choose the next speaker, inspect context and validate routing output.',
         },
         {
-            key: 'director',
-            title: STORY_DIRECTOR_LABEL,
-            copy: 'Maintain the private StoryGuide, planner prompt and lorebook scope.',
-        },
-        {
             key: 'agents',
             title: AGENTS_LABEL,
             copy: 'Configure focused agents, schedules, outputs and dependencies.',
@@ -6432,7 +5685,7 @@ function renderWorkspaceNav() {
     return `
         <aside class="sd-sidebar">
             <div class="sd-sidebar-title">${escapeHtml(EXTENSION_DISPLAY_NAME)}</div>
-            <div class="sd-sidebar-copy">One control room for turn routing and private story planning.</div>
+            <div class="sd-sidebar-copy">Turn routing, focused agents and runtime diagnostics.</div>
             <div class="sd-stage-nav">
                 ${items.map(item => `
                     <button class="sd-stage-link ${sceneDirectorState.activeTab === item.key ? 'sd-stage-link--active' : ''}" data-stage="${item.key}">
@@ -6504,6 +5757,26 @@ function renderOperationLogBody(log) {
     `;
 }
 
+function renderLogLevelOptions(selectedLevel, { includeInherit = false } = {}) {
+    const options = includeInherit ? AGENT_LOG_LEVEL_OPTIONS : LOG_LEVEL_OPTIONS;
+    const selected = normalizeLogLevel(selectedLevel, {
+        allowInherit: includeInherit,
+        fallback: includeInherit ? 'inherit' : DEFAULT_CONFIG.consoleLogLevel,
+    });
+    const labels = {
+        inherit: 'Inherit global level',
+        off: 'Off',
+        error: 'Error',
+        warn: 'Warn',
+        info: 'Info',
+        debug: 'Debug',
+        trace: 'Trace',
+    };
+    return options
+        .map(level => `<option value="${level}" ${level === selected ? 'selected' : ''}>${labels[level]}</option>`)
+        .join('');
+}
+
 function renderLogsWorkspace() {
     const logs = Array.isArray(sceneDirectorState.operationLogs) ? sceneDirectorState.operationLogs : [];
     const runningCount = logs.filter(log => log.status === 'running').length;
@@ -6516,7 +5789,7 @@ function renderLogsWorkspace() {
                 <div>
                     <div class="sd-eyebrow">Backstage Module</div>
                     <h3>Logs</h3>
-                    <p>Runtime history for routing, planning and character generations.</p>
+                    <p>Runtime history for routing, agents and character generations.</p>
                 </div>
                 <div class="sd-hero-meta">
                     ${renderStatusBadge(errorCount ? 'error' : (runningCount ? 'running' : 'ready'))}
@@ -6534,6 +5807,14 @@ function renderLogsWorkspace() {
                 ${renderStatCard('Errors', String(errorCount), 'Expand a row for diagnostics')}
                 ${renderStatCard('Last Event', logs[0]?.startedAt ? formatPanelTime(new Date(logs[0].startedAt)) : 'never', 'Newest operation first')}
             </div>
+
+            ${renderCard('Console Logging', 'Structured browser-console diagnostics with a stable [Backstage] prefix.', `
+                <label for="backstage-console-log-level">Global console level</label>
+                <select id="backstage-console-log-level" class="text_pole">
+                    ${renderLogLevelOptions(config.consoleLogLevel)}
+                </select>
+                <div class="sd-footnote">Filter the browser console with <code>[Backstage]</code>. Debug includes request assembly and tool lifecycle summaries; Trace includes high-frequency flow events. Operation History remains available independently.</div>
+            `)}
 
             <section class="sd-card">
                 <div class="sd-card-head">
@@ -6582,7 +5863,6 @@ function renderRouterWorkspacePanel() {
 
             ${renderCard('Trigger Settle', 'After a profile switch, Backstage waits for a quiet event window before /trigger.', renderTriggerSettleSummary(sceneDirectorState.triggerSettle))}
 
-            ${renderCard('Router Injection', 'Preview of the private directive that will be injected into the selected character.', renderRouterInjectionPreview(sceneDirectorState.lastDecision))}
 
             ${renderDisclosure('Router Response', 'Resposta direta da ultima chamada OOC ao router ou da ultima execucao capturada.', `
                 ${renderTokenCountedConsole(routerResponseText, 'No router response yet.', 'sd-console--tall')}
@@ -6600,28 +5880,12 @@ function renderRouterConfigPanel(castCount) {
 
                 <label>Input token budget (0 = connection preset)</label>
                 <input type="number" id="router-input-token-budget" class="text_pole" min="0" max="2000000" step="1000" value="${config.routerInputTokenBudget}">
-                <div class="sd-footnote">The newest RP messages fill the available input after the planner/router prompt and VectFox context.</div>
+                <div class="sd-footnote">The newest RP messages fill the available input after the router prompt and VectFox context.</div>
 
                 <label>VectFox world context chars (0 = disabled)</label>
                 <input type="number" id="router-world-context-chars" class="text_pole" min="0" max="30000" step="500" value="${config.worldContextChars}">
                 <div class="sd-footnote">0 skips the VectFox dry-run entirely. Values above 0 call VectFox and cap the injected text by character count. Output tokens stay under the active connection profile.</div>
 
-                <hr class="sysHR">
-
-                <label>Trigger lorebook book</label>
-                <select id="router-timed-lorebook-book" class="text_pole"></select>
-
-                <label>Search entry</label>
-                <input type="text" id="router-timed-lorebook-search" class="text_pole" placeholder="Type to filter entries from the selected lorebook" value="${escapeHtml(sceneDirectorState.routerTimedLorebookSearch || '')}">
-
-                <label>Matched entries</label>
-                <select id="router-timed-lorebook-results" class="text_pole" size="8"></select>
-                <div id="router-timed-lorebook-selected" class="sd-footnote">${escapeHtml(config.routerTimedLorebookName || 'No entry selected.')}</div>
-
-                <label>GM trigger regex</label>
-                <input type="text" id="router-timed-lorebook-regex" class="text_pole" placeholder="Example: skill-check|\\[Check\\]|roll" value="${escapeHtml(config.routerTimedLorebookTriggerRegex || '')}">
-                <div class="sd-footnote">When a GM message matches this regex, Backstage applies the ST timed effect to the selected entry. It prefers sticky if the entry has sticky configured; otherwise it uses cooldown.</div>
-                ${renderRouterTimedLorebookStatus()}
             `)}
             ${renderCard('Cast Routing', 'Map each group member to a connection profile before triggering turns.', `
                 <div class="sd-inline-actions">
@@ -6638,10 +5902,7 @@ function renderRouterConfigPanel(castCount) {
             <div class="sd-template-tags" aria-label="Router template tags">
                 ${[
                     '{{recentChat}}',
-                    '{{storyGuide}}',
                     '{{worldContext}}',
-                    '{{lorebookContext}}',
-                    '{{lorebookCatalog}}',
                     '{{players}}',
                     '{{lastSpeaker}}',
                     '{{user}}',
@@ -6674,6 +5935,7 @@ function renderRouterWorkspace() {
             <div class="sd-toolbar sd-toolbar--router">
                 <button id="router-send-ooc-toolbar" class="menu_button primary">Send OOC</button>
                 <button id="scene-director-run" class="menu_button primary">Run Router</button>
+                ${(isProcessing || cancellableOperations.isActive('router')) ? '<button id="scene-director-stop" class="menu_button">Stop</button>' : ''}
                 <button id="scene-director-test-director" class="menu_button">Test Router</button>
                 <button id="scene-director-test-vectfox" class="menu_button">Test VectFox</button>
                 <button id="scene-director-copy-prompt" class="menu_button">Copy Last Request</button>
@@ -6699,123 +5961,6 @@ function renderRouterWorkspace() {
     `;
 }
 
-function renderStoryDirectorWorkspacePanel(storyGuide) {
-    const plannerResponseText = getPlannerWorkspaceResponseText();
-    return `
-        <div class="sd-grid">
-            ${renderDisclosure('Planner OOC', 'Chamada direta e descartavel para conversar com o planner fora do fluxo do StoryGuide.', `
-                <textarea id="planner-ooc-request" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(sceneDirectorState.plannerOocDraft || PLANNER_OOC_DEFAULT_DRAFT)}</textarea>
-                <div class="sd-inline-actions">
-                    <button id="planner-send-ooc" class="menu_button primary">Send OOC</button>
-                    <button id="planner-clear-ooc" class="menu_button">Clear Draft</button>
-                </div>
-                <div class="sd-footnote">Usa o perfil do planner, envia o contexto atual, mostra a resposta na UI e nao grava nada no StoryGuide.</div>
-            `, { open: true })}
-
-            ${renderDisclosure('Planner Response', 'Resposta direta da ultima chamada ao planner ou do ultimo update do StoryGuide.', `
-                ${renderTokenCountedConsole(plannerResponseText, 'No planner response yet.', 'sd-console--tall')}
-            `)}
-
-            ${renderDisclosure('StoryGuide', 'Estado privado persistido em chat metadata para este chat.', `
-                <textarea id="scene-director-story-guide" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(storyGuide)}</textarea>
-                ${renderEditorMeta('Autosaves when focus leaves the field.', 'scene-director-story-guide-token-counter')}
-            `)}
-        </div>
-    `;
-}
-
-function renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, turnsUntilAutoUpdate, storyGuideUpdatedAt) {
-    return `
-        <div class="sd-grid">
-            ${renderCard('Director Settings', 'Connection profile, cadence and lorebook scope for StoryGuide updates.', `
-                <label>Connection profile</label>
-                <select id="planner-profile-dropdown" class="text_pole"></select>
-
-                <label>User turns between planner updates</label>
-                <input type="number" id="planner-user-turn-interval" class="text_pole" min="1" max="100" value="${config.plannerUserTurnInterval}">
-
-                <label>Recent RP messages sent to planner</label>
-                <input type="number" id="planner-context-messages" class="text_pole" min="1" max="5000" value="${config.plannerContextMessages}">
-
-                <label>Selected lorebooks for planner context</label>
-                <div class="sd-inline-actions">
-                    <button id="planner-world-info-all" class="menu_button">Select All</button>
-                    <button id="planner-world-info-none" class="menu_button">Clear All</button>
-                    <span id="planner-world-info-count" class="sd-muted">${selectedCount} selected</span>
-                </div>
-                <div id="planner-world-info-books" class="sd-checkbox-list"></div>
-
-                <div class="sd-kv"><span>Stored in</span><b>chat_metadata.sceneDirector.storyGuide</b></div>
-                <div class="sd-kv"><span>Turns since update</span><b>${escapeHtml(plannerTurnsSinceUpdate)}</b></div>
-                <div class="sd-kv"><span>Next auto update in</span><b>${escapeHtml(turnsUntilAutoUpdate)}</b></div>
-                <div class="sd-kv"><span>Last saved</span><b>${escapeHtml(storyGuideUpdatedAt)}</b></div>
-                <div class="sd-footnote">Autosaves on blur or selection change.</div>
-            `)}
-            ${renderCard('Template', 'Editable system prompt used by the Story Director planner.', `
-                <textarea id="planner-prompt" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(config.plannerPrompt)}</textarea>
-                ${renderEditorMeta('Autosaves when focus leaves the field.', 'planner-prompt-token-counter')}
-                <div class="sd-template-tags"><code>{{user}}</code><code>{{agent:id}}</code></div>
-            `)}
-        </div>
-    `;
-}
-
-function renderStoryDirectorWorkspace() {
-    const storyGuide = getStoryGuide();
-    const storyGuideSnapshots = getStoryGuideSnapshots();
-    const selectedCount = Array.isArray(config.plannerWorldInfoBooks) ? config.plannerWorldInfoBooks.length : 0;
-    const plannerTurnsSinceUpdate = getPlannerUserTurnCounter();
-    const plannerInterval = Math.max(1, Number(config.plannerUserTurnInterval || DEFAULT_CONFIG.plannerUserTurnInterval));
-    const turnsUntilAutoUpdate = Math.max(0, plannerInterval - plannerTurnsSinceUpdate);
-    const storyGuideUpdatedAtRaw = getStoryGuideUpdatedAt();
-    const storyGuideUpdatedAt = storyGuideUpdatedAtRaw ? formatPanelTime(new Date(storyGuideUpdatedAtRaw)) : 'never';
-    const directorView = sceneDirectorState.directorView === 'config' ? 'config' : 'workspace';
-
-    return `
-        <div class="sd-main">
-            <section class="sd-hero sd-hero--director">
-                <div>
-                    <div class="sd-eyebrow">Backstage Module</div>
-                    <h3>${escapeHtml(STORY_DIRECTOR_LABEL)}</h3>
-                    <p>Maintain the private planning layer, update StoryGuide state and inspect the planner output without digging through tabs.</p>
-                </div>
-                <div class="sd-hero-meta">
-                    ${renderStatusBadge(sceneDirectorState.directorStatus)}
-                    <div class="sd-hero-note">Updated ${escapeHtml(formatPanelTime(sceneDirectorState.directorUpdatedAt))}</div>
-                </div>
-            </section>
-
-            <div class="sd-toolbar sd-toolbar--director">
-                <button id="planner-send-ooc-toolbar" class="menu_button primary">Send OOC</button>
-                <button id="scene-director-update-story-guide" class="menu_button primary">Update StoryGuide</button>
-                <button id="scene-director-copy-story-guide" class="menu_button">Copy StoryGuide</button>
-                <button id="scene-director-copy-story-guide-snapshot-1" class="menu_button" ${storyGuideSnapshots.length < 1 ? 'disabled' : ''}>Copy Snapshot 1</button>
-                <button id="scene-director-copy-story-guide-snapshot-2" class="menu_button" ${storyGuideSnapshots.length < 2 ? 'disabled' : ''}>Copy Snapshot 2</button>
-                <button id="scene-director-clear-director" class="menu_button">Clear Director Console</button>
-            </div>
-
-            <div class="sd-subnav">
-                <button class="menu_button sd-subnav-button${directorView === 'workspace' ? ' sd-subnav-button--active' : ''}" data-director-view="workspace">Workspace</button>
-                <button class="menu_button sd-subnav-button${directorView === 'config' ? ' sd-subnav-button--active' : ''}" data-director-view="config">Config</button>
-            </div>
-
-            <div class="sd-summary-grid">
-                ${renderStatCard('Status', formatStateLabel(sceneDirectorState.directorStatus), 'Planner pipeline state')}
-                ${renderStatCard('Updated', formatPanelTime(sceneDirectorState.directorUpdatedAt), 'Last Story Director refresh')}
-                ${renderStatCard('Lorebooks', String(selectedCount), selectedCount ? 'Selected for planner context' : 'No lorebooks selected')}
-                ${renderStatCard('StoryGuide', storyGuide ? `${storyGuide.length} chars` : 'Empty', 'Stored in chat metadata')}
-                ${renderStatCard('Turns Since Update', String(plannerTurnsSinceUpdate), 'Counts only user turns')}
-                ${renderStatCard('Auto Update In', String(turnsUntilAutoUpdate), `Every ${plannerInterval} user turns`)}
-                ${renderStatCard('Last StoryGuide Save', storyGuideUpdatedAt, 'Timestamp from chat metadata')}
-            </div>
-
-            ${directorView === 'config'
-                ? renderStoryDirectorConfigPanel(selectedCount, plannerTurnsSinceUpdate, turnsUntilAutoUpdate, storyGuideUpdatedAt)
-                : renderStoryDirectorWorkspacePanel(storyGuide)}
-        </div>
-    `;
-}
-
 async function renderSceneDirectorPanel() {
     if ($('#scene-director-floating-root').length) return;
 
@@ -6828,6 +5973,29 @@ async function renderSceneDirectorPanel() {
     refreshSceneDirectorPanel();
 }
 
+async function initAgentScriptEditor(agent) {
+    try {
+        await mountAgentScriptEditor('agent-action-editor', agent.actionScript, {
+            onBlur: value => {
+                agent.actionScript = String(value ?? '');
+                saveConfig();
+            },
+        });
+    } catch (error) {
+        const message = error?.message ?? String(error);
+        backstageLogger.error(getAgentLogScope(agent), 'Could not initialize the JavaScript editor', error);
+        $('#agent-action-editor').html(`<div class="sd-console sd-console--error">${escapeHtml(message)}</div>`);
+    }
+}
+
+function positionSceneDirectorPanel() {
+    const panel = document.getElementById('scene-director-panel');
+    if (!panel) return;
+
+    const margin = window.matchMedia('(max-width: 720px)').matches ? 10 : 20;
+    panel.style.top = `${Math.max(0, window.scrollY) + margin}px`;
+}
+
 function refreshSceneDirectorPanel() {
     const panel = $('#scene-director-panel');
     const toggleStatusText = getTogglePipelineStatus();
@@ -6837,12 +6005,18 @@ function refreshSceneDirectorPanel() {
     if (!panel.length) return;
 
     panel.toggleClass('sd-hidden', !sceneDirectorState.panelOpen);
+    positionSceneDirectorPanel();
+
+    const liveScript = getAgentScriptEditorValue();
+    const selectedBeforeRender = getSelectedAgent();
+    if (liveScript != null && selectedBeforeRender) {
+        selectedBeforeRender.actionScript = liveScript;
+    }
+    destroyAgentScriptEditor();
 
     const body = $('#scene-director-panel-body');
-    const workspace = sceneDirectorState.activeTab === 'director'
-        ? renderStoryDirectorWorkspace()
-        : sceneDirectorState.activeTab === 'agents'
-            ? renderAgentsWorkspace()
+    const workspace = sceneDirectorState.activeTab === 'agents'
+        ? renderAgentsWorkspace()
         : sceneDirectorState.activeTab === 'logs'
             ? renderLogsWorkspace()
             : renderRouterWorkspace();
@@ -6858,10 +6032,8 @@ function refreshSceneDirectorPanel() {
     const selectedAgent = getSelectedAgent();
     const selectedAgentStatus = selectedAgent ? getAgentRuntimeState(selectedAgent.id).lastStatus : 'idle';
     $('#scene-director-header-status').html(
-        sceneDirectorState.activeTab === 'director'
-            ? renderStatusBadge(sceneDirectorState.directorStatus)
-            : sceneDirectorState.activeTab === 'agents'
-                ? renderStatusBadge(selectedAgentStatus)
+        sceneDirectorState.activeTab === 'agents'
+            ? renderStatusBadge(selectedAgentStatus)
             : sceneDirectorState.activeTab === 'logs'
                 ? renderStatusBadge(logErrorCount ? 'error' : (logRunningCount ? 'running' : 'ready'))
                 : renderStatusBadge(sceneDirectorState.routerStatus)
@@ -6870,17 +6042,13 @@ function refreshSceneDirectorPanel() {
     if (sceneDirectorState.activeTab === 'router') {
         if (sceneDirectorState.routerView === 'config') {
             initRouterProfileDropdown();
-            initRouterTimedLorebookSelect();
             renderGroupMembers();
-        }
-    } else if (sceneDirectorState.activeTab === 'director') {
-        if (sceneDirectorState.directorView === 'config') {
-            initPlannerProfileDropdown();
-            initPlannerWorldInfoSelect();
         }
     } else if (sceneDirectorState.activeTab === 'agents' && sceneDirectorState.agentView === 'config') {
         initAgentProfileDropdown();
         initAgentWorldInfoSelect();
+    } else if (sceneDirectorState.activeTab === 'agents' && sceneDirectorState.agentView === 'script' && selectedAgent) {
+        initAgentScriptEditor(selectedAgent);
     }
 
     refreshVisiblePromptTokenCounters();
@@ -6901,7 +6069,7 @@ function startToggleStatusTicker() {
     }, 400);
 }
 
-function formatDirectorPromptForCopy(request) {
+function formatRouterPromptForCopy(request) {
     if (!request?.messages?.length) return '';
 
     return request.messages
@@ -6910,7 +6078,7 @@ function formatDirectorPromptForCopy(request) {
 }
 
 async function copyDirectorPromptToClipboard() {
-    const promptText = formatDirectorPromptForCopy(lastDirectorRequest);
+    const promptText = formatRouterPromptForCopy(lastRouterRequest);
 
     if (!promptText) {
         toastr.warning('No router request captured yet.', EXTENSION_LABEL);
@@ -6921,21 +6089,9 @@ async function copyDirectorPromptToClipboard() {
         await navigator.clipboard.writeText(promptText);
         toastr.success('Router request copied.', EXTENSION_LABEL);
     } catch (error) {
-        console.error('[SceneDirector] Failed to copy prompt:', error);
+        backstageLogger.error('UI', 'Failed to copy Router prompt', error);
         toastr.error('Could not copy the router request. See console.', EXTENSION_LABEL);
     }
-}
-
-function getSelectedPlannerWorldInfoBooks() {
-    return $('#planner-world-info-books input[type="checkbox"]:checked')
-        .map((_, input) => String($(input).val() || '').trim())
-        .get()
-        .filter(Boolean);
-}
-
-function updatePlannerWorldInfoCount() {
-    const count = getSelectedPlannerWorldInfoBooks().length;
-    $('#planner-world-info-count').text(`${count} selected`);
 }
 
 function getSelectedAgentWorldInfoBooks() {
@@ -6979,21 +6135,6 @@ function preserveVisiblePanelDrafts() {
         sceneDirectorState.routerOocDraft = String(routerOoc.val() ?? '');
     }
 
-    const plannerPrompt = $('#planner-prompt');
-    if (plannerPrompt.length) {
-        config.plannerPrompt = plannerPrompt.val();
-    }
-
-    const storyGuide = $('#scene-director-story-guide');
-    if (storyGuide.length) {
-        saveStoryGuide(storyGuide.val());
-    }
-
-    const plannerOoc = $('#planner-ooc-request');
-    if (plannerOoc.length) {
-        sceneDirectorState.plannerOocDraft = String(plannerOoc.val() ?? '');
-    }
-
     const selectedAgent = getSelectedAgent();
     const agentOoc = $('#agent-ooc-request');
     if (selectedAgent && agentOoc.length) {
@@ -7001,6 +6142,7 @@ function preserveVisiblePanelDrafts() {
     }
 
     persistAgentPanelFields();
+    destroyAgentScriptEditor();
 }
 
 function schedulePromptTokenCounterUpdate(textareaId, counterId) {
@@ -7013,8 +6155,6 @@ function schedulePromptTokenCounterUpdate(textareaId, counterId) {
 
 function refreshVisiblePromptTokenCounters() {
     schedulePromptTokenCounterUpdate('router-prompt', 'router-prompt-token-counter');
-    schedulePromptTokenCounterUpdate('planner-prompt', 'planner-prompt-token-counter');
-    schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
     schedulePromptTokenCounterUpdate('agent-prompt', 'agent-prompt-token-counter');
     schedulePromptTokenCounterUpdate('agent-output', 'agent-output-token-counter');
     refreshReadOnlyTokenCounters(
@@ -7037,10 +6177,6 @@ function persistDirectorPanelFields() {
     const routerInputTokenBudget = $('#router-input-token-budget');
     const routerWorldContextChars = $('#router-world-context-chars');
     const routerPrompt = $('#router-prompt');
-    const timedBook = $('#router-timed-lorebook-book');
-    const timedSearch = $('#router-timed-lorebook-search');
-    const timedResults = $('#router-timed-lorebook-results');
-    const timedRegex = $('#router-timed-lorebook-regex');
 
     if ($('#router-profile-dropdown').length) {
         config.routerProfileId = $('#router-profile-dropdown').val() || config.routerProfileId;
@@ -7054,46 +6190,8 @@ function persistDirectorPanelFields() {
     if (routerPrompt.length) {
         config.routerPrompt = routerPrompt.val();
     }
-    if (timedBook.length) {
-        config.routerTimedLorebookBook = String(timedBook.val() || '').trim();
-    }
-    if (timedSearch.length) {
-        sceneDirectorState.routerTimedLorebookSearch = String(timedSearch.val() ?? '');
-    }
-    if (timedResults.length) {
-        config.routerTimedLorebookUid = String(timedResults.val() || '').trim();
-    }
-    if (timedRegex.length) {
-        config.routerTimedLorebookTriggerRegex = String(timedRegex.val() ?? '').trim();
-    }
     if ($('#router-ooc-request').length) {
         sceneDirectorState.routerOocDraft = String($('#router-ooc-request').val() ?? '');
-    }
-
-    saveConfig();
-}
-
-function persistPlannerPanelFields() {
-    if ($('#planner-profile-dropdown').length) {
-        config.plannerProfileId = $('#planner-profile-dropdown').val() || config.plannerProfileId;
-    }
-    if ($('#planner-user-turn-interval').length) {
-        config.plannerUserTurnInterval = Math.max(1, parseInt($('#planner-user-turn-interval').val()) || DEFAULT_CONFIG.plannerUserTurnInterval);
-    }
-    if ($('#planner-context-messages').length) {
-        config.plannerContextMessages = Math.min(5000, Math.max(1, parseInt($('#planner-context-messages').val()) || DEFAULT_CONFIG.plannerContextMessages));
-    }
-    if ($('#planner-world-info-books').length) {
-        config.plannerWorldInfoBooks = getSelectedPlannerWorldInfoBooks();
-    }
-    if ($('#planner-prompt').length) {
-        config.plannerPrompt = $('#planner-prompt').val();
-    }
-    if ($('#scene-director-story-guide').length) {
-        saveStoryGuide($('#scene-director-story-guide').val());
-    }
-    if ($('#planner-ooc-request').length) {
-        sceneDirectorState.plannerOocDraft = String($('#planner-ooc-request').val() ?? '');
     }
 
     saveConfig();
@@ -7119,6 +6217,28 @@ function persistAgentPanelFields() {
     if ($('#agent-vectfox-enabled').length) {
         agent.vectFoxEnabled = $('#agent-vectfox-enabled').is(':checked');
     }
+    if ($('#agent-graphiti-ooc-enabled').length) {
+        agent.graphitiOocEnabled = $('#agent-graphiti-ooc-enabled').is(':checked');
+    }
+    if ($('#agent-graphiti-automatic-enabled').length) {
+        agent.graphitiAutomaticEnabled = $('#agent-graphiti-automatic-enabled').is(':checked');
+    }
+    if ($('#agent-graphiti-read-groups').length) {
+        agent.graphitiReadGroupIds = normalizeGraphitiGroupIds($('#agent-graphiti-read-groups').val());
+    }
+    if ($('#agent-graphiti-write-group').length) {
+        const groupId = String($('#agent-graphiti-write-group').val() ?? '').trim();
+        agent.graphitiWriteGroupId = isValidGraphitiGroupId(groupId) ? groupId : '';
+    }
+    for (const mode of ['ooc', 'automatic']) {
+        const permissions = $('[data-agent-graphiti-permission][data-agent-graphiti-mode="' + mode + '"]')
+            .filter(':checked')
+            .map((_, element) => String($(element).attr('data-agent-graphiti-permission') ?? ''))
+            .get();
+        if ($(`[data-agent-graphiti-mode="${mode}"]`).length) {
+            agent[mode === 'ooc' ? 'graphitiOocPermissions' : 'graphitiAutomaticPermissions'] = normalizeGraphitiPermissions(permissions);
+        }
+    }
     if ($('#agent-schedule-type').length) {
         const scheduleType = String($('#agent-schedule-type').val() ?? 'manual');
         agent.scheduleType = AGENT_SCHEDULE_TYPES.has(scheduleType) ? scheduleType : 'manual';
@@ -7128,8 +6248,27 @@ function persistAgentPanelFields() {
     if ($('#agent-context-messages').length) {
         agent.contextMessages = Math.min(5000, Math.max(1, parseInt($('#agent-context-messages').val()) || DEFAULT_AGENT_CONTEXT_MESSAGES));
     }
+    if ($('#agent-max-tool-rounds').length) {
+        agent.maxToolRounds = Math.min(MAX_AGENT_TOOL_ROUNDS, Math.max(1, parseInt($('#agent-max-tool-rounds').val()) || DEFAULT_AGENT_MAX_TOOL_ROUNDS));
+    }
+    if ($('#agent-log-level').length) {
+        agent.logLevel = normalizeLogLevel($('#agent-log-level').val(), { allowInherit: true, fallback: 'inherit' });
+    }
     if ($('#agent-validate-output-format').length) {
         agent.validateOutputFormat = $('#agent-validate-output-format').is(':checked');
+    }
+    if ($('#agent-action-enabled').length) {
+        agent.actionEnabled = $('#agent-action-enabled').is(':checked');
+    }
+    if ($('#agent-action-auto-run').length) {
+        agent.actionAutoRun = $('#agent-action-auto-run').is(':checked');
+    }
+    if ($('#agent-action-test-payload').length) {
+        agent.actionTestPayload = String($('#agent-action-test-payload').val() ?? '');
+    }
+    const actionScript = getAgentScriptEditorValue();
+    if (actionScript != null) {
+        agent.actionScript = actionScript;
     }
     if ($('#agent-character-injection-enabled').length) {
         agent.characterInjectionEnabled = $('#agent-character-injection-enabled').is(':checked');
@@ -7239,10 +6378,15 @@ function deleteSelectedAgent() {
 }
 
 function attachFloatingPanelEvents() {
+    $(window)
+        .off('scroll.backstagePanelPosition resize.backstagePanelPosition')
+        .on('scroll.backstagePanelPosition resize.backstagePanelPosition', positionSceneDirectorPanel);
     $('#scene-director-toggle').on('click', () => {
+        if (sceneDirectorState.panelOpen) preserveVisiblePanelDrafts();
         updateSceneDirectorState({ panelOpen: !sceneDirectorState.panelOpen });
     });
     $('#scene-director-close').on('click', () => {
+        preserveVisiblePanelDrafts();
         updateSceneDirectorState({ panelOpen: false });
     });
     $(document).off('mousedown.backstagePanelDismiss').on('mousedown.backstagePanelDismiss', (event) => {
@@ -7261,12 +6405,13 @@ function attachFloatingPanelEvents() {
 
         preserveVisiblePanelDrafts();
         persistDirectorPanelFields();
-        persistPlannerPanelFields();
         updateSceneDirectorState({ panelOpen: false });
     });
     $('#scene-director-panel-body').on('click', '[data-stage]', function () {
         preserveVisiblePanelDrafts();
         updateSceneDirectorState({ activeTab: $(this).data('stage') || 'router' });
+        const panelBody = document.getElementById('scene-director-panel-body');
+        if (panelBody) panelBody.scrollTop = 0;
     });
     $('#scene-director-panel-body').on('click', '.sd-log-entry > summary', function (event) {
         const entry = this.parentElement;
@@ -7293,10 +6438,6 @@ function attachFloatingPanelEvents() {
         preserveVisiblePanelDrafts();
         updateRouterState({ routerView: $(this).data('router-view') || 'workspace' });
     });
-    $('#scene-director-panel-body').on('click', '[data-director-view]', function () {
-        preserveVisiblePanelDrafts();
-        updateStoryDirectorState({ directorView: $(this).data('director-view') || 'workspace' });
-    });
     $('#scene-director-panel-body').on('click', '[data-agent-view]', function () {
         switchAgentView($(this).data('agent-view') || 'workspace');
     });
@@ -7316,8 +6457,30 @@ function attachFloatingPanelEvents() {
         const agent = getSelectedAgent();
         if (!agent) return;
         try {
-            await executeAgent(agent.id, { type: 'manual', label: 'Manual run from Agents workspace' });
-            toastr.success(`${agent.name} updated.`, EXTENSION_LABEL);
+            const result = await executeAgent(agent.id, { type: 'manual', label: 'Manual run from Agents workspace' });
+            if (result != null) toastr.success(`${agent.name} updated.`, EXTENSION_LABEL);
+        } catch (error) {
+            toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
+        }
+    });
+    $('#scene-director-panel-body').on('click', '[data-agent-stop]', () => {
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        if (stopAgentExecution(agent.id)) {
+            toastr.info(`${agent.name} stopped.`, EXTENSION_LABEL);
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#agent-run-action', async () => {
+        persistAgentPanelFields();
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        try {
+            await executeConfiguredAgentAction(
+                agent,
+                getAgentRuntimeState(agent.id).output,
+                { type: 'manual', label: 'Manual action from Agents workspace' },
+            );
+            toastr.success(`${agent.name} action completed.`, EXTENSION_LABEL);
         } catch (error) {
             toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
         }
@@ -7359,12 +6522,58 @@ function attachFloatingPanelEvents() {
         updateAgentOocState(agent.id, { history: [] });
         refreshSceneDirectorPanel();
     });
+    $('#scene-director-panel-body').on('click', '#agent-run-ooc-action', async () => {
+        persistAgentPanelFields();
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        try {
+            await executeConfiguredAgentAction(
+                agent,
+                getLatestAgentOocAssistantOutput(agent.id),
+                { type: 'ooc', label: 'Manual action from latest OOC response' },
+            );
+            toastr.success(`${agent.name} OOC action completed.`, EXTENSION_LABEL);
+        } catch (error) {
+            toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#agent-action-validate', () => {
+        persistAgentPanelFields();
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        const validation = validateAgentActionScript(agent.actionScript);
+        if (validation.valid) {
+            toastr.success(`${agent.name} JavaScript is valid.`, EXTENSION_LABEL);
+        } else {
+            toastr.error(validation.error, EXTENSION_LABEL);
+        }
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('click', '#agent-action-test', async () => {
+        persistAgentPanelFields();
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        try {
+            await executeConfiguredAgentAction(
+                agent,
+                agent.actionTestPayload,
+                { type: 'test', label: 'Manual action test' },
+            );
+            toastr.success(`${agent.name} action test completed.`, EXTENSION_LABEL);
+        } catch (error) {
+            toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
+        }
+    });
     $('#scene-director-panel-body').on('click', '#agent-delete', () => deleteSelectedAgent());
-    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-prompt, #agent-output, #agent-injection-depth, [data-agent-injection-tag]', () => {
+    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-max-tool-rounds, #agent-prompt, #agent-output, #agent-injection-depth, #agent-action-test-payload, #agent-graphiti-read-groups, #agent-graphiti-write-group, [data-agent-injection-tag]', () => {
         persistAgentPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-vectfox-enabled, [data-agent-injection-character]', () => {
+    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-vectfox-enabled, #agent-graphiti-ooc-enabled, #agent-graphiti-automatic-enabled, #agent-log-level, #agent-action-auto-run, [data-agent-graphiti-permission], [data-agent-injection-character]', () => {
         persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-action-enabled', () => {
+        persistAgentPanelFields();
+        refreshSceneDirectorPanel();
     });
     $('#scene-director-panel-body').on('change', '#agent-character-injection-enabled, input[name="agent-injection-position"], [data-agent-injection-mode]', () => {
         persistAgentPanelFields();
@@ -7416,13 +6625,19 @@ function attachFloatingPanelEvents() {
         persistDirectorPanelFields();
         await runRouter('floating-panel');
     });
+    $('#scene-director-panel-body').on('click', '#scene-director-stop', async () => {
+        if (await stopRouterExecution()) {
+            toastr.info('Router stopped. New generations are available.', EXTENSION_LABEL);
+        }
+    });
     $('#scene-director-panel-body').on('click', '#scene-director-test-director', async () => {
         persistDirectorPanelFields();
-        const ctx = SillyTavern.getContext();
         toastr.info('Running router test...', EXTENSION_LABEL);
-        const decision = await callRouterAgent(ctx.chat);
+        const decision = await runRouterTestRequest();
         const nextSpeaker = typeof decision === 'string' ? decision : decision?.nextSpeaker;
-        toastr.info(nextSpeaker ? `Next speaker: ${nextSpeaker}` : 'No response returned.', EXTENSION_LABEL);
+        if (sceneDirectorState.routerStatus !== 'stopped') {
+            toastr.info(nextSpeaker ? `Next speaker: ${nextSpeaker}` : 'No response returned.', EXTENSION_LABEL);
+        }
     });
     $('#scene-director-panel-body').on('click', '#scene-director-test-vectfox', async () => {
         await testVectFoxPrompt('floating-panel');
@@ -7453,17 +6668,6 @@ function attachFloatingPanelEvents() {
         sceneDirectorState.routerOocDraft = ROUTER_OOC_DEFAULT_DRAFT;
         refreshSceneDirectorPanel();
     });
-    $('#scene-director-panel-body').on('click', '#scene-director-clear-director', () => {
-        updateStoryDirectorState({
-            status: 'idle',
-            plannerReasoning: '',
-            plannerRawOutput: '',
-            plannerError: '',
-            lastPlannerPromptMessages: null,
-            plannerOocHistory: [],
-            lastError: '',
-        });
-    });
     $('#scene-director-panel-body').on('click', '#scene-director-clear-issue', () => {
         clearBackstageIssue();
     });
@@ -7472,45 +6676,10 @@ function attachFloatingPanelEvents() {
             operationLogs: (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'running'),
         });
     });
-    $('#scene-director-panel-body').on('click', '#planner-send-ooc, #planner-send-ooc-toolbar', async () => {
-        persistPlannerPanelFields();
-        await runPlannerOocRequest();
-    });
-    $('#scene-director-panel-body').on('click', '#planner-clear-ooc', () => {
-        sceneDirectorState.plannerOocDraft = PLANNER_OOC_DEFAULT_DRAFT;
-        refreshSceneDirectorPanel();
-    });
-    $('#scene-director-panel-body').on('change', '#planner-world-info-books input[type="checkbox"]', () => {
-        updatePlannerWorldInfoCount();
-        persistPlannerPanelFields();
-    });
-    $('#scene-director-panel-body').on('click', '#planner-world-info-all', () => {
-        $('#planner-world-info-books input[type="checkbox"]').prop('checked', true);
-        updatePlannerWorldInfoCount();
-        persistPlannerPanelFields();
-    });
-    $('#scene-director-panel-body').on('click', '#planner-world-info-none', () => {
-        $('#planner-world-info-books input[type="checkbox"]').prop('checked', false);
-        updatePlannerWorldInfoCount();
-        persistPlannerPanelFields();
-    });
-    $('#scene-director-panel-body').on('click', '#scene-director-update-story-guide', async () => {
-        persistPlannerPanelFields();
-        await updateStoryGuideFromContext();
-        refreshSceneDirectorPanel();
-    });
-    $('#scene-director-panel-body').on('click', '#scene-director-copy-story-guide', async () => {
-        persistPlannerPanelFields();
-        await navigator.clipboard.writeText(getStoryGuide());
-        toastr.success('StoryGuide copiado.', EXTENSION_LABEL);
-    });
-    $('#scene-director-panel-body').on('click', '#scene-director-copy-story-guide-snapshot-1', async () => {
-        persistPlannerPanelFields();
-        await copyStoryGuideSnapshot(0);
-    });
-    $('#scene-director-panel-body').on('click', '#scene-director-copy-story-guide-snapshot-2', async () => {
-        persistPlannerPanelFields();
-        await copyStoryGuideSnapshot(1);
+    $('#scene-director-panel-body').on('change', '#backstage-console-log-level', function () {
+        config.consoleLogLevel = normalizeLogLevel($(this).val(), { fallback: DEFAULT_CONFIG.consoleLogLevel });
+        saveConfig();
+        backstageLogger.info('Core', `Console log level changed to ${config.consoleLogLevel}`);
     });
     $('#scene-director-panel-body').on('focusout', '#router-input-token-budget, #router-world-context-chars, #router-prompt', () => {
         persistDirectorPanelFields();
@@ -7521,68 +6690,11 @@ function attachFloatingPanelEvents() {
     $('#scene-director-panel-body').on('change', '#router-input-token-budget, #router-world-context-chars', () => {
         persistDirectorPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#router-timed-lorebook-book', async () => {
-        config.routerTimedLorebookBook = String($('#router-timed-lorebook-book').val() || '').trim();
-        config.routerTimedLorebookUid = '';
-        config.routerTimedLorebookName = '';
-        routerTimedLorebookLastTriggerSignature = '';
-        saveConfig();
-        await renderRouterTimedLorebookResults();
-        refreshSceneDirectorPanel();
-    });
-    $('#scene-director-panel-body').on('input', '#router-timed-lorebook-search', async () => {
-        sceneDirectorState.routerTimedLorebookSearch = String($('#router-timed-lorebook-search').val() ?? '');
-        await renderRouterTimedLorebookResults();
-    });
-    $('#scene-director-panel-body').on('change', '#router-timed-lorebook-results', async () => {
-        const bookName = String($('#router-timed-lorebook-book').val() || config.routerTimedLorebookBook || '').trim();
-        const selectedUid = String($('#router-timed-lorebook-results').val() || '').trim();
-        config.routerTimedLorebookBook = bookName;
-        config.routerTimedLorebookUid = selectedUid;
-        config.routerTimedLorebookName = '';
-
-        if (bookName && selectedUid) {
-            const entries = await getRouterTimedLorebookEntries(bookName);
-            const selectedEntry = entries.find(entry => String(entry.uid) === selectedUid);
-            config.routerTimedLorebookName = selectedEntry?.label ?? '';
-        }
-
-        saveConfig();
-        routerTimedLorebookLastTriggerSignature = '';
-        await renderRouterTimedLorebookResults();
-        refreshSceneDirectorPanel();
-    });
-    $('#scene-director-panel-body').on('change focusout', '#router-timed-lorebook-regex', async () => {
-        persistDirectorPanelFields();
-        routerTimedLorebookLastTriggerSignature = '';
-        refreshSceneDirectorPanel();
-    });
     $('#scene-director-panel-body').on('focusout', '#router-ooc-request', () => {
         persistDirectorPanelFields();
     });
     $('#scene-director-panel-body').on('input', '#router-ooc-request', () => {
         sceneDirectorState.routerOocDraft = String($('#router-ooc-request').val() ?? '');
-    });
-    $('#scene-director-panel-body').on('focusout', '#planner-user-turn-interval, #planner-context-messages, #planner-prompt, #scene-director-story-guide', () => {
-        persistPlannerPanelFields();
-    });
-    $('#scene-director-panel-body').on('input', '#planner-prompt', () => {
-        schedulePromptTokenCounterUpdate('planner-prompt', 'planner-prompt-token-counter');
-    });
-    $('#scene-director-panel-body').on('input', '#scene-director-story-guide', () => {
-        schedulePromptTokenCounterUpdate('scene-director-story-guide', 'scene-director-story-guide-token-counter');
-    });
-    $('#scene-director-panel-body').on('change', '#planner-user-turn-interval, #planner-context-messages', () => {
-        persistPlannerPanelFields();
-    });
-    $('#scene-director-panel-body').on('focusout', '#planner-ooc-request', () => {
-        persistPlannerPanelFields();
-    });
-    $('#scene-director-panel-body').on('input', '#planner-ooc-request', () => {
-        sceneDirectorState.plannerOocDraft = String($('#planner-ooc-request').val() ?? '');
-    });
-    $('#scene-director-panel-body').on('change', '#planner-profile-dropdown', () => {
-        persistPlannerPanelFields();
     });
 }
 
@@ -7601,7 +6713,7 @@ function renderSettings() {
                             <input type="checkbox" id="router-enabled" ${config.enabled ? 'checked' : ''}>
                             <span>${ROUTER_LABEL} enabled</span>
                         </label>
-                        <small style="color:#888;">Use the floating ${EXTENSION_DISPLAY_NAME} panel to manage ${ROUTER_LABEL} and ${STORY_DIRECTOR_LABEL}.</small>
+                        <small style="color:#888;">Use the floating ${EXTENSION_DISPLAY_NAME} panel to manage ${ROUTER_LABEL}, agents and logs.</small>
                     </div>
                 </div>
             </div>
@@ -7694,19 +6806,6 @@ async function initRouterProfileDropdown() {
     );
 }
 
-async function initPlannerProfileDropdown() {
-    if (!$('#planner-profile-dropdown').length) return;
-    const service = await getConnService();
-    service.handleDropdown(
-        '#planner-profile-dropdown',
-        config.plannerProfileId,
-        (profile) => {
-            config.plannerProfileId = profile?.id ?? '';
-            saveConfig();
-        }
-    );
-}
-
 async function initAgentProfileDropdown() {
     const agent = getSelectedAgent();
     if (!agent || !$('#agent-profile-dropdown').length) return;
@@ -7747,96 +6846,9 @@ async function initAgentWorldInfoSelect() {
         container.html(options || '<div class="sd-muted">No lorebooks found.</div>');
         updateAgentWorldInfoCount();
     } catch (error) {
-        console.warn('[SceneDirector] Failed to initialize agent World Info select:', error);
+        backstageLogger.warn('UI', 'Failed to initialize Agent World Info select', error);
         container.html('<div class="sd-muted">Could not load lorebooks.</div>');
         updateAgentWorldInfoCount();
-    }
-}
-
-async function initPlannerWorldInfoSelect() {
-    const container = $('#planner-world-info-books');
-    if (!container.length) return;
-
-    try {
-        const wi = await getWorldInfoModule();
-        const worldNames = getAvailableWorldInfoNames(wi);
-        const selected = new Set(Array.isArray(config.plannerWorldInfoBooks) ? config.plannerWorldInfoBooks : []);
-        const options = worldNames
-            .map((name, index) => {
-                const id = `planner-world-info-book-${index}`;
-                return `<label class="sd-checkbox-row" for="${id}">
-                    <input id="${id}" type="checkbox" value="${escapeHtml(name)}" ${selected.has(name) ? 'checked' : ''}>
-                    <span>${escapeHtml(name)}</span>
-                </label>`;
-            })
-            .join('');
-
-        container.html(options || '<div class="sd-muted">No lorebooks found.</div>');
-        updatePlannerWorldInfoCount();
-    } catch (error) {
-        console.warn('[SceneDirector] Failed to initialize planner World Info select:', error);
-        container.html('<div class="sd-muted">Could not load lorebooks.</div>');
-        updatePlannerWorldInfoCount();
-    }
-}
-
-async function renderRouterTimedLorebookResults() {
-    const results = $('#router-timed-lorebook-results');
-    const selectedSummary = $('#router-timed-lorebook-selected');
-    if (!results.length || !selectedSummary.length) return;
-
-    const bookName = String($('#router-timed-lorebook-book').val() || config.routerTimedLorebookBook || '').trim();
-    const search = String($('#router-timed-lorebook-search').val() ?? sceneDirectorState.routerTimedLorebookSearch ?? '').trim().toLowerCase();
-    sceneDirectorState.routerTimedLorebookSearch = String($('#router-timed-lorebook-search').val() ?? sceneDirectorState.routerTimedLorebookSearch ?? '');
-
-    if (!bookName) {
-        results.html('');
-        selectedSummary.text('Select a lorebook first.');
-        return;
-    }
-
-    try {
-        const entries = await getRouterTimedLorebookEntries(bookName);
-        const filtered = entries.filter(entry => !search || entry.searchText.includes(search));
-        const selectedUid = Number(config.routerTimedLorebookUid);
-        const visible = filtered.slice(0, 60);
-        const selectedEntry = entries.find(entry => entry.uid === selectedUid) ?? null;
-
-        results.html(visible.map(entry => `
-            <option value="${escapeHtml(String(entry.uid))}" ${entry.uid === selectedUid ? 'selected' : ''}>
-                ${escapeHtml(`${entry.label} | uid ${entry.uid}${entry.keys ? ` | ${entry.keys}` : ''}`)}
-            </option>
-        `).join(''));
-
-        if (!visible.length) {
-            results.html('<option value="">No matching entries.</option>');
-        }
-
-        selectedSummary.text(selectedEntry
-            ? `${selectedEntry.label} | uid ${selectedEntry.uid}${selectedEntry.disable ? ' | currently disabled' : ''}${selectedEntry.sticky ? ` | sticky ${selectedEntry.sticky}` : ''}${selectedEntry.cooldown ? ` | cooldown ${selectedEntry.cooldown}` : ''}`
-            : 'No entry selected.');
-    } catch (error) {
-        console.warn('[SceneDirector] Failed to render timed lorebook results:', error);
-        results.html('<option value="">Could not load entries.</option>');
-        selectedSummary.text('Could not load entries.');
-    }
-}
-
-async function initRouterTimedLorebookSelect() {
-    const select = $('#router-timed-lorebook-book');
-    if (!select.length) return;
-
-    try {
-        const wi = await getWorldInfoModule();
-        const worldNames = getAvailableWorldInfoNames(wi);
-        const selectedBook = String(config.routerTimedLorebookBook ?? '').trim();
-        const options = ['<option value="">-- none --</option>']
-            .concat(worldNames.map(name => `<option value="${escapeHtml(name)}" ${name === selectedBook ? 'selected' : ''}>${escapeHtml(name)}</option>`));
-        select.html(options.join(''));
-        await renderRouterTimedLorebookResults();
-    } catch (error) {
-        console.warn('[SceneDirector] Failed to initialize timed lorebook select:', error);
-        select.html('<option value="">Could not load lorebooks.</option>');
     }
 }
 
@@ -7880,6 +6892,14 @@ jQuery(document).ready(async () => {
     startToggleStatusTicker();
 
     const ctx = SillyTavern.getContext();
+    ctx.setExtensionPrompt?.(
+        'scene-director-next-reply',
+        '',
+        EXTENSION_PROMPT_TYPES.IN_PROMPT,
+        0,
+        false,
+        EXTENSION_PROMPT_ROLES.SYSTEM,
+    );
 
     ctx.registerSlashCommand?.('router', async (_args, value) => {
         const requestedSpeaker = String(value ?? '').trim();
@@ -7895,7 +6915,7 @@ jQuery(document).ready(async () => {
     ctx.registerSlashCommand?.('director', async () => {
         await runRouter('manual:/director');
         return '';
-    }, [], 'Executa o SceneDirector manualmente');
+    }, [], 'Executa o Turn Router manualmente');
 
     ctx.registerSlashCommand?.('routerwi', async () => {
         await testWorldInfoPrompt('slash:/routerwi');
@@ -7912,8 +6932,40 @@ jQuery(document).ready(async () => {
         testWorldInfoPrompt,
         testVectFoxPrompt,
         testVectFoxPromptVerbose: (caller = 'console') => testVectFoxPrompt(caller, { verbose: true }),
-        lastDirectorRequest,
+        lastRouterRequest,
+        logger: backstageLogger,
     };
+
+    ctx.eventSource.on(ctx.event_types.GENERATION_STARTED, async (type, _options, dryRun) => {
+        if (dryRun) return;
+        const diagnostics = await getToolCallingDiagnostics(type);
+        backstageLogger.debug('ToolCall', 'Generation started', {
+            type: String(type ?? 'normal'),
+            activeCharacter: lastActiveChar || 'unknown',
+            supported: diagnostics.supported,
+            canPerform: diagnostics.canPerform,
+            hostToolBlocks: summarizeHostChatForLog().toolCount,
+            inspectionError: diagnostics.error || '',
+        });
+    });
+
+    if (ctx.event_types.TOOL_CALLS_PERFORMED) {
+        ctx.eventSource.on(ctx.event_types.TOOL_CALLS_PERFORMED, (invocations) => {
+            backstageLogger.info('ToolCall', 'Tools performed and persisted to host chat', {
+                invocations: summarizeToolInvocationsForConsole(invocations),
+                hostToolBlocks: summarizeHostChatForLog().toolCount,
+            });
+        });
+    }
+
+    if (ctx.event_types.TOOL_CALLS_RENDERED) {
+        ctx.eventSource.on(ctx.event_types.TOOL_CALLS_RENDERED, (invocations) => {
+            backstageLogger.debug('ToolCall', 'Tool result block rendered', {
+                count: Array.isArray(invocations) ? invocations.length : 0,
+                hostToolBlocks: summarizeHostChatForLog().toolCount,
+            });
+        });
+    }
 
     ctx.eventSource.on(ctx.event_types.USER_MESSAGE_RENDERED, () => {
         scheduleAgentsForTurn({
@@ -7926,25 +6978,8 @@ jQuery(document).ready(async () => {
         }, 300);
     });
 
-    ctx.eventSource.on(ctx.event_types.CHARACTER_MESSAGE_RENDERED, () => {
-        setTimeout(async () => {
-            const c = SillyTavern.getContext();
-            const lastMsg = c.chat[c.chat.length - 1];
-            if (isToolInvocationChatMessage(lastMsg)) {
-                return; // ignora mensagens de tool call — GM ainda está gerando
-            }
-            scheduleAgentsForTurn({
-                type: 'character',
-                label: `Scheduled after ${String(lastMsg?.name ?? 'character')} turn`,
-                characterName: String(lastMsg?.name ?? ''),
-            });
-            if (skipNextCharacterAutoRouter) {
-                skipNextCharacterAutoRouter = false;
-                return;
-            }
-            await maybeTriggerRouterTimedLorebookFromMessage(lastMsg, c);
-            runRouter('CHARACTER_MESSAGE_RENDERED');
-        }, 300);
+    ctx.eventSource.on(ctx.event_types.CHARACTER_MESSAGE_RENDERED, async messageId => {
+        await handleCharacterTurnCandidate(messageId, 'CHARACTER_MESSAGE_RENDERED');
     });
 
     ctx.eventSource.on(ctx.event_types.GENERATION_ENDED, () => {
@@ -7954,9 +6989,35 @@ jQuery(document).ready(async () => {
         const isEmpty = !lastMsg?.mes?.trim();
         const isToolCycle = isEmpty || isToolInvocationChatMessage(lastMsg);
         fl('← EVT', 'GENERATION_ENDED', `isProcessing=${isProcessing} | type=${type ?? (isEmpty ? 'empty' : 'msg')} | toolCycle=${isToolCycle}`);
-        if (!isProcessing) return;
         if (isToolCycle) {
             fl('  =', 'GENERATION_ENDED', 'tool_call pendente — mantendo isProcessing');
+            backstageLogger.debug('ToolCall', 'Generation ended on an intermediate tool cycle', {
+                messageType: type || 'empty',
+                isProcessing,
+            });
+            return;
+        }
+        backstageLogger.info(`Character:${String(lastMsg?.name ?? lastActiveChar ?? 'unknown')}`, 'Generation ended', {
+            isProcessing,
+            responseCharacters: String(lastMsg?.mes ?? '').length,
+            pendingNativeTurn: !!pendingNativeCharacterMessage,
+        });
+        const pendingNativeMessage = pendingNativeCharacterMessage;
+        const completedCharacterMessage = pendingNativeMessage
+            ?? (lastMsg && !lastMsg.is_user && !lastMsg.is_system && !isToolInvocationChatMessage(lastMsg) ? lastMsg : null);
+        pendingNativeCharacterMessage = completedCharacterMessage;
+        if (!isProcessing) {
+            if (completedCharacterMessage) {
+                pendingAutoRouter = false;
+                setTimeout(() => {
+                    processCompletedCharacterMessage(completedCharacterMessage, 'GENERATION_ENDED:native-character');
+                }, 0);
+            } else if (pendingAutoRouter) {
+                pendingAutoRouter = false;
+                setTimeout(() => {
+                    runRouter('GENERATION_ENDED:native-pending');
+                }, 0);
+            }
             return;
         }
         updateActiveOperationLog('character-turn', {
@@ -7964,17 +7025,18 @@ jQuery(document).ready(async () => {
             reasoning: String(lastMsg?.extra?.reasoning ?? ''),
         });
         clearCharacterNote();
-        clearStoryGuideInjection();
-        clearLorebookInjection();
         clearAgentCharacterInjection();
         clearDirectedOocPrompt();
-        clearSceneDirection();
         clearActiveTriggerSettleMonitor();
         finishRuntimePhase(['character-turn']);
-        skipNextCharacterAutoRouter = false;
         isProcessing = false;
         fl('  ✓', 'GENERATION_ENDED', 'isProcessing liberado');
-        if (pendingAutoRouter) {
+        if (completedCharacterMessage) {
+            pendingAutoRouter = false;
+            setTimeout(() => {
+                processCompletedCharacterMessage(completedCharacterMessage, 'GENERATION_ENDED:character');
+            }, 0);
+        } else if (pendingAutoRouter) {
             pendingAutoRouter = false;
             setTimeout(() => {
                 runRouter('GENERATION_ENDED:pending-auto');
@@ -7984,19 +7046,36 @@ jQuery(document).ready(async () => {
 
     ctx.eventSource.on(ctx.event_types.GENERATION_STOPPED, () => {
         fl('← EVT', 'GENERATION_STOPPED', `isProcessing=${isProcessing}`);
-        if (!isProcessing) return;
+        backstageLogger.warn('Generation', 'Generation stopped', { isProcessing });
+        if (!isProcessing) {
+            pendingAutoRouter = false;
+            pendingNativeCharacterMessage = null;
+            return;
+        }
         clearCharacterNote();
-        clearStoryGuideInjection();
-        clearLorebookInjection();
         clearAgentCharacterInjection();
         clearDirectedOocPrompt();
-        clearSceneDirection();
         clearActiveTriggerSettleMonitor();
         finishRuntimePhase(['character-turn'], 'stopped');
         skipNextCharacterAutoRouter = false;
         pendingAutoRouter = false;
+        pendingNativeCharacterMessage = null;
         isProcessing = false;
         fl('  ✓', 'GENERATION_STOPPED', 'isProcessing liberado (stop forçado)');
+    });
+
+    ctx.eventSource.on(ctx.event_types.GROUP_WRAPPER_FINISHED, async () => {
+        const pendingMessage = pendingNativeCharacterMessage;
+        if (!pendingMessage) {
+            return;
+        }
+
+        pendingNativeCharacterMessage = null;
+        backstageLogger.debug('Generation', 'Group wrapper finished; processing pending character turn', {
+            character: String(pendingMessage?.name ?? 'unknown'),
+            messageCharacters: String(pendingMessage?.mes ?? '').length,
+        });
+        await processCompletedCharacterMessage(pendingMessage, 'GROUP_WRAPPER_FINISHED');
     });
 
     ctx.eventSource.on(ctx.event_types.GROUP_MEMBER_DRAFTED, (charName) => {
@@ -8011,13 +7090,27 @@ jQuery(document).ready(async () => {
         const promptReadyNumber = Math.max(0, Number(characterOperation?.promptReadyCount) || 0) + 1;
         const beforeRemap = summarizeCompletionMessagesForLog(chat);
         const hostChat = summarizeHostChatForLog();
+        const promptSummary = {
+            promptReadyNumber,
+            completionMessages: beforeRemap.total,
+            completionRoles: beforeRemap.roles,
+            toolCalls: beforeRemap.toolCalls,
+            toolResults: beforeRemap.toolResults,
+            hostMessages: hostChat.total,
+            hostToolBlocks: hostChat.toolCount,
+            activeCharacter: lastActiveChar || 'unknown',
+        };
+        backstageLogger.debug('ToolCall', 'Prompt assembled before Backstage remap', promptSummary);
+        if (hostChat.toolCount > 0 && beforeRemap.toolCalls === 0 && beforeRemap.toolResults === 0) {
+            backstageLogger.warn('ToolCall', 'Host chat contains tool blocks, but the assembled prompt does not', promptSummary);
+        }
         if (characterOperationLogId) {
             updateOperationLog(characterOperationLogId, {
                 promptReadyCount: promptReadyNumber,
             });
             appendOperationLogDetail(characterOperationLogId, [
                 `Prompt ready ${promptReadyNumber} before remap`,
-                `Completion messages: total=${beforeRemap.total}, nonSystem=${beforeRemap.nonSystem} (${beforeRemap.roles})`,
+                `Completion messages: total=${beforeRemap.total}, nonSystem=${beforeRemap.nonSystem} (${beforeRemap.roles}), toolCalls=${beforeRemap.toolCalls}, toolResults=${beforeRemap.toolResults}`,
                 `Host chat at prompt ready: total=${hostChat.total}, user=${hostChat.userCount}, character=${hostChat.characterCount}, system=${hostChat.systemCount}, tools=${hostChat.toolCount}`,
                 `Host chat tail: ${hostChat.lastMessages}`,
                 beforeRemap.nonSystem === 0 && (hostChat.userCount + hostChat.characterCount) > 0
@@ -8049,20 +7142,37 @@ jQuery(document).ready(async () => {
             }
         }
 
+        const afterRemap = summarizeCompletionMessagesForLog(chat);
         if (characterOperationLogId) {
-            const afterRemap = summarizeCompletionMessagesForLog(chat);
             appendOperationLogDetail(characterOperationLogId, [
                 `Prompt ready ${promptReadyNumber} after remap`,
-                `Completion messages: total=${afterRemap.total}, nonSystem=${afterRemap.nonSystem} (${afterRemap.roles})`,
+                `Completion messages: total=${afterRemap.total}, nonSystem=${afterRemap.nonSystem} (${afterRemap.roles}), toolCalls=${afterRemap.toolCalls}, toolResults=${afterRemap.toolResults}`,
             ].join('\n'));
         }
+        backstageLogger.trace('ToolCall', 'Prompt after Backstage remap', {
+            promptReadyNumber,
+            completionMessages: afterRemap.total,
+            completionRoles: afterRemap.roles,
+            toolCalls: afterRemap.toolCalls,
+            toolResults: afterRemap.toolResults,
+        });
     });
 
     ctx.eventSource.on(ctx.event_types.CHAT_COMPLETION_SETTINGS_READY, (payload) => {
         try {
             captureCharacterApiRequest(payload);
+            const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+            backstageLogger.debug('ToolCall', 'Final character API request ready', {
+                model: String(payload?.model ?? '-'),
+                source: String(payload?.chat_completion_source ?? '-'),
+                messages: messages.length,
+                toolCalls: messages.filter(message => Array.isArray(message?.tool_calls) && message.tool_calls.length > 0).length,
+                toolResults: messages.filter(message => message?.role === 'tool').length,
+                registeredTools: Array.isArray(payload?.tools) ? payload.tools.length : 0,
+                streaming: !!payload?.stream,
+            });
         } catch (error) {
-            console.warn('[Backstage] Failed to capture character API request:', error);
+            backstageLogger.warn('ToolCall', 'Failed to capture character API request', error);
         }
     });
 
