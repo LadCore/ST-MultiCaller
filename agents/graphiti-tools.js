@@ -202,10 +202,11 @@ async function readJsonResponse(response) {
     return payload ?? {};
 }
 
-async function callGraphiti(path, { method = 'GET', body } = {}) {
+async function callGraphiti(path, { method = 'GET', body, signal = null } = {}) {
     const response = await fetch(`${GRAPHITI_API_URL}${path}`, {
         method,
         cache: 'no-store',
+        signal,
         headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -224,7 +225,7 @@ async function deterministicEpisodeUuid(parameters) {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-async function rememberMemory(parameters) {
+async function rememberMemory(parameters, signal = null) {
     const groupId = String(parameters.group_id ?? '').trim();
     assertValidGroupId(groupId);
     const payload = {
@@ -236,7 +237,35 @@ async function rememberMemory(parameters) {
         source: 'text',
         ...(parameters.reference_time ? { reference_time: String(parameters.reference_time) } : {}),
     };
-    return callGraphiti('/episodes', { method: 'POST', body: payload });
+    return callGraphiti('/episodes', { method: 'POST', body: payload, signal });
+}
+
+export function getLongTermMemoryStatus(signal = null) {
+    return callGraphiti('/health', { signal });
+}
+
+export function searchLongTermMemory({ query, groupIds, count = 8 }, signal = null) {
+    const normalizedGroups = normalizeGroupIds(Array.isArray(groupIds) ? groupIds : String(groupIds ?? '').split(/[\s,]+/));
+    if (!normalizedGroups.length) throw new Error('At least one readable memory group is required.');
+    return callGraphiti('/search', {
+        method: 'POST',
+        signal,
+        body: {
+            query: String(query ?? '').trim(),
+            group_ids: normalizedGroups,
+            num_results: Math.min(50, Math.max(1, Number(count) || 8)),
+        },
+    });
+}
+
+export function ingestLongTermMemoryEpisode({ groupId, name, content, sourceDescription, referenceTime }, signal = null) {
+    return rememberMemory({
+        group_id: groupId,
+        name,
+        content,
+        source_description: sourceDescription,
+        reference_time: referenceTime,
+    }, signal);
 }
 
 async function forgetMemory(parameters) {

@@ -18,9 +18,22 @@ import {
 } from './agents/action-runner.js';
 import {
     buildAgentGraphitiToolRuntime,
+    getLongTermMemoryStatus,
+    ingestLongTermMemoryEpisode,
     isValidGraphitiGroupId,
+    searchLongTermMemory,
 } from './agents/graphiti-tools.js';
 import { runAgentToolConversation } from './agents/tool-call-runner.js';
+import {
+    AGENT_CONNECTION_MODES,
+    AGENT_OWNER_TYPES,
+    CHARACTER_AGENT_CONNECTION_MODES,
+    findCharacterConnection,
+    getAgentOwnerKey,
+    normalizeAgentConnection,
+    normalizeCharacterConnection,
+    resolveAgentConnection,
+} from './agents/connection-routing.js';
 import { CancellationRegistry, isAbortError } from './runtime/cancellation.js';
 import {
     destroyAgentScriptEditor,
@@ -35,8 +48,7 @@ const EXTENSION_DISPLAY_NAME = 'Backstage';
 const EXTENSION_LABEL = 'Backstage';
 const ROUTER_LABEL = 'Turn Router';
 const AGENTS_LABEL = 'Agents';
-const CURRENT_CONFIG_VERSION = 14;
-const DEFAULT_WORLD_CONTEXT_CHARS = 0;
+const CURRENT_CONFIG_VERSION = 15;
 const PROFILE_SWITCH_SETTLE_QUIET_MS = 2000;
 const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
 const PROFILE_SWITCH_SETTLE_EVENT_LIMIT = 12;
@@ -56,20 +68,16 @@ const NATIVE_SETTINGS_STORAGE_VERSION = 1;
 const DEFAULT_ROUTER_PROMPT = `You are the RP Turn Router for a SillyTavern group roleplay.
 
 You are invisible. You never write chat prose. You never narrate the scene.
-Your job is to decide who should speak next and provide a private direction for that character's next turn.
+Your only job is to decide who should speak next.
 
-Use the recent chat, active characters, last speaker, and world context to preserve continuity, pacing, tension, and character agency.
+Use the recent chat, active characters, last speaker, and explicitly referenced agent outputs to preserve continuity and pacing.
 
 Rules:
 - Do not reveal information the selected character could not know.
 - Do not force the user character's actions, thoughts, emotions, or dialogue.
 - Prefer the character with the strongest immediate reason to act.
 - If the scene needs the user to act, return USER as nextSpeaker.
-- If nextSpeaker is USER, direction must be empty or exactly "Wait for the player's input."; scenePressure may describe what is at stake, and avoid must tell NPCs what not to resolve.
 - Never instruct, command, script, or imply the user's next action.
-- If nextSpeaker is a character, direction should be a private playable instruction for that character only.
-- Keep direction specific, short, and playable. Prefer one clear action path; use conditional branches only when uncertainty is the point of the turn.
-- Write avoid as clear prohibitions. Prefer separate "Do not..." clauses and avoid ambiguous wording.
 - Do not summarize all lore. Use only what matters now.
 - Output valid JSON only. No markdown. No prose outside JSON.
 
@@ -82,16 +90,10 @@ Last speaker:
 Recent chat:
 {{recentChat}}
 
-World context:
-{{worldContext}}
-
 Return:
 {
   "nextSpeaker": "name or USER",
-  "reason": "brief internal reason",
-  "direction": "private instruction for the next speaker's next turn",
-  "scenePressure": "what should keep the scene moving",
-  "avoid": "what the next speaker must not do"
+  "reason": "brief internal reason"
 }`;
 
 const ROUTER_OOC_DEFAULT_DRAFT = `OOC
@@ -105,13 +107,14 @@ const DEFAULT_CONFIG = {
     configVersion:     CURRENT_CONFIG_VERSION,
     routerProfileId:   '',
     routerInputTokenBudget: 0,
-    worldContextChars: DEFAULT_WORLD_CONTEXT_CHARS,
+    globalAgentProfileId: '',
+    globalAgentProfileName: '',
     consoleLogLevel:  'debug',
     enabled:           true,
     routerPrompt:      DEFAULT_ROUTER_PROMPT,
     characters: [],
     agents: [],
-    // characters: [{ name, profileId, profileName }]
+    // characters: [{ name, avatar, profileId, profileName, agentProfileMode, agentProfileId, agentProfileName }]
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -129,6 +132,7 @@ let sceneDirectorState = {
     activeTab: 'router',
     routerView: 'workspace',
     agentView: 'workspace',
+    activeAgentOwnerKey: '',
     activeAgentId: '',
     routerStatus: 'idle',
     routerUpdatedAt: null,
@@ -147,6 +151,27 @@ let sceneDirectorState = {
     lastError: '',
     triggerSettle: null,
     operationLogs: [],
+    memoryWorkspace: {
+        groupId: '',
+        sourceDescription: 'Backstage semantic bootstrap',
+        selectedCharacterAvatars: [],
+        selectedLorebooks: [],
+        status: 'idle',
+        completed: 0,
+        total: 0,
+        current: '',
+        error: '',
+        result: '',
+    },
+    evaluationWorkspace: {
+        query: '',
+        groupIds: '',
+        count: 8,
+        status: 'idle',
+        durationMs: 0,
+        result: '',
+        error: '',
+    },
     runtimeTiming: {
         activeKind: '',
         activeLabel: '',
@@ -172,6 +197,7 @@ let pendingAutoRouter = false;
 let pendingNativeCharacterMessage = null;
 const handledCharacterTurnMessages = new WeakSet();
 let activeTriggerSettleMonitor = null;
+let memoryIngestionController = null;
 
 // ================= FLOW LOG =================
 
@@ -191,8 +217,11 @@ function buildNativeRouterAgentConfig() {
             enabled: config.enabled,
             profileId: config.routerProfileId,
             inputTokenBudget: config.routerInputTokenBudget,
-            worldContextChars: config.worldContextChars,
             prompt: config.routerPrompt,
+        },
+        connections: {
+            globalAgentProfileId: config.globalAgentProfileId,
+            globalAgentProfileName: config.globalAgentProfileName,
             characters: structuredClone(config.characters),
         },
         logging: {
@@ -211,7 +240,7 @@ function hasMeaningfulRouterAgentValues(value) {
         || characters.some(character => String(character?.profileId ?? '').trim())
         || (!!String(source.routerPrompt ?? '').trim() && source.routerPrompt !== DEFAULT_ROUTER_PROMPT)
         || Math.max(0, parseInt(source.routerInputTokenBudget) || 0) !== DEFAULT_CONFIG.routerInputTokenBudget
-        || Math.max(0, parseInt(source.worldContextChars) || 0) !== DEFAULT_CONFIG.worldContextChars
+        || !!String(source.globalAgentProfileId ?? '').trim()
         || normalizeLogLevel(source.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel }) !== DEFAULT_CONFIG.consoleLogLevel
         || source.enabled === false;
 }
@@ -223,13 +252,20 @@ function applyNativeRouterAgentConfig(nativeSettings) {
     const logging = nativeSettings?.logging && typeof nativeSettings.logging === 'object'
         ? nativeSettings.logging
         : {};
+    const connections = nativeSettings?.connections && typeof nativeSettings.connections === 'object'
+        ? nativeSettings.connections
+        : {};
 
     config.enabled = router.enabled ?? config.enabled;
     config.routerProfileId = String(router.profileId ?? config.routerProfileId ?? '');
     config.routerInputTokenBudget = Math.max(0, parseInt(router.inputTokenBudget) || 0);
-    config.worldContextChars = Math.max(0, parseInt(router.worldContextChars) || 0);
     config.routerPrompt = String(router.prompt ?? config.routerPrompt ?? DEFAULT_ROUTER_PROMPT);
-    config.characters = Array.isArray(router.characters) ? router.characters : config.characters;
+    config.globalAgentProfileId = String(connections.globalAgentProfileId ?? config.globalAgentProfileId ?? '');
+    config.globalAgentProfileName = String(connections.globalAgentProfileName ?? config.globalAgentProfileName ?? '');
+    const storedCharacters = Array.isArray(connections.characters) ? connections.characters : router.characters;
+    config.characters = Array.isArray(storedCharacters)
+        ? storedCharacters.map(normalizeCharacterConnection)
+        : config.characters;
     config.consoleLogLevel = normalizeLogLevel(logging.level ?? config.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel });
     config.agents = normalizeAgentDefinitions(nativeSettings?.agents);
 }
@@ -268,8 +304,9 @@ function normalizeAgentId(value) {
     return String(value ?? '')
         .trim()
         .toLowerCase()
-        .replace(/[^a-z0-9_-]+/g, '-')
-        .replace(/^-+|-+$/g, '')
+        .replace(/[^a-z0-9_:-]+/g, '-')
+        .replace(/:+/g, ':')
+        .replace(/^[-:]+|[-:]+$/g, '')
         .slice(0, 64);
 }
 
@@ -281,6 +318,70 @@ function createUniqueAgentId(name, agents = config.agents) {
     let suffix = 2;
     while (used.has(`${base}-${suffix}`)) suffix += 1;
     return `${base}-${suffix}`;
+}
+
+function createAgentIdForOwner(name, owner = getActiveAgentOwner()) {
+    const agentPart = normalizeAgentId(name) || 'agent';
+    if (owner?.type !== AGENT_OWNER_TYPES.CHARACTER) {
+        return createUniqueAgentId(agentPart);
+    }
+
+    const ownerPart = normalizeAgentId(owner.label || owner.character?.name) || 'character';
+    return createUniqueAgentId(`${ownerPart}:${agentPart}`);
+}
+
+function replaceAgentIdReference(value, oldId, newId) {
+    const escapedOldId = String(oldId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return String(value ?? '').replace(
+        new RegExp(`{{\\s*agent:${escapedOldId}\\s*}}`, 'gi'),
+        `{{agent:${newId}}}`,
+    );
+}
+
+function renameAgentId(agent, requestedId, ctx = SillyTavern.getContext()) {
+    const oldId = normalizeAgentId(agent?.id);
+    const newId = normalizeAgentId(requestedId);
+    if (!agent || !oldId) return { ok: false, error: 'No agent is selected.' };
+    if (!newId) return { ok: false, error: 'Agent ID cannot be empty.' };
+    if (newId === oldId) return { ok: true, id: oldId };
+    if ((config.agents ?? []).some(item => item !== agent && normalizeAgentId(item.id) === newId)) {
+        return { ok: false, error: `Agent ID "${newId}" is already in use.` };
+    }
+    if (runningAgentIds.has(oldId) || runningAgentActionIds.has(oldId)) {
+        return { ok: false, error: 'Stop this agent before changing its ID.' };
+    }
+
+    const metadata = getAgentMetadata(ctx);
+    if (metadata[oldId]) {
+        metadata[newId] = metadata[oldId];
+        delete metadata[oldId];
+        ctx.saveMetadata?.();
+    }
+
+    for (const definition of config.agents ?? []) {
+        definition.prompt = replaceAgentIdReference(definition.prompt, oldId, newId);
+    }
+    config.routerPrompt = replaceAgentIdReference(config.routerPrompt, oldId, newId);
+    agent.id = newId;
+
+    if (Object.hasOwn(sceneDirectorState.agentOocDrafts ?? {}, oldId)) {
+        sceneDirectorState.agentOocDrafts[newId] = sceneDirectorState.agentOocDrafts[oldId];
+        delete sceneDirectorState.agentOocDrafts[oldId];
+    }
+    if (Object.hasOwn(sceneDirectorState.agentOocHistories ?? {}, oldId)) {
+        sceneDirectorState.agentOocHistories[newId] = sceneDirectorState.agentOocHistories[oldId];
+        delete sceneDirectorState.agentOocHistories[oldId];
+    }
+    sceneDirectorState.operationLogs = (sceneDirectorState.operationLogs ?? []).map(log => log.agentId === oldId
+        ? {
+            ...log,
+            agentId: newId,
+            kind: String(log.kind ?? '').replace(`agent-ooc:${oldId}`, `agent-ooc:${newId}`).replace(`agent:${oldId}`, `agent:${newId}`),
+        }
+        : log);
+    sceneDirectorState.activeAgentId = newId;
+    saveConfig();
+    return { ok: true, id: newId };
 }
 
 function normalizeGraphitiGroupIds(values) {
@@ -305,6 +406,7 @@ function normalizeAgentDefinition(agent, index = 0) {
         ? String(agent.scheduleType)
         : 'manual';
     const injectionPlacement = normalizeAgentInjectionPlacement(agent);
+    const connection = normalizeAgentConnection(agent);
 
     return {
         id: normalizeAgentId(agent?.id) || createUniqueAgentId(name, []),
@@ -312,6 +414,10 @@ function normalizeAgentDefinition(agent, index = 0) {
         enabled: agent?.enabled !== false,
         profileId: String(agent?.profileId ?? ''),
         profileName: String(agent?.profileName ?? ''),
+        ownerType: connection.ownerType,
+        ownerCharacterAvatar: connection.ownerCharacterAvatar,
+        ownerCharacterName: connection.ownerCharacterName,
+        connectionMode: connection.connectionMode,
         prompt: String(agent?.prompt ?? ''),
         scheduleType,
         interval: Math.min(10000, Math.max(1, parseInt(agent?.interval) || 5)),
@@ -321,7 +427,6 @@ function normalizeAgentDefinition(agent, index = 0) {
         worldInfoBooks: Array.isArray(agent?.worldInfoBooks)
             ? agent.worldInfoBooks.map(name => String(name ?? '').trim()).filter(Boolean)
             : [],
-        vectFoxEnabled: agent?.vectFoxEnabled === true,
         graphitiOocEnabled: agent?.graphitiOocEnabled === true || agent?.graphitiToolEnabled === true,
         graphitiAutomaticEnabled: agent?.graphitiAutomaticEnabled === true,
         graphitiReadGroupIds: normalizeGraphitiGroupIds(agent?.graphitiReadGroupIds),
@@ -433,9 +538,7 @@ function migrateConfig() {
             config.routerInputTokenBudget = 0;
         }
         config.routerInputTokenBudget = Math.max(0, parseInt(config.routerInputTokenBudget) || 0);
-        if (config.worldContextChars == null) {
-            config.worldContextChars = DEFAULT_WORLD_CONTEXT_CHARS;
-        }
+        config.characters = (Array.isArray(config.characters) ? config.characters : []).map(normalizeCharacterConnection);
         config.agents = normalizeAgentDefinitions(config.agents);
         delete config.maxTokens;
         config.configVersion = CURRENT_CONFIG_VERSION;
@@ -1431,6 +1534,154 @@ async function getSelectedWorldInfoCatalog(selectedBooks = [], options = {}) {
     }
 }
 
+function buildCharacterMemoryEpisode(character) {
+    const fields = [
+        ['Description', getCharacterCardValue(character, 'description')],
+        ['Personality', getCharacterCardValue(character, 'personality')],
+        ['Scenario', getCharacterCardValue(character, 'scenario')],
+        ['Creator notes', getCharacterCardValue(character, 'creator_notes', 'creatorcomment')],
+    ].filter(([, value]) => value);
+    return {
+        name: `Character card: ${String(character?.name ?? 'Unknown')}`,
+        content: [
+            `Canonical character: ${String(character?.name ?? 'Unknown')}`,
+            ...fields.map(([label, value]) => `${label}:\n${value}`),
+        ].join('\n\n'),
+    };
+}
+
+async function buildLorebookMemoryEpisodes(bookNames) {
+    const wi = await getWorldInfoModule();
+    const available = new Set(getAvailableWorldInfoNames(wi));
+    const episodes = [];
+
+    for (const bookName of Array.isArray(bookNames) ? bookNames : []) {
+        if (!available.has(bookName) || typeof wi.loadWorldInfo !== 'function') continue;
+        const data = await wi.loadWorldInfo(bookName);
+        for (const entry of Object.values(data?.entries ?? {})) {
+            const content = String(entry?.content ?? '').trim();
+            if (!content) continue;
+            const uid = String(entry?.uid ?? '?');
+            const title = String(entry?.comment ?? '').trim() || `UID ${uid}`;
+            const keys = Array.isArray(entry?.key)
+                ? entry.key.map(value => String(value ?? '').trim()).filter(Boolean)
+                : [];
+            episodes.push({
+                name: `Lorebook ${bookName}: ${title}`,
+                content: [
+                    `Lorebook: ${bookName}`,
+                    `Entry: ${title}`,
+                    `UID: ${uid}`,
+                    keys.length ? `Keywords: ${keys.join(', ')}` : '',
+                    content,
+                ].filter(Boolean).join('\n'),
+            });
+        }
+    }
+
+    return episodes;
+}
+
+function captureMemoryWorkspaceFields() {
+    const workspace = sceneDirectorState.memoryWorkspace;
+    if ($('#memory-group-id').length) workspace.groupId = String($('#memory-group-id').val() ?? '').trim();
+    if ($('#memory-source-description').length) workspace.sourceDescription = String($('#memory-source-description').val() ?? '').trim();
+    if ($('#memory-source-characters').length) {
+        workspace.selectedCharacterAvatars = $('#memory-source-characters input:checked').map((_, input) => String(input.value)).get();
+    }
+    if ($('#memory-source-lorebooks').length) {
+        workspace.selectedLorebooks = $('#memory-source-lorebooks input:checked').map((_, input) => String(input.value)).get();
+    }
+}
+
+async function runMemoryIngestion() {
+    captureMemoryWorkspaceFields();
+    const workspace = sceneDirectorState.memoryWorkspace;
+    if (!isValidGraphitiGroupId(workspace.groupId)) throw new Error('Enter a valid destination memory group.');
+    if (memoryIngestionController) throw new Error('A memory ingestion is already running.');
+
+    const ctx = SillyTavern.getContext();
+    const selectedCharacters = (ctx.characters ?? []).filter(character => workspace.selectedCharacterAvatars.includes(String(character?.avatar ?? '')));
+    const episodes = [
+        ...selectedCharacters.map(buildCharacterMemoryEpisode),
+        ...await buildLorebookMemoryEpisodes(workspace.selectedLorebooks),
+    ];
+    if (!episodes.length) throw new Error('Select at least one character card or non-empty lorebook.');
+
+    const logId = beginOperationLog('memory-ingestion', 'Memory ingestion', `${episodes.length} semantic sources`, 'Long-term memory');
+    memoryIngestionController = new AbortController();
+    Object.assign(workspace, { status: 'running', completed: 0, total: episodes.length, current: '', error: '', result: '' });
+    refreshSceneDirectorPanel();
+    const results = [];
+
+    try {
+        for (const episode of episodes) {
+            workspace.current = episode.name;
+            refreshSceneDirectorPanel();
+            const result = await ingestLongTermMemoryEpisode({
+                groupId: workspace.groupId,
+                name: episode.name,
+                content: episode.content,
+                sourceDescription: workspace.sourceDescription || 'Backstage semantic bootstrap',
+            }, memoryIngestionController.signal);
+            results.push({ name: episode.name, result });
+            workspace.completed += 1;
+        }
+        workspace.status = 'success';
+        workspace.current = '';
+        workspace.result = JSON.stringify(results, null, 2);
+        updateOperationLog(logId, { response: workspace.result, detail: `Group: ${workspace.groupId}\nEpisodes: ${episodes.length}` });
+        completeOperationLog(logId, 'success');
+    } catch (error) {
+        const stopped = error?.name === 'AbortError';
+        workspace.status = stopped ? 'stopped' : 'error';
+        workspace.error = stopped ? 'Ingestion stopped by operator.' : (error?.message ?? String(error));
+        updateOperationLog(logId, { error: workspace.error, detail: `Completed ${workspace.completed} of ${workspace.total}` });
+        completeOperationLog(logId, stopped ? 'stopped' : 'error');
+        if (!stopped) throw error;
+    } finally {
+        memoryIngestionController = null;
+        refreshSceneDirectorPanel();
+    }
+}
+
+async function runMemoryEvaluation() {
+    const workspace = sceneDirectorState.evaluationWorkspace;
+    workspace.query = String($('#evaluation-query').val() ?? workspace.query).trim();
+    workspace.groupIds = String($('#evaluation-group-ids').val() ?? workspace.groupIds).trim();
+    workspace.count = Math.min(50, Math.max(1, Number($('#evaluation-count').val()) || workspace.count || 8));
+    if (!workspace.query) throw new Error('Enter a semantic query.');
+
+    const startedAt = performance.now();
+    const logId = beginOperationLog('memory-evaluation', 'RAG retrieval test', workspace.query, 'Long-term memory');
+    updateOperationLog(logId, {
+        request: JSON.stringify({ query: workspace.query, groupIds: workspace.groupIds, count: workspace.count }, null, 2),
+    });
+    Object.assign(workspace, { status: 'running', error: '', result: '' });
+    refreshSceneDirectorPanel();
+    try {
+        const result = await searchLongTermMemory({
+            query: workspace.query,
+            groupIds: workspace.groupIds,
+            count: workspace.count,
+        });
+        workspace.durationMs = performance.now() - startedAt;
+        workspace.result = JSON.stringify(result, null, 2);
+        workspace.status = 'success';
+        updateOperationLog(logId, { response: workspace.result, detail: `Latency: ${formatDurationMs(workspace.durationMs)}` });
+        completeOperationLog(logId, 'success');
+    } catch (error) {
+        workspace.durationMs = performance.now() - startedAt;
+        workspace.error = error?.message ?? String(error);
+        workspace.status = 'error';
+        updateOperationLog(logId, { error: workspace.error, detail: `Latency: ${formatDurationMs(workspace.durationMs)}` });
+        completeOperationLog(logId, 'error');
+        throw error;
+    } finally {
+        refreshSceneDirectorPanel();
+    }
+}
+
 async function testWorldInfoPrompt(caller = 'manual') {
     const ctx = SillyTavern.getContext();
 
@@ -1477,320 +1728,6 @@ async function testWorldInfoPrompt(caller = 'manual') {
     }
 }
 
-// ================= VECTFOX TEST =================
-
-async function getExtensionSettings() {
-    try {
-        const mod = await import('/scripts/extensions.js');
-        return mod.extension_settings ?? window.extension_settings ?? null;
-    } catch (error) {
-        backstageLogger.warn('VectFox', 'Could not import extension settings', error);
-        return window.extension_settings ?? null;
-    }
-}
-
-function getVectFoxSettings(extensionSettings) {
-    return extensionSettings?.vectfox ?? null;
-}
-
-function buildVectFoxRecentMessages(ctx, settings) {
-    const depth = Number(settings?.world_info_query_depth || settings?.query || 3);
-    return [...(ctx.chat ?? [])]
-        .filter(m => !m.is_system && m.extra?.type !== 'tool_call' && m.extra?.type !== 'tool_response')
-        .filter(m => m.mes != null && String(m.mes).trim())
-        .reverse()
-        .slice(0, Math.max(1, depth))
-        .map(m => {
-            const text = String(m.mes ?? '');
-            return typeof ctx.substituteParams === 'function' ? ctx.substituteParams(text) : text;
-        });
-}
-
-function getLastUserMessage(ctx) {
-    const message = [...(ctx.chat ?? [])]
-        .reverse()
-        .find(m => !m.is_system && m.is_user && m.mes != null && String(m.mes).trim());
-
-    return message ? String(message.mes).trim() : null;
-}
-
-function summarizeVectFoxEntries(entries) {
-    if (!Array.isArray(entries)) return [];
-
-    return entries.map(entry => ({
-        world: entry.world ?? entry.worldName ?? entry.sourceWorld ?? '',
-        uid: entry.uid ?? entry.id ?? '',
-        comment: entry.comment ?? entry.title ?? entry.name ?? '',
-        score: entry.score ?? entry.similarity ?? entry.distance ?? '',
-        key: Array.isArray(entry.key) ? entry.key.join(', ') : entry.key ?? '',
-        contentLength: String(entry.content ?? '').length,
-        content: entry.content ?? '',
-    }));
-}
-
-function formatVectFoxLorebookInjection(entries, settings) {
-    if (!Array.isArray(entries) || !entries.length) return '';
-
-    const tag = settings?.lorebook_xml_tag || 'VectFoxLorebook';
-    const blocks = entries
-        .filter(entry => String(entry.content ?? '').trim())
-        .map(entry => {
-            const title = entry.comment || entry.title || entry.name || entry.uid || 'entry';
-            return `### ${title}\n${entry.content}`;
-        });
-
-    if (!blocks.length) return '';
-
-    return `<${tag}>\n${blocks.join('\n\n')}\n</${tag}>`;
-}
-
-function inspectVectFoxExtensionPrompts(ctx) {
-    const prompts = ctx.extensionPrompts ?? {};
-
-    return Object.entries(prompts)
-        .filter(([key, prompt]) => /vectfox|vector|rag|memory/i.test(`${key} ${prompt?.value ?? ''}`))
-        .map(([key, prompt]) => ({
-            key,
-            position: prompt?.position,
-            depth: prompt?.depth,
-            length: String(prompt?.value ?? '').length,
-            value: prompt?.value ?? '',
-        }));
-}
-
-function summarizeVectFoxPrompts(prompts) {
-    if (!Array.isArray(prompts)) return [];
-
-    return prompts.map(prompt => ({
-        key: prompt.key,
-        length: prompt.length,
-        position: prompt.position,
-        depth: prompt.depth,
-        valueStart: String(prompt.value ?? '').slice(0, 300),
-    }));
-}
-
-async function importFirstAvailable(paths) {
-    for (const path of paths) {
-        try {
-            const mod = await import(path);
-            return { mod, path };
-        } catch (_) {
-            // Optional probe: VectFox may not be installed under this path.
-        }
-    }
-
-    return null;
-}
-
-async function runVectFoxLorebookDryRun(ctx, settings) {
-    const imported = await importFirstAvailable([
-        '/scripts/extensions/third-party/VectFox/core/world-info-integration.js',
-        '/scripts/extensions/third-party/vectfox/core/world-info-integration.js',
-    ]);
-
-    if (typeof imported?.mod?.runLorebookWIDryRun !== 'function') {
-        return { importedPath: imported?.path ?? null, result: null };
-    }
-
-    const result = await imported.mod.runLorebookWIDryRun({
-        chat: ctx.chat ?? [],
-        testMessage: getLastUserMessage(ctx),
-        settings,
-    });
-
-    return { importedPath: imported.path, result };
-}
-
-function limitText(text, maxChars) {
-    const value = String(text ?? '');
-    const limit = Math.max(0, Number(maxChars || 0));
-
-    if (limit === 0 || value.length <= limit) return value;
-
-    return `${value.slice(0, limit)}\n\n[Context truncated to ${limit} characters.]`;
-}
-
-async function getVectFoxRouterContext(ctx, options = {}) {
-    const maxChars = options.maxChars == null
-        ? Number(config.worldContextChars || 0)
-        : Math.max(0, Number(options.maxChars || 0));
-    const forceEnabled = options.forceEnabled === true;
-
-    if (!forceEnabled && maxChars <= 0) {
-        return { text: '', source: 'vectfox-skipped-by-config', entryCount: 0, originalLength: 0, truncated: false };
-    }
-
-    try {
-        const extensionSettings = await getExtensionSettings();
-        const settings = getVectFoxSettings(extensionSettings);
-
-        if (!settings?.enabled_world_info) {
-            return { text: '', source: 'vectfox-disabled', entryCount: 0, originalLength: 0 };
-        }
-
-        const dryRun = await runVectFoxLorebookDryRun(ctx, settings);
-        const injectionText = String(dryRun?.result?.injectionText ?? '');
-
-        return {
-            text: limitText(injectionText, maxChars),
-            source: dryRun?.importedPath ?? 'vectfox',
-            entryCount: Number(dryRun?.result?.entryCount ?? 0),
-            originalLength: injectionText.length,
-            truncated: maxChars > 0 && injectionText.length > maxChars,
-        };
-    } catch (error) {
-        backstageLogger.warn('VectFox', 'Failed to get Router context', error);
-        return { text: '', source: 'error', entryCount: 0, originalLength: 0, error };
-    }
-}
-
-function buildVectFoxRuntimeSummary(settings) {
-    const vectFoxWorldInfo = window.VectFox_WorldInfo ?? null;
-
-    return {
-        hasSettings: !!settings,
-        enabled: settings?.enabled,
-        enabledWorldInfo: settings?.enabled_world_info,
-        worldInfoTopK: settings?.world_info_top_k,
-        worldInfoQueryDepth: settings?.world_info_query_depth,
-        lorebookXmlTag: settings?.lorebook_xml_tag,
-        hasVectFoxWorldInfo: !!vectFoxWorldInfo,
-        vectFoxWorldInfoMethods: Object.keys(vectFoxWorldInfo ?? {}),
-        hasRearrangeChat: typeof window.vectfox_rearrangeChat === 'function',
-    };
-}
-
-function buildVectFoxCompactResult(data) {
-    const semanticEntries = Array.isArray(data.semanticEntries) ? data.semanticEntries : [];
-    const dryRunText = data.lorebookDryRun?.result?.injectionText ?? '';
-
-    return {
-        runtime: data.runtime,
-        query: {
-            chatMessages: data.chatMessages,
-            recentMessageCount: data.recentMessages?.length ?? 0,
-            recentMessagesStart: (data.recentMessages ?? []).map(text => String(text ?? '').slice(0, 180)),
-            keywordQuery: String(data.keywordQuery ?? '').slice(0, 300),
-        },
-        dryRun: {
-            importedPath: data.lorebookDryRun?.importedPath ?? null,
-            entryCount: data.lorebookDryRun?.result?.entryCount ?? null,
-            disabled: data.lorebookDryRun?.result?.disabled ?? false,
-            noCollections: data.lorebookDryRun?.result?.noCollections ?? false,
-            injectionLength: String(dryRunText).length,
-            injectionStart: String(dryRunText).slice(0, 1200),
-        },
-        semantic: {
-            count: semanticEntries.length,
-            entries: summarizeVectFoxEntries(semanticEntries).slice(0, 12).map(entry => ({
-                world: entry.world,
-                uid: entry.uid,
-                comment: entry.comment,
-                score: entry.score,
-                key: entry.key,
-                contentLength: entry.contentLength,
-                contentStart: String(entry.content ?? '').slice(0, 260),
-            })),
-            injectionLength: String(data.semanticInjectionText ?? '').length,
-            injectionStart: String(data.semanticInjectionText ?? '').slice(0, 1200),
-        },
-        existingPrompts: summarizeVectFoxPrompts(data.existingPrompts),
-    };
-}
-
-async function testVectFoxPrompt(caller = 'manual', options = {}) {
-    const verbose = options?.verbose === true;
-    const ctx = SillyTavern.getContext();
-    const extensionSettings = await getExtensionSettings();
-    const settings = getVectFoxSettings(extensionSettings);
-    const runtime = buildVectFoxRuntimeSummary(settings);
-    const existingPrompts = inspectVectFoxExtensionPrompts(ctx);
-
-    backstageLogger.info('Test:VectFox', `Test started by ${caller}`);
-    backstageLogger.info('Test:VectFox', 'Runtime', runtime);
-    backstageLogger.debug('Test:VectFox', 'Existing extension prompts summary', summarizeVectFoxPrompts(existingPrompts));
-    if (verbose) backstageLogger.trace('Test:VectFox', 'Existing extension prompts full', existingPrompts);
-
-    if (!settings) {
-        backstageLogger.warn('Test:VectFox', 'extension_settings.vectfox was not found');
-        toastr.warning('VectFox settings nao encontradas. Veja o console.', 'RP Router');
-        return { runtime, existingPrompts };
-    }
-
-    const recentMessages = buildVectFoxRecentMessages(ctx, settings);
-    const keywordQuery = getLastUserMessage(ctx);
-
-    backstageLogger.debug('Test:VectFox', 'Query input', {
-        recentMessageCount: recentMessages.length,
-        recentMessagesStart: recentMessages.map(text => String(text ?? '').slice(0, 180)),
-        keywordQuery,
-        chatMessages: ctx.chat?.length ?? 0,
-        groupId: ctx.groupId,
-        chatId: ctx.chatId,
-    });
-
-    try {
-        let semanticEntries = null;
-        let semanticInjectionText = '';
-
-        if (typeof window.VectFox_WorldInfo?.getSemanticEntries === 'function') {
-            semanticEntries = await window.VectFox_WorldInfo.getSemanticEntries(
-                recentMessages,
-                [],
-                settings,
-                keywordQuery,
-            );
-            semanticInjectionText = formatVectFoxLorebookInjection(semanticEntries, settings);
-
-            const summarizedEntries = summarizeVectFoxEntries(semanticEntries);
-            backstageLogger.info('Test:VectFox', 'Semantic entries', summarizedEntries);
-            backstageLogger.debug('Test:VectFox', 'Semantic injection preview', semanticInjectionText.slice(0, 1200));
-            if (verbose) {
-                backstageLogger.trace('Test:VectFox', 'Semantic entries raw', semanticEntries);
-                backstageLogger.trace('Test:VectFox', 'Semantic injection full', semanticInjectionText);
-            }
-        } else {
-            backstageLogger.warn('Test:VectFox', 'window.VectFox_WorldInfo.getSemanticEntries is unavailable');
-        }
-
-        const lorebookDryRun = await runVectFoxLorebookDryRun(ctx, settings);
-        const compact = buildVectFoxCompactResult({
-            runtime,
-            chatMessages: ctx.chat?.length ?? 0,
-            recentMessages,
-            keywordQuery,
-            semanticEntries,
-            semanticInjectionText,
-            lorebookDryRun,
-            existingPrompts,
-        });
-
-        backstageLogger.info('Test:VectFox', 'Compact result', compact);
-        if (verbose) backstageLogger.trace('Test:VectFox', 'runLorebookWIDryRun full', lorebookDryRun);
-
-        const entryCount = Array.isArray(semanticEntries)
-            ? semanticEntries.length
-            : Number(lorebookDryRun?.result?.entryCount ?? 0);
-
-        toastr.info(`VectFox dry-run: ${entryCount} entradas. Veja o console.`, 'RP Router');
-        return {
-            runtime,
-            recentMessages,
-            keywordQuery,
-            semanticEntries,
-            semanticInjectionText,
-            lorebookDryRun,
-            existingPrompts,
-            compact,
-        };
-    } catch (error) {
-        backstageLogger.error('Test:VectFox', 'Test failed', error);
-        toastr.error('Erro no teste do VectFox. Veja o console.', 'RP Router');
-        return null;
-    }
-}
-
 // ================= ROUTER =================
 
 function renderTemplate(template, values) {
@@ -1813,7 +1750,6 @@ function buildRouterSystemPrompt(routerContext) {
         lastSpeaker: routerContext.lastSpeaker,
         players: routerContext.playerNames,
         recentChat: routerContext.recentChat,
-        worldContext: routerContext.worldContext.text,
         user: routerContext.humanName,
     });
 }
@@ -1986,7 +1922,7 @@ async function fitContextMessagesToInputBudget(profileId, sourceContext, buildMe
         };
     }
 
-    // VectFox is the durable RP summary, so remove raw chat before touching it.
+    // Preserve structured context while determining how much recent chat fits.
     setRecentChatEntries(workingContext, []);
     messages = buildMessagesFn(workingContext);
     inputTokens = await estimateRequestInputTokens(profileId, messages, requestService);
@@ -1995,7 +1931,6 @@ async function fitContextMessagesToInputBudget(profileId, sourceContext, buildMe
     const shrinkers = [
         () => shrinkObjectTextField(workingContext.lorebookCatalog, { ratio: 0.25 }),
         () => shrinkObjectTextField(workingContext.lorebookContext, { ratio: 0.2 }),
-        () => shrinkObjectTextField(workingContext.worldContext, { ratio: 0.2 }),
     ];
 
     for (const shrink of shrinkers) {
@@ -2743,7 +2678,7 @@ function saveAgentRuntimeState(agentId, patch, ctx = SillyTavern.getContext()) {
 
 function getAgentDependencies(template) {
     const dependencies = [];
-    const pattern = /{{\s*agent:([a-zA-Z0-9_-]+)\s*}}/gi;
+    const pattern = /{{\s*agent:([a-zA-Z0-9_:-]+)\s*}}/gi;
     let match;
     while ((match = pattern.exec(String(template ?? ''))) !== null) {
         const id = normalizeAgentId(match[1]);
@@ -2808,7 +2743,7 @@ function getCharacterPersonalityTagReferences(template, ctx = SillyTavern.getCon
 
 function resolveAgentTagsInText(template, ctx = SillyTavern.getContext(), snapshots = null) {
     const values = snapshots instanceof Map ? snapshots : null;
-    const withAgentOutputs = String(template ?? '').replace(/{{\s*agent:([a-zA-Z0-9_-]+)\s*}}/gi, (_match, rawId) => {
+    const withAgentOutputs = String(template ?? '').replace(/{{\s*agent:([a-zA-Z0-9_:-]+)\s*}}/gi, (_match, rawId) => {
         const id = normalizeAgentId(rawId);
         const snapshot = values?.get(id) ?? getAgentOutputSnapshot(id, ctx);
         return snapshot?.output?.trim() || `[No output available for agent:${id}]`;
@@ -2868,16 +2803,7 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
     );
     const characterReference = getAgentCharacterReference(agent, ctx);
     const characterPersonalityReferences = getCharacterPersonalityTagReferences(agent.prompt, ctx);
-    const [worldContext, lorebookContext, lorebookCatalog] = await Promise.all([
-        agent.vectFoxEnabled
-            ? getVectFoxRouterContext(ctx, { forceEnabled: true, maxChars: 0 })
-            : Promise.resolve({
-                text: '',
-                source: 'agent-vectfox-disabled',
-                entryCount: 0,
-                originalLength: 0,
-                truncated: false,
-            }),
+    const [lorebookContext, lorebookCatalog] = await Promise.all([
         routerPromptUsesTag('lorebookContext', agent.prompt)
             ? getSelectedWorldInfoContext(ctx, agent.worldInfoBooks)
             : Promise.resolve({
@@ -2910,7 +2836,6 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
         dependencies: Object.fromEntries(dependencySnapshots),
         characterReference,
         characterPersonalityReferences,
-        worldContext,
         lorebookContext,
         lorebookCatalog,
     };
@@ -2932,17 +2857,6 @@ function buildAgentMessages(agentContext, options = {}) {
         lorebookContext: agentContext.lorebookContext?.text || '[No activated lorebook context]',
         lorebookCatalog: agentContext.lorebookCatalog?.text || '[No selected lorebook catalog]',
     });
-    const vectFoxMessages = agentContext.worldContext?.text
-        ? [{
-            role: 'system',
-            content: `[VECTFOX_CONTEXT]
-This is private retrieved world and roleplay context for the agent's assigned task. Use only relevant information and do not mention this context source.
-
-${agentContext.worldContext.text}
-[/VECTFOX_CONTEXT]`,
-        }]
-        : [];
-
     if (options.mode === 'ooc') {
         const persistedOutputMessage = templateUsesPreviousOutput
             ? []
@@ -2956,7 +2870,6 @@ ${agentContext.previousOutput || '[No previous output]'}
             }];
         return [
             { role: 'system', content: systemPrompt },
-            ...vectFoxMessages,
             ...persistedOutputMessage,
             {
                 role: 'system',
@@ -2969,7 +2882,6 @@ ${agentContext.previousOutput || '[No previous output]'}
 
     return [
         { role: 'system', content: systemPrompt },
-        ...vectFoxMessages,
         {
             role: 'user',
             content: 'Run your assigned task now. Return only the complete updated output for this agent.',
@@ -2991,7 +2903,6 @@ function formatAgentContextForLog(agentContext) {
         dependencies: agentContext.dependencies,
         characterReference: agentContext.characterReference,
         characterPersonalityReferences: agentContext.characterPersonalityReferences,
-        worldContext: agentContext.worldContext,
         lorebookContext: agentContext.lorebookContext,
         lorebookCatalog: agentContext.lorebookCatalog,
     }, null, 2);
@@ -3056,9 +2967,10 @@ async function executeConfiguredAgentAction(agent, rawOutput, trigger, ctx = Sil
     }
 
     const triggerLabel = formatAgentActionTrigger(trigger);
+    const operationName = getAgentOperationDisplayName(agent);
     const operationKind = `agent-action:${agent.id}`;
     const logScope = getAgentLogScope(agent);
-    const logId = beginOperationLog(operationKind, `Agent action: ${agent.name}`, triggerLabel, 'Browser JavaScript');
+    const logId = beginOperationLog(operationKind, `Agent action: ${operationName}`, triggerLabel, 'Browser JavaScript');
     updateOperationLog(logId, {
         agentId: agent.id,
         context: String(agent.actionScript ?? ''),
@@ -3130,7 +3042,7 @@ async function executeConfiguredAgentAction(agent, rawOutput, trigger, ctx = Sil
         sceneDirectorState = {
             ...sceneDirectorState,
             persistentIssue: message,
-            persistentIssueSource: `Agent action: ${agent.name}`,
+            persistentIssueSource: `Agent action: ${operationName}`,
             persistentIssueAt: new Date(),
         };
         refreshSceneDirectorPanel();
@@ -3149,9 +3061,11 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
     const ctx = SillyTavern.getContext();
     const originChatKey = getChatContextKey(ctx);
     const operationKind = `agent:${agent.id}`;
+    const operationName = getAgentOperationDisplayName(agent);
     const logScope = getAgentLogScope(agent);
-    const model = getTimingModelLabel(agent.profileId, agent.profileName);
-    const logId = beginOperationLog(operationKind, `Agent: ${agent.name}`, trigger.label || trigger.type, model);
+    const connection = resolveAgentConnection(agent, config);
+    const model = getTimingModelLabel(connection.profileId, connection.profileName);
+    const logId = beginOperationLog(operationKind, `Agent: ${operationName}`, trigger.label || trigger.type, model);
     updateOperationLog(logId, { agentId: agent.id });
     const cancellation = cancellableOperations.start(`agent:${agent.id}`, {
         logId,
@@ -3167,11 +3081,12 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
     refreshSceneDirectorPanel();
     backstageLogger.info(logScope, 'Execution started', {
         trigger: trigger.label || trigger.type,
-        profile: agent.profileName || agent.profileId || 'not configured',
+        profile: connection.profileName || connection.profileId || 'not configured',
+        connectionSource: connection.source,
     });
 
     try {
-        if (!agent.profileId) throw new Error(`Agent ${agent.name} has no Connection Profile.`);
+        if (!connection.profileId) throw new Error(`Agent ${agent.name} has no resolved Connection Profile (${connection.label}).`);
         if (!agent.prompt.trim()) throw new Error(`Agent ${agent.name} has an empty prompt.`);
         cancellableOperations.assertActive(cancellation);
         sortScheduledAgents([agent.id]);
@@ -3179,7 +3094,7 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         const agentContext = await buildAgentContextSnapshot(agent, trigger, ctx);
         cancellableOperations.assertActive(cancellation);
         const budgetedRequest = await fitContextMessagesToInputBudget(
-            agent.profileId,
+            connection.profileId,
             agentContext,
             buildAgentMessages,
         );
@@ -3191,10 +3106,10 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             inputTokens: budgetedRequest.inputTokens,
             detail: [
                 `Trigger: ${trigger.label || trigger.type}`,
-                `Profile: ${agent.profileName || agent.profileId}`,
+                `Profile: ${connection.profileName || connection.profileId}`,
+                `Connection source: ${connection.label}`,
                 `Dependencies: ${getAgentDependencies(agent.prompt).map(id => `agent:${id}`).join(', ') || 'none'}`,
                 `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
-                `VectFox: ${agent.vectFoxEnabled ? `${budgetedRequest.context?.worldContext?.text?.length ?? 0} chars from ${budgetedRequest.context?.worldContext?.source ?? 'unknown'}` : 'disabled'}`,
                 `Recent RP messages: ${budgetedRequest.context?.recentChatEntries?.length ?? 0}`,
                 `Output validation: ${agent.validateOutputFormat ? 'enabled' : 'disabled'}`,
                 `JavaScript action: ${agent.actionEnabled ? (agent.actionAutoRun ? 'enabled, automatic' : 'enabled, manual') : 'disabled'}`,
@@ -3210,7 +3125,7 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             inputBudget: budgetedRequest.budget,
             trimmed: budgetedRequest.trimmed,
             recentMessages: budgetedRequest.context?.recentChatEntries?.length ?? 0,
-            vectFox: agent.vectFoxEnabled,
+            connectionSource: connection.source,
             lorebooks: agent.worldInfoBooks ?? [],
         });
 
@@ -3219,8 +3134,8 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             appendOperationLogDetail(logId, `Long-term memory tools: ${automaticToolRuntime.summary}`);
         }
         const response = automaticToolRuntime
-            ? await sendAgentToolRequest(agent.profileId, messages, logId, automaticToolRuntime, agent.maxToolRounds, cancellation.controller.signal)
-            : await sendAgentStreamingRequest(agent.profileId, messages, cancellation.controller.signal);
+            ? await sendAgentToolRequest(connection.profileId, messages, logId, automaticToolRuntime, agent.maxToolRounds, cancellation.controller.signal)
+            : await sendAgentStreamingRequest(connection.profileId, messages, cancellation.controller.signal);
         cancellableOperations.assertActive(cancellation);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
@@ -3312,7 +3227,7 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         sceneDirectorState = {
             ...sceneDirectorState,
             persistentIssue: message,
-            persistentIssueSource: `Agent: ${agent.name}`,
+            persistentIssueSource: `Agent: ${operationName}`,
             persistentIssueAt: new Date(),
         };
         refreshSceneDirectorPanel();
@@ -3354,8 +3269,9 @@ function updateAgentOocState(agentId, patch = {}) {
 async function runAgentOocRequest(agentId) {
     const agent = getAgentDefinition(agentId);
     if (!agent) throw new Error(`Agent not found: ${agentId}`);
-    if (!agent.profileId) {
-        toastr.warning(`Configure a Connection Profile for ${agent.name} first.`, EXTENSION_LABEL);
+    const connection = resolveAgentConnection(agent, config);
+    if (!connection.profileId) {
+        toastr.warning(`Configure ${connection.label} for ${agent.name} first.`, EXTENSION_LABEL);
         return null;
     }
     if (runningAgentIds.has(agent.id)) {
@@ -3372,12 +3288,13 @@ async function runAgentOocRequest(agentId) {
     const ctx = SillyTavern.getContext();
     const originChatKey = getChatContextKey(ctx);
     const operationKind = `agent-ooc:${agent.id}`;
+    const operationName = getAgentOperationDisplayName(agent);
     const logScope = getAgentLogScope(agent);
     const logId = beginOperationLog(
         operationKind,
-        `Agent OOC: ${agent.name}`,
+        `Agent OOC: ${operationName}`,
         'Direct agent workspace request',
-        getTimingModelLabel(agent.profileId, agent.profileName),
+        getTimingModelLabel(connection.profileId, connection.profileName),
     );
     updateOperationLog(logId, { agentId: agent.id });
     const cancellation = cancellableOperations.start(`agent:${agent.id}`, {
@@ -3404,7 +3321,7 @@ async function runAgentOocRequest(agentId) {
                 content: String(message?.content ?? ''),
             }));
         const budgetedRequest = await fitContextMessagesToInputBudget(
-            agent.profileId,
+            connection.profileId,
             agentContext,
             currentContext => buildAgentMessages(currentContext, {
                 mode: 'ooc',
@@ -3419,11 +3336,11 @@ async function runAgentOocRequest(agentId) {
             request: formatPromptMessages(messages),
             inputTokens: budgetedRequest.inputTokens,
             detail: [
-                `Profile: ${agent.profileName || agent.profileId}`,
+                `Profile: ${connection.profileName || connection.profileId}`,
+                `Connection source: ${connection.label}`,
                 `History messages: ${priorHistory.length}`,
                 `Persisted output: ${agentContext.previousOutput.length} chars (${routerPromptUsesTag('previousOutput', agent.prompt) ? 'prompt tag' : 'dedicated OOC system message'})`,
                 `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
-                `VectFox: ${agent.vectFoxEnabled ? `${budgetedRequest.context?.worldContext?.text?.length ?? 0} chars from ${budgetedRequest.context?.worldContext?.source ?? 'unknown'}` : 'disabled'}`,
                 `Long-term memory OOC tools: ${agent.graphitiOocEnabled ? 'enabled' : 'disabled'}`,
                 `Tool-call round limit: ${agent.maxToolRounds}`,
                 `Input budget: ${budgetedRequest.budget}`,
@@ -3436,8 +3353,8 @@ async function runAgentOocRequest(agentId) {
             appendOperationLogDetail(logId, `Long-term memory tools: ${oocToolRuntime.summary}`);
         }
         const response = oocToolRuntime
-            ? await sendAgentToolRequest(agent.profileId, messages, logId, oocToolRuntime, agent.maxToolRounds, cancellation.controller.signal)
-            : await sendAgentStreamingRequest(agent.profileId, messages, cancellation.controller.signal);
+            ? await sendAgentToolRequest(connection.profileId, messages, logId, oocToolRuntime, agent.maxToolRounds, cancellation.controller.signal)
+            : await sendAgentStreamingRequest(connection.profileId, messages, cancellation.controller.signal);
         cancellableOperations.assertActive(cancellation);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
         const responseText = stripMarkdownFence(extractResponseText(response));
@@ -3476,7 +3393,7 @@ async function runAgentOocRequest(agentId) {
         sceneDirectorState = {
             ...sceneDirectorState,
             persistentIssue: message,
-            persistentIssueSource: `Agent OOC: ${agent.name}`,
+            persistentIssueSource: `Agent OOC: ${operationName}`,
             persistentIssueAt: new Date(),
         };
         toastr.error(message, EXTENSION_LABEL);
@@ -3653,7 +3570,7 @@ function shouldPersistAgentOutputSnapshot(agentId, now = new Date(), ctx = Silly
 }
 
 function buildAgentOutputSnapshotFileName(agentId, savedAt = new Date()) {
-    const safeAgentId = normalizeAgentId(agentId) || 'agent';
+    const safeAgentId = (normalizeAgentId(agentId) || 'agent').replace(/:/g, '-');
     const stamp = savedAt.toISOString().replace(/[:.]/g, '-');
     const suffix = Math.random().toString(36).slice(2, 8);
     return `backstage-agent-${safeAgentId}-${stamp}-${suffix}.md`;
@@ -3919,23 +3836,12 @@ async function buildRouterContextSnapshot(chatHistory, ctx) {
     const recentChatEntries = routerPromptUsesTag('recentChat')
         ? formatRpContextMessages(realMessages, humanName)
         : [];
-    const worldContext = routerPromptUsesTag('worldContext')
-        ? await getVectFoxRouterContext(ctx)
-        : {
-            text: '',
-            source: 'router-template-tag-not-used',
-            entryCount: 0,
-            originalLength: 0,
-            truncated: false,
-        };
-
     return {
         lastSpeaker,
         playerNames,
         humanName,
         recentChatEntries,
         recentChat: recentChatEntries.join('\n'),
-        worldContext,
     };
 }
 
@@ -4197,11 +4103,6 @@ async function callRouterAgent(chatHistory, cancellation = null) {
     if (cancellation) cancellableOperations.assertActive(cancellation);
     const contextSummary = {
         recentMessages: routerContext.recentChatEntries?.length ?? 0,
-        worldContextSource: routerContext.worldContext.source,
-        worldContextEntries: routerContext.worldContext.entryCount,
-        worldContextOriginalLength: routerContext.worldContext.originalLength,
-        worldContextLength: routerContext.worldContext.text.length,
-        worldContextTruncated: !!routerContext.worldContext.truncated,
         forcedSpeaker: forcedRouterSpeaker || '',
     };
     updateRouterState({
@@ -5045,12 +4946,6 @@ function renderDecisionSummary(decision) {
         <div class="sd-kv"><span>parsed</span><b>${decision.parsed ? 'true' : 'false'}</b></div>
         <label>Reason</label>
         <pre>${escapeHtml(decision.reason || '')}</pre>
-        <label>Direction</label>
-        <pre>${escapeHtml(decision.direction || '')}</pre>
-        <label>Pressure</label>
-        <pre>${escapeHtml(decision.scenePressure || '')}</pre>
-        <label>Avoid</label>
-        <pre>${escapeHtml(decision.avoid || '')}</pre>
     `;
 }
 
@@ -5061,14 +4956,9 @@ function renderContextSummary(context) {
 
     return `
         <div class="sd-kv"><span>recentMessages</span><b>${escapeHtml(context.recentMessages)}</b></div>
-        <div class="sd-kv"><span>VectFox entries</span><b>${escapeHtml(context.worldContextEntries)}</b></div>
-        <div class="sd-kv"><span>world length</span><b>${escapeHtml(context.worldContextLength)}</b></div>
-        <div class="sd-kv"><span>original length</span><b>${escapeHtml(context.worldContextOriginalLength)}</b></div>
-        <div class="sd-kv"><span>truncated</span><b>${context.worldContextTruncated ? 'true' : 'false'}</b></div>
         <div class="sd-kv"><span>input budget</span><b>${escapeHtml(context.inputTokenBudget ?? 0)}</b></div>
         <div class="sd-kv"><span>input tokens</span><b>${escapeHtml(context.inputTokens ?? 0)}</b></div>
         <div class="sd-kv"><span>budget trim</span><b>${context.inputTrimmed ? 'true' : 'false'}</b></div>
-        <div class="sd-source">${escapeHtml(context.worldContextSource || '')}</div>
     `;
 }
 
@@ -5114,11 +5004,41 @@ function formatPromptMessages(messages) {
         .join('\n\n');
 }
 
+function getAgentOwners() {
+    return [
+        { key: AGENT_OWNER_TYPES.GLOBAL, label: 'Global', type: AGENT_OWNER_TYPES.GLOBAL, character: null },
+        ...config.characters.map((character, index) => ({
+            key: `character:${character.avatar || character.name}`,
+            label: character.name,
+            type: AGENT_OWNER_TYPES.CHARACTER,
+            character,
+            characterIndex: index,
+        })),
+    ];
+}
+
+function getActiveAgentOwner() {
+    const owners = getAgentOwners();
+    const selectedAgent = (config.agents ?? []).find(agent => agent.id === sceneDirectorState.activeAgentId);
+    const requestedKey = sceneDirectorState.activeAgentOwnerKey || (selectedAgent ? getAgentOwnerKey(selectedAgent) : '');
+    const owner = owners.find(item => item.key === requestedKey) ?? owners[0];
+    sceneDirectorState.activeAgentOwnerKey = owner.key;
+    return owner;
+}
+
+function getAgentsForOwner(ownerKey = getActiveAgentOwner().key) {
+    return (Array.isArray(config.agents) ? config.agents : [])
+        .filter(agent => getAgentOwnerKey(agent) === ownerKey);
+}
+
 function getSelectedAgent() {
-    const agents = Array.isArray(config.agents) ? config.agents : [];
+    const agents = getAgentsForOwner();
     const selected = agents.find(agent => agent.id === sceneDirectorState.activeAgentId) ?? agents[0] ?? null;
     if (selected && sceneDirectorState.activeAgentId !== selected.id) {
         sceneDirectorState.activeAgentId = selected.id;
+    }
+    if (!selected && sceneDirectorState.activeAgentId) {
+        sceneDirectorState.activeAgentId = '';
     }
     return selected;
 }
@@ -5130,14 +5050,104 @@ function formatAgentSchedule(agent) {
     return `Every ${agent.interval} turns by ${agent.characterName || 'unassigned character'}`;
 }
 
-function renderAgentList(selectedAgent) {
+function renderAgentOwnerOptions(agent = null) {
+    const selectedKey = agent ? getAgentOwnerKey(agent) : AGENT_OWNER_TYPES.GLOBAL;
+    return `
+        <option value="global" ${selectedKey === AGENT_OWNER_TYPES.GLOBAL ? 'selected' : ''}>Global</option>
+        ${config.characters.map(character => {
+            const key = `character:${character.avatar || character.name}`;
+            return `<option value="${escapeHtml(key)}" ${selectedKey === key ? 'selected' : ''}>${escapeHtml(character.name)}</option>`;
+        }).join('')}
+    `;
+}
+
+function getAgentOwnerLabel(agent) {
+    if (agent?.ownerType !== AGENT_OWNER_TYPES.CHARACTER) return 'Global';
+    return findCharacterConnection(agent, config.characters)?.name || agent.ownerCharacterName || 'Unavailable character';
+}
+
+function getAgentOperationDisplayName(agent) {
+    const agentName = String(agent?.name ?? 'Unknown agent').trim() || 'Unknown agent';
+    if (agent?.ownerType !== AGENT_OWNER_TYPES.CHARACTER) return agentName;
+    return `${getAgentOwnerLabel(agent)} / ${agentName}`;
+}
+
+function applyAgentOwnerValue(agent, value) {
+    const raw = String(value ?? 'global');
+    if (!raw.startsWith('character:')) {
+        agent.ownerType = AGENT_OWNER_TYPES.GLOBAL;
+        agent.ownerCharacterAvatar = '';
+        agent.ownerCharacterName = '';
+        return;
+    }
+
+    const identity = raw.slice('character:'.length);
+    const character = config.characters.find(item => String(item.avatar || item.name) === identity);
+    agent.ownerType = AGENT_OWNER_TYPES.CHARACTER;
+    agent.ownerCharacterAvatar = String(character?.avatar ?? '');
+    agent.ownerCharacterName = String(character?.name ?? identity);
+}
+
+function renderAgentOwnerPane(activeOwner) {
     const agents = Array.isArray(config.agents) ? config.agents : [];
+    const owners = getAgentOwners();
+    const connectionContent = activeOwner.type === AGENT_OWNER_TYPES.GLOBAL
+        ? `
+            <label>Agent Connection</label>
+            <select id="global-agent-profile" class="text_pole"></select>
+            <div class="sd-footnote">Default connection for agents in the Global block.</div>
+        `
+        : `
+            <label>Generation Connection</label>
+            <select id="char-generation-profile-${activeOwner.characterIndex}" class="text_pole"></select>
+            <label>Agent Connection</label>
+            <select class="text_pole" data-character-agent-mode="${activeOwner.characterIndex}">
+                <option value="generation" ${activeOwner.character.agentProfileMode === CHARACTER_AGENT_CONNECTION_MODES.GENERATION ? 'selected' : ''}>Inherit Generation Connection</option>
+                <option value="profile" ${activeOwner.character.agentProfileMode === CHARACTER_AGENT_CONNECTION_MODES.PROFILE ? 'selected' : ''}>Use another profile</option>
+            </select>
+            <select id="char-agent-profile-${activeOwner.characterIndex}" class="text_pole ${activeOwner.character.agentProfileMode === CHARACTER_AGENT_CONNECTION_MODES.PROFILE ? '' : 'sd-hidden'}"></select>
+        `;
+
+    return `
+        <aside class="sd-agent-owner-pane">
+            <div class="sd-pane-heading">
+                <div>
+                    <div class="sd-card-title">Owner</div>
+                    <div class="sd-card-subtitle">Choose whose agents you want to manage.</div>
+                </div>
+                <button id="agent-refresh-group" class="menu_button sd-compact-button" title="Refresh active group">Refresh</button>
+            </div>
+            <nav class="sd-agent-owner-list" aria-label="Agent owners">
+                ${owners.map(owner => {
+                    const count = agents.filter(agent => getAgentOwnerKey(agent) === owner.key).length;
+                    return `
+                        <button class="sd-agent-owner-item${owner.key === activeOwner.key ? ' sd-agent-owner-item--active' : ''}" data-agent-owner-key="${escapeHtml(owner.key)}">
+                            <span class="sd-agent-owner-mark">${escapeHtml(owner.type === AGENT_OWNER_TYPES.GLOBAL ? 'G' : String(owner.label || '?').slice(0, 1).toUpperCase())}</span>
+                            <span class="sd-agent-owner-copy">
+                                <b>${escapeHtml(owner.label)}</b>
+                                <small>${owner.type === AGENT_OWNER_TYPES.GLOBAL ? 'Shared agents' : 'Character agents'}</small>
+                            </span>
+                            <span class="sd-agent-count">${count}</span>
+                        </button>
+                    `;
+                }).join('')}
+            </nav>
+            <section class="sd-owner-connection-panel">
+                <div class="sd-owner-connection-title">${escapeHtml(activeOwner.label)} connections</div>
+                ${connectionContent}
+            </section>
+        </aside>
+    `;
+}
+
+function renderAgentList(selectedAgent, activeOwner) {
+    const agents = getAgentsForOwner(activeOwner.key);
     return `
         <aside class="sd-agent-list-pane">
             <div class="sd-agent-list-head">
                 <div>
-                    <div class="sd-card-title">Configured agents</div>
-                    <div class="sd-card-subtitle">Definitions are global; outputs stay with each chat.</div>
+                    <div class="sd-card-title">${escapeHtml(activeOwner.label)} agents</div>
+                    <div class="sd-card-subtitle">Only this owner's agents are shown.</div>
                 </div>
                 <span class="sd-agent-count">${agents.length}</span>
             </div>
@@ -5148,6 +5158,7 @@ function renderAgentList(selectedAgent) {
             <div class="sd-agent-list">
                 ${agents.length ? agents.map(agent => {
                     const runtime = getAgentRuntimeState(agent.id);
+                    const connection = resolveAgentConnection(agent, config);
                     return `
                         <button class="sd-agent-list-item${selectedAgent?.id === agent.id ? ' sd-agent-list-item--active' : ''}" data-agent-id="${escapeHtml(agent.id)}">
                             <span class="sd-agent-list-title-row">
@@ -5156,9 +5167,10 @@ function renderAgentList(selectedAgent) {
                             </span>
                             <span class="sd-agent-list-tag">{{agent:${escapeHtml(agent.id)}}}</span>
                             <span class="sd-agent-list-schedule">${escapeHtml(formatAgentSchedule(agent))}</span>
+                            <span class="sd-agent-list-schedule">${escapeHtml(connection.profileName || connection.label)}</span>
                         </button>
                     `;
-                }).join('') : '<div class="sd-log-empty">No agents configured.</div>'}
+                }).join('') : `<div class="sd-agent-empty-state"><b>No agents for ${escapeHtml(activeOwner.label)}</b><span>Create one above. It will inherit this owner's connection.</span></div>`}
             </div>
         </aside>
     `;
@@ -5435,6 +5447,8 @@ function renderAgentConfigPanel(agent) {
     const inChatPlacement = injectionPlacement.position === AGENT_INJECTION_POSITIONS.IN_CHAT;
     const placementDisabled = injectionEnabled ? '' : 'disabled';
     const depthSettingsDisabled = injectionEnabled && inChatPlacement ? '' : 'disabled';
+    const resolvedConnection = resolveAgentConnection(agent, config);
+    const usesOwnConnection = agent.connectionMode === AGENT_CONNECTION_MODES.PROFILE;
     return `
         <div class="sd-grid sd-grid--double">
             ${renderCard('Agent Settings', 'Identity, connection and execution cadence.', `
@@ -5444,11 +5458,21 @@ function renderAgentConfigPanel(agent) {
                 </label>
                 <label>Name</label>
                 <input id="agent-name" class="text_pole" type="text" maxlength="80" value="${escapeHtml(agent.name)}">
+                <label>Agent ID</label>
+                <input id="agent-id" class="text_pole" type="text" maxlength="64" value="${escapeHtml(agent.id)}">
+                <div class="sd-footnote">Character agents use <code>character:agent</code>. Changing the ID migrates stored output and prompt references.</div>
                 <label>Output tag</label>
                 <input class="text_pole" type="text" readonly value="{{agent:${escapeHtml(agent.id)}}}">
-                <div class="sd-footnote">The ID remains stable when the display name changes.</div>
-                <label>Connection profile</label>
-                <select id="agent-profile-dropdown" class="text_pole"></select>
+                <div class="sd-footnote">The display name can change without changing this tag.</div>
+                <label>Owner block</label>
+                <select id="agent-owner" class="text_pole">${renderAgentOwnerOptions(agent)}</select>
+                <label>Agent Connection</label>
+                <select id="agent-connection-mode" class="text_pole">
+                    <option value="parent" ${usesOwnConnection ? '' : 'selected'}>Inherit from ${escapeHtml(getAgentOwnerLabel(agent))}</option>
+                    <option value="profile" ${usesOwnConnection ? 'selected' : ''}>Use an agent-specific profile</option>
+                </select>
+                <div class="sd-connection-resolution">Resolved: <b>${escapeHtml(resolvedConnection.profileName || resolvedConnection.profileId || 'not configured')}</b> via ${escapeHtml(resolvedConnection.label)}</div>
+                <select id="agent-profile-dropdown" class="text_pole ${usesOwnConnection ? '' : 'sd-hidden'}"></select>
                 <label>Reference character</label>
                 <select id="agent-reference-character" class="text_pole">
                     ${renderAgentReferenceCharacterOptions(agent)}
@@ -5526,12 +5550,7 @@ function renderAgentConfigPanel(agent) {
                 </div>
                 <div class="sd-footnote">Use valid, case-sensitive XML names such as &lt;Mirella&gt; or &lt;Tio_Klarus&gt;. Each destination must appear exactly once in the final OUTPUT FORMAT and response. Tagged section removes only that outer tag; Full output injects the entire validated payload.</div>
             `)}
-            ${renderCard('Knowledge Context', 'Choose VectFox and the lorebooks available to this agent.', `
-                <label class="sd-checkbox-row" for="agent-vectfox-enabled">
-                    <input id="agent-vectfox-enabled" type="checkbox" ${agent.vectFoxEnabled ? 'checked' : ''}>
-                    <span>Include VectFox context in every agent request</span>
-                </label>
-                <div class="sd-footnote">VectFox is sent automatically as a private system message in normal and OOC calls. When disabled, the integration is not called for this agent.</div>
+            ${renderCard('Knowledge Context', 'Configure long-term memory tools and direct lorebook context.', `
                 <label class="sd-checkbox-row" for="agent-graphiti-ooc-enabled">
                     <input id="agent-graphiti-ooc-enabled" type="checkbox" ${agent.graphitiOocEnabled ? 'checked' : ''}>
                     <span>Enable long-term memory (RAG) tools in OOC</span>
@@ -5602,8 +5621,8 @@ function switchAgentView(nextView) {
     content.html(agent
         ? renderAgentViewPanel(agent, view)
         : '<div class="sd-agent-empty"><h4>Create the first agent</h4><p>Give it a name, assign a Connection Profile and write one focused task.</p></div>');
-    const panelBody = document.getElementById('scene-director-panel-body');
-    if (panelBody) panelBody.scrollTop = 0;
+    const contentElement = content.get(0);
+    if (contentElement) contentElement.scrollTop = 0;
 
     if (agent && view === 'config') {
         initAgentProfileDropdown();
@@ -5615,6 +5634,7 @@ function switchAgentView(nextView) {
 }
 
 function renderAgentsWorkspace() {
+    const activeOwner = getActiveAgentOwner();
     const agent = getSelectedAgent();
     const view = ['workspace', 'ooc', 'script', 'config'].includes(sceneDirectorState.agentView)
         ? sceneDirectorState.agentView
@@ -5623,42 +5643,190 @@ function renderAgentsWorkspace() {
     const snapshots = runtime?.snapshots ?? [];
     return `
         <div class="sd-main sd-main--agents">
-            <section class="sd-hero sd-hero--agents">
+            <section class="sd-agent-workspace-header">
                 <div>
-                    <div class="sd-eyebrow">Backstage Module</div>
-                    <h3>${escapeHtml(AGENTS_LABEL)}</h3>
-                    <p>Build focused state agents, schedule their updates and compose their outputs through stable prompt tags.</p>
+                    <div class="sd-eyebrow">${escapeHtml(AGENTS_LABEL)} / ${escapeHtml(activeOwner.label)}</div>
+                    <h3>${agent ? escapeHtml(agent.name) : `No ${escapeHtml(activeOwner.label)} agent selected`}</h3>
                 </div>
-                <div class="sd-hero-meta">
+                <div class="sd-agent-header-actions">
+                    ${agent ? `<span class="sd-agent-tag">{{agent:${escapeHtml(agent.id)}}}</span>` : ''}
                     ${renderStatusBadge(runtime?.lastStatus || 'idle')}
-                    <div class="sd-hero-note">${agent ? escapeHtml(`{{agent:${agent.id}}}`) : 'No selected agent'}</div>
+                    <div class="sd-subnav">
+                        <button class="menu_button sd-subnav-button${view === 'workspace' ? ' sd-subnav-button--active' : ''}" data-agent-view="workspace">Workspace</button>
+                        <button class="menu_button sd-subnav-button${view === 'ooc' ? ' sd-subnav-button--active' : ''}" data-agent-view="ooc">OOC</button>
+                        <button class="menu_button sd-subnav-button${view === 'script' ? ' sd-subnav-button--active' : ''}" data-agent-view="script">Script</button>
+                        <button class="menu_button sd-subnav-button${view === 'config' ? ' sd-subnav-button--active' : ''}" data-agent-view="config">Config</button>
+                    </div>
                 </div>
             </section>
             ${renderPersistentIssueBanner()}
-            <div class="sd-toolbar">
-                ${agent ? `<button id="agent-run" data-agent-workspace-action class="menu_button primary${view === 'workspace' ? '' : ' sd-hidden'}" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Run Now</button>` : ''}
-                ${agent && runningAgentIds.has(agent.id) ? '<button data-agent-stop class="menu_button">Stop</button>' : ''}
-                ${agent?.actionEnabled ? `<button id="agent-run-action" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${runtime?.output && !runningAgentIds.has(agent.id) && !runningAgentActionIds.has(agent.id) ? '' : 'disabled'}>Run Action</button>` : ''}
-                ${agent ? `<button id="agent-copy-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Copy Output</button>` : ''}
-                ${agent ? [0, 1, 2].map(index => `<button data-agent-copy-snapshot="${index}" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${snapshots.length <= index ? 'disabled' : ''} title="${snapshots[index]?.savedAt ? escapeHtml(new Date(snapshots[index].savedAt).toLocaleString()) : 'No snapshot'}">Snapshot ${index + 1}</button>`).join('') : ''}
-                ${agent ? `<button id="agent-clear-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Clear Output</button>` : ''}
-                <div class="sd-subnav">
-                    <button class="menu_button sd-subnav-button${view === 'workspace' ? ' sd-subnav-button--active' : ''}" data-agent-view="workspace">Workspace</button>
-                    <button class="menu_button sd-subnav-button${view === 'ooc' ? ' sd-subnav-button--active' : ''}" data-agent-view="ooc">OOC</button>
-                    <button class="menu_button sd-subnav-button${view === 'script' ? ' sd-subnav-button--active' : ''}" data-agent-view="script">Script</button>
-                    <button class="menu_button sd-subnav-button${view === 'config' ? ' sd-subnav-button--active' : ''}" data-agent-view="config">Config</button>
-                </div>
-            </div>
-            <div class="sd-agent-shell">
-                ${renderAgentList(agent)}
-                <section class="sd-agent-content">
-                    ${agent
-                        ? renderAgentViewPanel(agent, view)
-                        : '<div class="sd-agent-empty"><h4>Create the first agent</h4><p>Give it a name, assign a Connection Profile and write one focused task.</p></div>'}
+            <div class="sd-agent-workbench">
+                ${renderAgentOwnerPane(activeOwner)}
+                ${renderAgentList(agent, activeOwner)}
+                <section class="sd-agent-detail-pane">
+                    <div class="sd-agent-toolbar">
+                        ${agent ? `<button id="agent-run" data-agent-workspace-action class="menu_button primary${view === 'workspace' ? '' : ' sd-hidden'}" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Run Now</button>` : ''}
+                        ${agent && runningAgentIds.has(agent.id) ? '<button data-agent-stop class="menu_button">Stop</button>' : ''}
+                        ${agent?.actionEnabled ? `<button id="agent-run-action" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${runtime?.output && !runningAgentIds.has(agent.id) && !runningAgentActionIds.has(agent.id) ? '' : 'disabled'}>Run Action</button>` : ''}
+                        ${agent ? `<button id="agent-copy-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Copy Output</button>` : ''}
+                        ${agent ? [0, 1, 2].map(index => `<button data-agent-copy-snapshot="${index}" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${snapshots.length <= index ? 'disabled' : ''} title="${snapshots[index]?.savedAt ? escapeHtml(new Date(snapshots[index].savedAt).toLocaleString()) : 'No snapshot'}">Snapshot ${index + 1}</button>`).join('') : ''}
+                        ${agent ? `<button id="agent-clear-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Clear Output</button>` : ''}
+                    </div>
+                    <div class="sd-agent-content">
+                        ${agent
+                            ? renderAgentViewPanel(agent, view)
+                            : `<div class="sd-agent-empty"><h4>No agent in ${escapeHtml(activeOwner.label)}</h4><p>Create one from the middle column to start configuring this owner.</p></div>`}
+                    </div>
                 </section>
             </div>
         </div>
     `;
+}
+
+function renderMemoryWorkspace() {
+    const state = sceneDirectorState.memoryWorkspace;
+    const progress = state.total ? `${state.completed}/${state.total}` : '0/0';
+    return `
+        <div class="sd-main">
+            ${renderPersistentIssueBanner()}
+            <section class="sd-hero">
+                <div>
+                    <div class="sd-eyebrow">Knowledge Operations</div>
+                    <h3>Memory</h3>
+                    <p>Bootstrap semantic memory from canonical character cards and lorebook entries, with an explicit destination and observable progress.</p>
+                </div>
+                <div class="sd-hero-meta">
+                    ${renderStatusBadge(state.status)}
+                    <div class="sd-hero-note">${escapeHtml(progress)} episodes</div>
+                </div>
+            </section>
+            <div class="sd-grid sd-grid--double">
+                ${renderCard('Destination', 'Every selected source is written as an independent semantic episode.', `
+                    <label>Memory group</label>
+                    <input id="memory-group-id" class="text_pole" type="text" value="${escapeHtml(state.groupId)}" placeholder="rp-arifureta-canon">
+                    <label>Source description</label>
+                    <input id="memory-source-description" class="text_pole" type="text" value="${escapeHtml(state.sourceDescription)}">
+                    <div class="sd-inline-actions">
+                        <button id="memory-check-status" class="menu_button">Check RAG</button>
+                        <button id="memory-ingest" class="menu_button primary" ${state.status === 'running' ? 'disabled' : ''}>Ingest selected</button>
+                        ${state.status === 'running' ? '<button id="memory-stop" class="menu_button">Stop</button>' : ''}
+                    </div>
+                    <div class="sd-footnote">Character cards and lorebook entries are separate episodes. Re-running the same unchanged source uses a deterministic idempotency key.</div>
+                `)}
+                ${renderCard('Sources', 'Select the canonical material that belongs in this memory group.', `
+                    <label>Character cards</label>
+                    <div id="memory-source-characters" class="sd-checkbox-list"></div>
+                    <label>Lorebooks</label>
+                    <div id="memory-source-lorebooks" class="sd-checkbox-list"></div>
+                `)}
+            </div>
+            ${renderDisclosure('Ingestion Activity', state.current || 'Latest result and API response.', `
+                <div class="sd-summary-grid">
+                    ${renderStatCard('Status', formatStateLabel(state.status), state.current || 'No active source')}
+                    ${renderStatCard('Completed', String(state.completed), `${state.total} total episodes`)}
+                    ${renderStatCard('Characters', String(state.selectedCharacterAvatars.length), 'Selected cards')}
+                    ${renderStatCard('Lorebooks', String(state.selectedLorebooks.length), 'Selected catalogs')}
+                </div>
+                ${state.error ? renderTokenCountedConsole(state.error, '', 'sd-console--error') : ''}
+                ${state.result ? renderTokenCountedConsole(state.result, '', 'sd-console--tall') : ''}
+            `, { open: state.status === 'running' || state.status === 'error' })}
+        </div>
+    `;
+}
+
+function getAgentOperationMetrics() {
+    const logs = (sceneDirectorState.operationLogs ?? []).filter(log => String(log.kind ?? '').startsWith('agent:'));
+    return config.agents.map(agent => {
+        const rows = logs.filter(log => log.agentId === agent.id && log.status !== 'running');
+        const successes = rows.filter(log => log.status === 'success').length;
+        const durations = rows.map(log => Number(log.durationMs)).filter(Number.isFinite);
+        const tokens = rows.map(log => Number(log.inputTokens)).filter(Number.isFinite);
+        return {
+            agent,
+            runs: rows.length,
+            successRate: rows.length ? Math.round((successes / rows.length) * 100) : 0,
+            averageMs: durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : 0,
+            averageTokens: tokens.length ? tokens.reduce((sum, value) => sum + value, 0) / tokens.length : 0,
+        };
+    });
+}
+
+function renderEvaluationWorkspace() {
+    const state = sceneDirectorState.evaluationWorkspace;
+    const metrics = getAgentOperationMetrics();
+    return `
+        <div class="sd-main">
+            <section class="sd-hero">
+                <div>
+                    <div class="sd-eyebrow">Quality Control</div>
+                    <h3>Evaluation</h3>
+                    <p>Inspect operational agent behavior and run controlled semantic retrieval checks against one or more memory groups.</p>
+                </div>
+                <div class="sd-hero-meta">
+                    ${renderStatusBadge(state.status)}
+                    <div class="sd-hero-note">${state.durationMs ? formatDurationMs(state.durationMs) : 'No retrieval test yet'}</div>
+                </div>
+            </section>
+            ${renderCard('Agent Metrics', 'Session-level execution measurements. Quality evaluation stays centralized so agents remain comparable.', `
+                <div class="sd-metric-table">
+                    <div class="sd-metric-row sd-metric-row--head"><span>Agent</span><span>Owner</span><span>Runs</span><span>Success</span><span>Avg time</span><span>Avg input</span></div>
+                    ${metrics.length ? metrics.map(metric => `
+                        <div class="sd-metric-row">
+                            <span>${escapeHtml(metric.agent.name)}</span>
+                            <span>${escapeHtml(getAgentOwnerLabel(metric.agent))}</span>
+                            <span>${metric.runs}</span>
+                            <span>${metric.runs ? `${metric.successRate}%` : '-'}</span>
+                            <span>${metric.runs ? formatDurationMs(metric.averageMs) : '-'}</span>
+                            <span>${metric.averageTokens ? Math.round(metric.averageTokens).toLocaleString() : '-'}</span>
+                        </div>
+                    `).join('') : '<div class="sd-log-empty">No agents configured.</div>'}
+                </div>
+            `)}
+            <div class="sd-grid sd-grid--double">
+                ${renderCard('Semantic Retrieval Test', 'A direct RAG query without agent prompting or hidden context.', `
+                    <label>Query</label>
+                    <textarea id="evaluation-query" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(state.query)}</textarea>
+                    <label>Readable groups</label>
+                    <textarea id="evaluation-group-ids" class="text_pole" rows="3" spellcheck="false" placeholder="one group per line">${escapeHtml(state.groupIds)}</textarea>
+                    <label>Top K</label>
+                    <input id="evaluation-count" class="text_pole" type="number" min="1" max="50" value="${state.count}">
+                    <button id="evaluation-run" class="menu_button primary" ${state.status === 'running' ? 'disabled' : ''}>Run retrieval</button>
+                `)}
+                ${renderCard('Retrieval Result', 'Raw facts returned by the memory service for inspection.', `
+                    <div class="sd-kv"><span>Status</span><b>${escapeHtml(formatStateLabel(state.status))}</b></div>
+                    <div class="sd-kv"><span>Latency</span><b>${state.durationMs ? escapeHtml(formatDurationMs(state.durationMs)) : '-'}</b></div>
+                    ${state.error ? renderTokenCountedConsole(state.error, '', 'sd-console--error') : ''}
+                    ${renderTokenCountedConsole(state.result, 'No retrieval result yet.', 'sd-console--tall')}
+                `)}
+            </div>
+        </div>
+    `;
+}
+
+async function initMemorySourceSelects() {
+    const state = sceneDirectorState.memoryWorkspace;
+    const characterContainer = $('#memory-source-characters');
+    const lorebookContainer = $('#memory-source-lorebooks');
+    if (characterContainer.length) {
+        characterContainer.html((SillyTavern.getContext().characters ?? [])
+            .filter(character => character?.avatar && character?.name)
+            .sort((left, right) => String(left.name).localeCompare(String(right.name)))
+            .map((character, index) => `<label class="sd-checkbox-row" for="memory-character-${index}">
+                <input id="memory-character-${index}" type="checkbox" value="${escapeHtml(character.avatar)}" ${state.selectedCharacterAvatars.includes(String(character.avatar)) ? 'checked' : ''}>
+                <span>${escapeHtml(character.name)}</span>
+            </label>`).join('') || '<div class="sd-muted">No character cards found.</div>');
+    }
+    if (lorebookContainer.length) {
+        try {
+            const wi = await getWorldInfoModule();
+            lorebookContainer.html(getAvailableWorldInfoNames(wi).map((name, index) => `<label class="sd-checkbox-row" for="memory-lorebook-${index}">
+                <input id="memory-lorebook-${index}" type="checkbox" value="${escapeHtml(name)}" ${state.selectedLorebooks.includes(name) ? 'checked' : ''}>
+                <span>${escapeHtml(name)}</span>
+            </label>`).join('') || '<div class="sd-muted">No lorebooks found.</div>');
+        } catch (error) {
+            lorebookContainer.html(`<div class="sd-console sd-console--error">${escapeHtml(error?.message ?? String(error))}</div>`);
+        }
+    }
 }
 
 function renderWorkspaceNav() {
@@ -5675,6 +5843,16 @@ function renderWorkspaceNav() {
             copy: 'Configure focused agents, schedules, outputs and dependencies.',
         },
         {
+            key: 'memory',
+            title: 'Memory',
+            copy: 'Ingest canonical cards and lorebooks into semantic memory.',
+        },
+        {
+            key: 'evaluation',
+            title: 'Evaluation',
+            copy: 'Compare agent operations and test semantic retrieval.',
+        },
+        {
             key: 'logs',
             title: 'Logs',
             copy: 'Inspect timing, requests, reasoning and failures by operation.',
@@ -5685,7 +5863,7 @@ function renderWorkspaceNav() {
     return `
         <aside class="sd-sidebar">
             <div class="sd-sidebar-title">${escapeHtml(EXTENSION_DISPLAY_NAME)}</div>
-            <div class="sd-sidebar-copy">Turn routing, focused agents and runtime diagnostics.</div>
+            <div class="sd-sidebar-copy">Turn routing, focused agents, semantic memory and quality diagnostics.</div>
             <div class="sd-stage-nav">
                 ${items.map(item => `
                     <button class="sd-stage-link ${sceneDirectorState.activeTab === item.key ? 'sd-stage-link--active' : ''}" data-stage="${item.key}">
@@ -5846,54 +6024,39 @@ function renderLogsWorkspace() {
 function renderRouterWorkspacePanel() {
     const routerResponseText = getRouterWorkspaceResponseText();
     return `
-        <div class="sd-grid">
-            ${renderDisclosure('Router OOC', 'Chamada direta e descartavel para conversar com o router fora do runtime normal.', `
-                <textarea id="router-ooc-request" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(sceneDirectorState.routerOocDraft || ROUTER_OOC_DEFAULT_DRAFT)}</textarea>
-                <div class="sd-inline-actions">
-                    <button id="router-send-ooc" class="menu_button primary">Send OOC</button>
-                    <button id="router-clear-ooc" class="menu_button">Clear Draft</button>
-                </div>
-                <div class="sd-footnote">Usa o perfil do router, envia o contexto atual e mostra a resposta na UI sem disparar personagens.</div>
-            `, { open: true })}
-
-            <div class="sd-grid sd-grid--double">
+        <div class="sd-router-workbench">
+            <div class="sd-router-column">
                 ${renderCard('Latest Decision', 'Parsed result returned by the router.', renderDecisionSummary(sceneDirectorState.lastDecision))}
                 ${renderCard('Context Snapshot', 'What the router used when building the request.', renderContextSummary(sceneDirectorState.lastContext))}
+                ${renderCard('Trigger Settle', 'After a profile switch, Backstage waits for a quiet event window before /trigger.', renderTriggerSettleSummary(sceneDirectorState.triggerSettle))}
             </div>
-
-            ${renderCard('Trigger Settle', 'After a profile switch, Backstage waits for a quiet event window before /trigger.', renderTriggerSettleSummary(sceneDirectorState.triggerSettle))}
-
-
-            ${renderDisclosure('Router Response', 'Resposta direta da ultima chamada OOC ao router ou da ultima execucao capturada.', `
-                ${renderTokenCountedConsole(routerResponseText, 'No router response yet.', 'sd-console--tall')}
-            `)}
+            <div class="sd-router-column sd-router-column--text">
+                ${renderDisclosure('Router OOC', 'Chamada direta e descartavel para conversar com o router fora do runtime normal.', `
+                    <textarea id="router-ooc-request" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(sceneDirectorState.routerOocDraft || ROUTER_OOC_DEFAULT_DRAFT)}</textarea>
+                    <div class="sd-inline-actions">
+                        <button id="router-send-ooc" class="menu_button primary">Send OOC</button>
+                        <button id="router-clear-ooc" class="menu_button">Clear Draft</button>
+                    </div>
+                    <div class="sd-footnote">Usa o perfil do router, envia o contexto atual e mostra a resposta na UI sem disparar personagens.</div>
+                `, { open: true })}
+                ${renderDisclosure('Router Response', 'Resposta direta da ultima chamada OOC ao router ou da ultima execucao capturada.', `
+                    ${renderTokenCountedConsole(routerResponseText, 'No router response yet.', 'sd-console--tall')}
+                `)}
+            </div>
         </div>
     `;
 }
 
-function renderRouterConfigPanel(castCount) {
+function renderRouterConfigPanel() {
     return `
-        <div class="sd-grid sd-grid--double">
-            ${renderCard('Router Settings', 'Connection and context shaping for the turn router.', `
+        <div class="sd-grid">
+            ${renderCard('Router Settings', 'Connection and input budget for speaker selection.', `
                 <label>Connection profile</label>
                 <select id="router-profile-dropdown" class="text_pole"></select>
 
                 <label>Input token budget (0 = connection preset)</label>
                 <input type="number" id="router-input-token-budget" class="text_pole" min="0" max="2000000" step="1000" value="${config.routerInputTokenBudget}">
-                <div class="sd-footnote">The newest RP messages fill the available input after the router prompt and VectFox context.</div>
-
-                <label>VectFox world context chars (0 = disabled)</label>
-                <input type="number" id="router-world-context-chars" class="text_pole" min="0" max="30000" step="500" value="${config.worldContextChars}">
-                <div class="sd-footnote">0 skips the VectFox dry-run entirely. Values above 0 call VectFox and cap the injected text by character count. Output tokens stay under the active connection profile.</div>
-
-            `)}
-            ${renderCard('Cast Routing', 'Map each group member to a connection profile before triggering turns.', `
-                <div class="sd-inline-actions">
-                    <button id="router-load-group-btn" class="menu_button">Refresh Group Members</button>
-                    <span class="sd-muted">Use this after changing the active group.</span>
-                </div>
-                <div id="router-group-members"></div>
-                <div class="sd-footnote">${castCount ? `${castCount} tracked character slots loaded.` : 'No tracked character slots loaded yet.'}</div>
+                <div class="sd-footnote">The newest RP messages fill the available input after the router prompt and explicitly referenced agent outputs.</div>
             `)}
         </div>
         ${renderCard('Router Prompt Template', 'Editable system prompt used by the turn router.', `
@@ -5902,7 +6065,6 @@ function renderRouterConfigPanel(castCount) {
             <div class="sd-template-tags" aria-label="Router template tags">
                 ${[
                     '{{recentChat}}',
-                    '{{worldContext}}',
                     '{{players}}',
                     '{{lastSpeaker}}',
                     '{{user}}',
@@ -5919,7 +6081,7 @@ function renderRouterWorkspace() {
     const routerView = sceneDirectorState.routerView === 'config' ? 'config' : 'workspace';
 
     return `
-        <div class="sd-main">
+        <div class="sd-main sd-main--router">
             <section class="sd-hero sd-hero--router">
                 <div>
                     <div class="sd-eyebrow">Backstage Module</div>
@@ -5937,7 +6099,6 @@ function renderRouterWorkspace() {
                 <button id="scene-director-run" class="menu_button primary">Run Router</button>
                 ${(isProcessing || cancellableOperations.isActive('router')) ? '<button id="scene-director-stop" class="menu_button">Stop</button>' : ''}
                 <button id="scene-director-test-director" class="menu_button">Test Router</button>
-                <button id="scene-director-test-vectfox" class="menu_button">Test VectFox</button>
                 <button id="scene-director-copy-prompt" class="menu_button">Copy Last Request</button>
                 <button id="scene-director-clear-router" class="menu_button">Clear Router Console</button>
             </div>
@@ -5950,13 +6111,15 @@ function renderRouterWorkspace() {
             <div class="sd-summary-grid">
                 ${renderStatCard('Status', formatStateLabel(sceneDirectorState.routerStatus), 'Current router pipeline state')}
                 ${renderStatCard('Updated', formatPanelTime(sceneDirectorState.routerUpdatedAt), 'Last router-related UI refresh')}
-                ${renderStatCard('Tracked Cast', String(castCount), castCount ? 'Character profile slots loaded' : 'Load the group to map profiles')}
+                ${renderStatCard('Tracked Cast', String(castCount), 'Managed from Agent connection groups')}
                 ${renderStatCard('Captured Prompt', sceneDirectorState.lastPromptMessages?.length ? 'Yes' : 'No', 'Latest router request payload')}
             </div>
 
-            ${routerView === 'config'
-                ? renderRouterConfigPanel(castCount)
-                : renderRouterWorkspacePanel()}
+            <div class="sd-router-content${routerView === 'config' ? ' sd-router-content--config' : ''}">
+                ${routerView === 'config'
+                    ? renderRouterConfigPanel()
+                    : renderRouterWorkspacePanel()}
+            </div>
         </div>
     `;
 }
@@ -5992,8 +6155,8 @@ function positionSceneDirectorPanel() {
     const panel = document.getElementById('scene-director-panel');
     if (!panel) return;
 
-    const margin = window.matchMedia('(max-width: 720px)').matches ? 10 : 20;
-    panel.style.top = `${Math.max(0, window.scrollY) + margin}px`;
+    const margin = window.matchMedia('(max-width: 720px)').matches ? 10 : 12;
+    panel.style.top = `${margin}px`;
 }
 
 function refreshSceneDirectorPanel() {
@@ -6017,9 +6180,13 @@ function refreshSceneDirectorPanel() {
     const body = $('#scene-director-panel-body');
     const workspace = sceneDirectorState.activeTab === 'agents'
         ? renderAgentsWorkspace()
-        : sceneDirectorState.activeTab === 'logs'
-            ? renderLogsWorkspace()
-            : renderRouterWorkspace();
+        : sceneDirectorState.activeTab === 'memory'
+            ? renderMemoryWorkspace()
+            : sceneDirectorState.activeTab === 'evaluation'
+                ? renderEvaluationWorkspace()
+                : sceneDirectorState.activeTab === 'logs'
+                    ? renderLogsWorkspace()
+                    : renderRouterWorkspace();
     body.html(`
         <div class="sd-shell">
             ${renderWorkspaceNav()}
@@ -6034,6 +6201,10 @@ function refreshSceneDirectorPanel() {
     $('#scene-director-header-status').html(
         sceneDirectorState.activeTab === 'agents'
             ? renderStatusBadge(selectedAgentStatus)
+            : sceneDirectorState.activeTab === 'memory'
+                ? renderStatusBadge(sceneDirectorState.memoryWorkspace.status)
+                : sceneDirectorState.activeTab === 'evaluation'
+                    ? renderStatusBadge(sceneDirectorState.evaluationWorkspace.status)
             : sceneDirectorState.activeTab === 'logs'
                 ? renderStatusBadge(logErrorCount ? 'error' : (logRunningCount ? 'running' : 'ready'))
                 : renderStatusBadge(sceneDirectorState.routerStatus)
@@ -6042,13 +6213,18 @@ function refreshSceneDirectorPanel() {
     if (sceneDirectorState.activeTab === 'router') {
         if (sceneDirectorState.routerView === 'config') {
             initRouterProfileDropdown();
-            renderGroupMembers();
         }
     } else if (sceneDirectorState.activeTab === 'agents' && sceneDirectorState.agentView === 'config') {
         initAgentProfileDropdown();
         initAgentWorldInfoSelect();
     } else if (sceneDirectorState.activeTab === 'agents' && sceneDirectorState.agentView === 'script' && selectedAgent) {
         initAgentScriptEditor(selectedAgent);
+    }
+
+    if (sceneDirectorState.activeTab === 'agents') {
+        initCharProfileDropdowns();
+    } else if (sceneDirectorState.activeTab === 'memory') {
+        initMemorySourceSelects();
     }
 
     refreshVisiblePromptTokenCounters();
@@ -6142,6 +6318,12 @@ function preserveVisiblePanelDrafts() {
     }
 
     persistAgentPanelFields();
+    captureMemoryWorkspaceFields();
+    if ($('#evaluation-query').length) {
+        sceneDirectorState.evaluationWorkspace.query = String($('#evaluation-query').val() ?? '');
+        sceneDirectorState.evaluationWorkspace.groupIds = String($('#evaluation-group-ids').val() ?? '');
+        sceneDirectorState.evaluationWorkspace.count = Math.min(50, Math.max(1, Number($('#evaluation-count').val()) || 8));
+    }
     destroyAgentScriptEditor();
 }
 
@@ -6175,7 +6357,6 @@ function updateRuntimeTimingUi() {
 
 function persistDirectorPanelFields() {
     const routerInputTokenBudget = $('#router-input-token-budget');
-    const routerWorldContextChars = $('#router-world-context-chars');
     const routerPrompt = $('#router-prompt');
 
     if ($('#router-profile-dropdown').length) {
@@ -6183,9 +6364,6 @@ function persistDirectorPanelFields() {
     }
     if (routerInputTokenBudget.length) {
         config.routerInputTokenBudget = Math.max(0, parseInt(routerInputTokenBudget.val()) || 0);
-    }
-    if (routerWorldContextChars.length) {
-        config.worldContextChars = Math.max(0, parseInt(routerWorldContextChars.val()) || DEFAULT_CONFIG.worldContextChars);
     }
     if (routerPrompt.length) {
         config.routerPrompt = routerPrompt.val();
@@ -6203,6 +6381,12 @@ function persistAgentPanelFields() {
 
     if ($('#agent-enabled').length) agent.enabled = $('#agent-enabled').is(':checked');
     if ($('#agent-name').length) agent.name = String($('#agent-name').val() ?? '').trim() || agent.name;
+    if ($('#agent-owner').length) applyAgentOwnerValue(agent, $('#agent-owner').val());
+    if ($('#agent-connection-mode').length) {
+        agent.connectionMode = $('#agent-connection-mode').val() === AGENT_CONNECTION_MODES.PROFILE
+            ? AGENT_CONNECTION_MODES.PROFILE
+            : AGENT_CONNECTION_MODES.PARENT;
+    }
     if ($('#agent-profile-dropdown').length) agent.profileId = $('#agent-profile-dropdown').val() || agent.profileId;
     if ($('#agent-reference-character').length) {
         const referenceAvatar = String($('#agent-reference-character').val() ?? '');
@@ -6213,9 +6397,6 @@ function persistAgentPanelFields() {
     }
     if ($('#agent-world-info-books').length) {
         agent.worldInfoBooks = getSelectedAgentWorldInfoBooks();
-    }
-    if ($('#agent-vectfox-enabled').length) {
-        agent.vectFoxEnabled = $('#agent-vectfox-enabled').is(':checked');
     }
     if ($('#agent-graphiti-ooc-enabled').length) {
         agent.graphitiOocEnabled = $('#agent-graphiti-ooc-enabled').is(':checked');
@@ -6345,7 +6526,8 @@ function createAgentFromPanel() {
         return null;
     }
 
-    const id = createUniqueAgentId(name);
+    const activeOwner = getActiveAgentOwner();
+    const id = createAgentIdForOwner(name, activeOwner);
     const agent = normalizeAgentDefinition({
         id,
         name,
@@ -6355,6 +6537,7 @@ function createAgentFromPanel() {
         contextMessages: DEFAULT_AGENT_CONTEXT_MESSAGES,
         prompt: `You are ${name}, a focused support agent for an ongoing group roleplay.\n\nTask:\n- Define one narrow responsibility here.\n- Maintain only information relevant to that responsibility.\n- Update the prior state instead of discarding valid facts.\n- Do not narrate the roleplay.\n\nPrevious output:\n{{previousOutput}}\n\nRecent RP context:\n{{recentChat}}`,
     }, config.agents.length);
+    applyAgentOwnerValue(agent, activeOwner.key);
     config.agents.push(agent);
     sceneDirectorState.activeAgentId = agent.id;
     sceneDirectorState.agentView = 'config';
@@ -6371,7 +6554,7 @@ function deleteSelectedAgent() {
     const metadata = getAgentMetadata();
     delete metadata[agent.id];
     SillyTavern.getContext().saveMetadata?.();
-    sceneDirectorState.activeAgentId = config.agents[0]?.id ?? '';
+    sceneDirectorState.activeAgentId = getAgentsForOwner()[0]?.id ?? '';
     saveConfig();
     refreshSceneDirectorPanel();
     return true;
@@ -6445,7 +6628,57 @@ function attachFloatingPanelEvents() {
         preserveVisiblePanelDrafts();
         updateSceneDirectorState({ activeAgentId: String($(this).data('agent-id') ?? '') });
     });
+    $('#scene-director-panel-body').on('click', '[data-agent-owner-key]', function () {
+        preserveVisiblePanelDrafts();
+        const ownerKey = String($(this).data('agent-owner-key') ?? AGENT_OWNER_TYPES.GLOBAL);
+        sceneDirectorState.activeAgentOwnerKey = ownerKey;
+        sceneDirectorState.activeAgentId = getAgentsForOwner(ownerKey)[0]?.id ?? '';
+        refreshSceneDirectorPanel();
+    });
     $('#scene-director-panel-body').on('click', '#agent-create', () => createAgentFromPanel());
+    $('#scene-director-panel-body').on('change', '#memory-source-characters input, #memory-source-lorebooks input', captureMemoryWorkspaceFields);
+    $('#scene-director-panel-body').on('focusout', '#memory-group-id, #memory-source-description', captureMemoryWorkspaceFields);
+    $('#scene-director-panel-body').on('click', '#memory-check-status', async () => {
+        try {
+            const result = await getLongTermMemoryStatus();
+            sceneDirectorState.memoryWorkspace.result = JSON.stringify(result, null, 2);
+            sceneDirectorState.memoryWorkspace.status = 'success';
+            sceneDirectorState.memoryWorkspace.error = '';
+            refreshSceneDirectorPanel();
+        } catch (error) {
+            sceneDirectorState.memoryWorkspace.status = 'error';
+            sceneDirectorState.memoryWorkspace.error = error?.message ?? String(error);
+            refreshSceneDirectorPanel();
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#memory-ingest', async () => {
+        try {
+            await runMemoryIngestion();
+        } catch (error) {
+            toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#memory-stop', () => memoryIngestionController?.abort());
+    $('#scene-director-panel-body').on('click', '#evaluation-run', async () => {
+        try {
+            await runMemoryEvaluation();
+        } catch (error) {
+            toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
+        }
+    });
+    $('#scene-director-panel-body').on('click', '#agent-refresh-group', () => {
+        loadGroupMembers();
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('change', '[data-character-agent-mode]', function () {
+        const index = Number($(this).attr('data-character-agent-mode'));
+        if (!Number.isInteger(index) || !config.characters[index]) return;
+        config.characters[index].agentProfileMode = $(this).val() === CHARACTER_AGENT_CONNECTION_MODES.PROFILE
+            ? CHARACTER_AGENT_CONNECTION_MODES.PROFILE
+            : CHARACTER_AGENT_CONNECTION_MODES.GENERATION;
+        saveConfig();
+        refreshSceneDirectorPanel();
+    });
     $('#scene-director-panel-body').on('keydown', '#agent-new-name', event => {
         if (event.key === 'Enter') {
             event.preventDefault();
@@ -6565,11 +6798,37 @@ function attachFloatingPanelEvents() {
         }
     });
     $('#scene-director-panel-body').on('click', '#agent-delete', () => deleteSelectedAgent());
+    $('#scene-director-panel-body').on('focusout', '#agent-id', function () {
+        const agent = getSelectedAgent();
+        if (!agent) return;
+        const result = renameAgentId(agent, $(this).val());
+        if (!result.ok) {
+            $(this).val(agent.id);
+            toastr.error(result.error, EXTENSION_LABEL);
+            return;
+        }
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('keydown', '#agent-id', function (event) {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        $(this).trigger('blur');
+    });
     $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-max-tool-rounds, #agent-prompt, #agent-output, #agent-injection-depth, #agent-action-test-payload, #agent-graphiti-read-groups, #agent-graphiti-write-group, [data-agent-injection-tag]', () => {
         persistAgentPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-vectfox-enabled, #agent-graphiti-ooc-enabled, #agent-graphiti-automatic-enabled, #agent-log-level, #agent-action-auto-run, [data-agent-graphiti-permission], [data-agent-injection-character]', () => {
+    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-graphiti-ooc-enabled, #agent-graphiti-automatic-enabled, #agent-log-level, #agent-action-auto-run, [data-agent-graphiti-permission], [data-agent-injection-character]', () => {
         persistAgentPanelFields();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-owner, #agent-connection-mode', () => {
+        const selectedAgentId = sceneDirectorState.activeAgentId;
+        persistAgentPanelFields();
+        const agent = (config.agents ?? []).find(item => item.id === selectedAgentId);
+        if (agent && $('#agent-owner').length) {
+            sceneDirectorState.activeAgentOwnerKey = getAgentOwnerKey(agent);
+            sceneDirectorState.activeAgentId = agent.id;
+        }
+        refreshSceneDirectorPanel();
     });
     $('#scene-director-panel-body').on('change', '#agent-action-enabled', () => {
         persistAgentPanelFields();
@@ -6639,9 +6898,6 @@ function attachFloatingPanelEvents() {
             toastr.info(nextSpeaker ? `Next speaker: ${nextSpeaker}` : 'No response returned.', EXTENSION_LABEL);
         }
     });
-    $('#scene-director-panel-body').on('click', '#scene-director-test-vectfox', async () => {
-        await testVectFoxPrompt('floating-panel');
-    });
     $('#scene-director-panel-body').on('click', '#scene-director-copy-prompt', async () => {
         await copyDirectorPromptToClipboard();
     });
@@ -6681,13 +6937,13 @@ function attachFloatingPanelEvents() {
         saveConfig();
         backstageLogger.info('Core', `Console log level changed to ${config.consoleLogLevel}`);
     });
-    $('#scene-director-panel-body').on('focusout', '#router-input-token-budget, #router-world-context-chars, #router-prompt', () => {
+    $('#scene-director-panel-body').on('focusout', '#router-input-token-budget, #router-prompt', () => {
         persistDirectorPanelFields();
     });
     $('#scene-director-panel-body').on('input', '#router-prompt', () => {
         schedulePromptTokenCounterUpdate('router-prompt', 'router-prompt-token-counter');
     });
-    $('#scene-director-panel-body').on('change', '#router-input-token-budget, #router-world-context-chars', () => {
+    $('#scene-director-panel-body').on('change', '#router-input-token-budget', () => {
         persistDirectorPanelFields();
     });
     $('#scene-director-panel-body').on('focusout', '#router-ooc-request', () => {
@@ -6741,56 +6997,26 @@ function renderSettings() {
 function loadGroupMembers() {
     const ctx   = SillyTavern.getContext();
     const group = ctx.groups.find(g => g.id === ctx.groupId);
-    const container = $('#router-group-members');
 
     if (!group) {
-        if (container.length) {
-            container.html('<small style="color:#888;">Nenhum grupo ativo.</small>');
-        }
         return;
     }
 
-    const groupNames = group.members
+    const groupCharacters = group.members
         .map(avatar => ctx.characters.find(c => c.avatar === avatar))
-        .filter(Boolean)
-        .map(c => c.name);
+        .filter(Boolean);
 
     const existing    = config.characters || [];
-    config.characters = groupNames.map(name => {
-        const saved = existing.find(c => c.name === name);
-        return saved ?? { name, profileId: '', profileName: '' };
+    config.characters = groupCharacters.map(character => {
+        const saved = existing.find(item => String(item.avatar ?? '') === String(character.avatar ?? ''))
+            ?? existing.find(item => item.name === character.name);
+        return normalizeCharacterConnection({
+            ...(saved ?? {}),
+            name: character.name,
+            avatar: character.avatar,
+        });
     });
-
-    if (container.length) {
-        renderGroupMembers();
-    }
-}
-
-function renderGroupMembers() {
-    const container = $('#router-group-members');
-    if (!container.length) {
-        return;
-    }
-
-    if (!config.characters.length) {
-        container.html('<small style="color:#888;">Nenhum personagem carregado.</small>');
-        return;
-    }
-
-    const html = config.characters.map((char, idx) => `
-        <div class="char-config-block sd-character-row" data-name="${char.name}" data-idx="${idx}">
-            <div class="sd-character-name">
-                <b>${char.name}</b>
-            </div>
-            <label>Perfil de conexão</label>
-            <select id="char-profile-${idx}" class="char-profile text_pole"></select>
-        </div>
-    `).join('');
-
-    container.html(`<h4>Personagens</h4>${html}`);
-
-    // Inicializa o dropdown de cada personagem após o HTML estar no DOM
-    initCharProfileDropdowns();
+    saveConfig();
 }
 
 async function initRouterProfileDropdown() {
@@ -6824,6 +7050,16 @@ async function initAgentProfileDropdown() {
     );
 }
 
+async function initGlobalAgentProfileDropdown() {
+    if (!$('#global-agent-profile').length) return;
+    const service = await getConnService();
+    service.handleDropdown('#global-agent-profile', config.globalAgentProfileId, profile => {
+        config.globalAgentProfileId = profile?.id ?? '';
+        config.globalAgentProfileName = profile?.name ?? '';
+        saveConfig();
+    });
+}
+
 async function initAgentWorldInfoSelect() {
     const agent = getSelectedAgent();
     const container = $('#agent-world-info-books');
@@ -6853,22 +7089,33 @@ async function initAgentWorldInfoSelect() {
 }
 
 async function initCharProfileDropdowns() {
-    if (!$('#router-group-members').length) return;
+    if (!$('.sd-owner-connection-panel').length) return;
     const service = await getConnService();
     config.characters.forEach((char, idx) => {
-        if (!$(`#char-profile-${idx}`).length) {
-            return;
+        if ($(`#char-generation-profile-${idx}`).length) {
+            service.handleDropdown(
+                `#char-generation-profile-${idx}`,
+                char.profileId,
+                profile => {
+                    config.characters[idx].profileId = profile?.id ?? '';
+                    config.characters[idx].profileName = profile?.name ?? '';
+                    saveConfig();
+                },
+            );
         }
-        service.handleDropdown(
-            `#char-profile-${idx}`,
-            char.profileId,
-            (profile) => {
-                config.characters[idx].profileId   = profile?.id   ?? '';
-                config.characters[idx].profileName = profile?.name ?? '';
-                saveConfig();
-            }
-        );
+        if ($(`#char-agent-profile-${idx}`).length) {
+            service.handleDropdown(
+                `#char-agent-profile-${idx}`,
+                char.agentProfileId,
+                profile => {
+                    config.characters[idx].agentProfileId = profile?.id ?? '';
+                    config.characters[idx].agentProfileName = profile?.name ?? '';
+                    saveConfig();
+                },
+            );
+        }
     });
+    await initGlobalAgentProfileDropdown();
 }
 
 function attachEvents() {
@@ -6877,14 +7124,13 @@ function attachEvents() {
         saveConfig();
         toastr.success(config.enabled ? `${ROUTER_LABEL} enabled.` : `${ROUTER_LABEL} disabled.`, EXTENSION_LABEL);
     });
-
-    $('#scene-director-panel-body').on('click', '#router-load-group-btn', () => loadGroupMembers());
 }
 
 // ================= MAIN =================
 
 jQuery(document).ready(async () => {
     loadConfig();
+    loadGroupMembers();
     renderSettings();
     await renderSceneDirectorPanel();
     attachEvents();
@@ -6922,16 +7168,9 @@ jQuery(document).ready(async () => {
         return '';
     }, [], 'Testa o World Info que seria injetado no prompt');
 
-    ctx.registerSlashCommand?.('routervf', async () => {
-        await testVectFoxPrompt('slash:/routervf');
-        return '';
-    }, [], 'Testa o VectFox que poderia alimentar o router');
-
     window.MultiCaller = {
         ...(window.MultiCaller ?? {}),
         testWorldInfoPrompt,
-        testVectFoxPrompt,
-        testVectFoxPromptVerbose: (caller = 'console') => testVectFoxPrompt(caller, { verbose: true }),
         lastRouterRequest,
         logger: backstageLogger,
     };

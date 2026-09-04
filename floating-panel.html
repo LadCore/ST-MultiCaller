@@ -11,7 +11,7 @@
             <div class="sd-header-copy">
                 <div class="sd-eyebrow">SillyTavern RP Control</div>
                 <div class="sd-title">Backstage</div>
-                <div class="sd-subtitle">Routing, story planning and specialized RP agents in one control room.</div>
+                <div class="sd-subtitle">Routing, specialized agents, semantic memory and evaluation in one control room.</div>
             </div>
             <div class="sd-header-actions">
                 <span id="scene-director-header-status"></span>
@@ -88,20 +88,17 @@
 
     #scene-director-panel {
         position: fixed;
-        top: 20px;
-        right: 28px;
-        width: min(1760px, calc(100vw - 56px));
-        height: min(1040px, calc(100vh - 156px));
+        top: 18px;
+        right: 36px;
+        width: calc(100vw - 72px);
+        height: calc(100vh - 36px);
         display: flex;
         flex-direction: column;
         gap: 14px;
         padding: 16px;
         border: 1px solid var(--sd-border-strong);
-        border-radius: 24px;
-        background:
-            radial-gradient(circle at top right, rgba(99, 194, 141, 0.14), transparent 24%),
-            radial-gradient(circle at left center, rgba(85, 130, 255, 0.1), transparent 28%),
-            var(--sd-bg);
+        border-radius: 10px;
+        background: var(--sd-bg);
         box-shadow: 0 32px 80px rgba(0, 0, 0, 0.52);
         color: var(--SmartThemeBodyColor, #ddd);
         backdrop-filter: blur(18px);
@@ -112,9 +109,14 @@
         display: none;
     }
 
+    #scene-director-panel .sd-hidden {
+        display: none !important;
+    }
+
     #scene-director-panel-body {
+        flex: 1 1 auto;
         min-height: 0;
-        overflow: auto;
+        overflow: hidden;
     }
 
     #scene-director-panel .sd-header,
@@ -169,9 +171,11 @@
 
     #scene-director-panel .sd-shell {
         display: grid;
-        grid-template-columns: 240px minmax(0, 1fr);
+        grid-template-columns: 220px minmax(0, 1fr);
         gap: 16px;
+        height: 100%;
         min-height: 0;
+        overflow: hidden;
     }
 
     #scene-director-panel .sd-sidebar,
@@ -185,8 +189,10 @@
         gap: 14px;
         padding: 18px;
         border: 1px solid var(--sd-border);
-        border-radius: 20px;
-        background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        min-height: 0;
+        overflow-y: auto;
     }
 
     #scene-director-panel .sd-sidebar-title {
@@ -211,9 +217,9 @@
         align-items: flex-start;
         gap: 6px;
         width: 100%;
-        padding: 15px 14px;
+        padding: 12px 13px;
         border: 1px solid var(--sd-border);
-        border-radius: 16px;
+        border-radius: 7px;
         background: rgba(0, 0, 0, 0.12);
         color: inherit;
         text-align: left;
@@ -229,7 +235,7 @@
 
     #scene-director-panel .sd-stage-link--active {
         border-color: rgba(99, 194, 141, 0.4);
-        background: linear-gradient(135deg, rgba(99, 194, 141, 0.18), rgba(255, 255, 255, 0.06));
+        background: rgba(99, 194, 141, 0.14);
         box-shadow: inset 0 0 0 1px rgba(99, 194, 141, 0.1);
     }
 
@@ -262,14 +268,63 @@
     }
 
     #scene-director-panel .sd-stage-copy {
-        color: var(--sd-text-dim);
-        line-height: 1.4;
+        display: none;
     }
 
     #scene-director-panel .sd-main {
         display: flex;
         flex-direction: column;
         gap: 14px;
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 3px;
+    }
+
+    #scene-director-panel .sd-main--agents {
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        overflow: hidden;
+        padding-right: 0;
+    }
+
+    #scene-director-panel .sd-main--router {
+        display: grid;
+        grid-template-rows: repeat(5, auto);
+        align-content: start;
+        overflow-y: auto;
+        padding-right: 3px;
+        scrollbar-gutter: stable;
+    }
+
+    #scene-director-panel .sd-router-content,
+    #scene-director-panel .sd-router-workbench,
+    #scene-director-panel .sd-router-column {
+        min-width: 0;
+        min-height: 0;
+    }
+
+    #scene-director-panel .sd-router-content {
+        overflow: visible;
+    }
+
+    #scene-director-panel .sd-router-content--config {
+        overflow: visible;
+    }
+
+    #scene-director-panel .sd-router-workbench {
+        display: grid;
+        grid-template-columns: minmax(320px, 0.85fr) minmax(460px, 1.4fr);
+        gap: 12px;
+        align-items: start;
+        height: auto;
+        overflow: visible;
+    }
+
+    #scene-director-panel .sd-router-column {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        overflow: visible;
     }
 
     #scene-director-panel .sd-hero {
@@ -279,8 +334,8 @@
         gap: 16px;
         padding: 18px 20px;
         border: 1px solid var(--sd-border);
-        border-radius: 20px;
-        background: linear-gradient(135deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03));
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.05);
     }
 
     #scene-director-panel .sd-hero h3 {
@@ -393,7 +448,7 @@
     #scene-director-panel .sd-stat-card,
     #scene-director-panel .sd-card {
         border: 1px solid var(--sd-border);
-        border-radius: 18px;
+        border-radius: 8px;
         background: var(--sd-card);
     }
 
@@ -621,7 +676,10 @@
     }
 
     #scene-director-panel .sd-log-table {
-        overflow-x: auto;
+        max-height: min(58vh, 620px);
+        overflow: auto;
+        scrollbar-gutter: stable;
+        overscroll-behavior: contain;
     }
 
     #scene-director-panel .sd-log-row {
@@ -641,6 +699,10 @@
     }
 
     #scene-director-panel .sd-log-row--head {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: var(--sd-bg);
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.08em;
@@ -728,28 +790,70 @@
         text-align: center;
     }
 
-    #scene-director-panel .sd-agent-shell {
+    #scene-director-panel .sd-agent-workspace-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        min-height: 54px;
+        padding: 10px 14px;
+        border: 1px solid var(--sd-border);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+    }
+
+    #scene-director-panel .sd-agent-workspace-header h3 {
+        margin: 4px 0 0;
+        font-size: 18px;
+        line-height: 1.15;
+    }
+
+    #scene-director-panel .sd-agent-header-actions,
+    #scene-director-panel .sd-agent-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+
+    #scene-director-panel .sd-agent-tag {
+        max-width: 240px;
+        overflow: hidden;
+        color: var(--sd-text-dim);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: monospace;
+        font-size: 11px;
+    }
+
+    #scene-director-panel .sd-agent-workbench {
         display: grid;
-        grid-template-columns: 230px minmax(0, 1fr);
-        gap: 16px;
-        min-height: 560px;
+        grid-template-columns: minmax(190px, 0.72fr) minmax(220px, 0.9fr) minmax(420px, 2.5fr);
+        gap: 12px;
+        min-height: 0;
+        overflow: hidden;
     }
 
+    #scene-director-panel .sd-agent-owner-pane,
     #scene-director-panel .sd-agent-list-pane,
-    #scene-director-panel .sd-agent-content {
+    #scene-director-panel .sd-agent-detail-pane {
         min-width: 0;
+        min-height: 0;
+        border: 1px solid var(--sd-border);
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.12);
+        overflow: hidden;
     }
 
+    #scene-director-panel .sd-agent-owner-pane,
     #scene-director-panel .sd-agent-list-pane {
         display: flex;
         flex-direction: column;
         gap: 12px;
-        padding: 14px;
-        border: 1px solid var(--sd-border);
-        border-radius: 8px;
-        background: rgba(0, 0, 0, 0.12);
+        padding: 12px;
     }
 
+    #scene-director-panel .sd-pane-heading,
     #scene-director-panel .sd-agent-list-head,
     #scene-director-panel .sd-agent-list-title-row,
     #scene-director-panel .sd-agent-danger-zone {
@@ -757,6 +861,114 @@
         align-items: center;
         justify-content: space-between;
         gap: 12px;
+    }
+
+    #scene-director-panel .sd-compact-button {
+        min-width: 0;
+        padding-inline: 9px;
+        font-size: 11px;
+    }
+
+    #scene-director-panel .sd-agent-owner-list,
+    #scene-director-panel .sd-agent-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-height: 0;
+        overflow-y: auto;
+    }
+
+    #scene-director-panel .sd-agent-owner-list {
+        flex: 1 1 auto;
+    }
+
+    #scene-director-panel .sd-agent-owner-item {
+        display: grid;
+        grid-template-columns: 30px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 9px;
+        width: 100%;
+        padding: 9px;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        text-align: left;
+        cursor: pointer;
+    }
+
+    #scene-director-panel .sd-agent-owner-item:hover {
+        border-color: var(--sd-border);
+        background: rgba(255, 255, 255, 0.04);
+    }
+
+    #scene-director-panel .sd-agent-owner-item--active {
+        border-color: rgba(108, 196, 255, 0.38);
+        background: rgba(108, 196, 255, 0.11);
+    }
+
+    #scene-director-panel .sd-agent-owner-mark {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        border: 1px solid var(--sd-border);
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.06);
+        font-weight: 900;
+    }
+
+    #scene-director-panel .sd-agent-owner-copy {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+    }
+
+    #scene-director-panel .sd-agent-owner-copy b,
+    #scene-director-panel .sd-agent-owner-copy small {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    #scene-director-panel .sd-agent-owner-copy small {
+        margin-top: 2px;
+        color: var(--sd-text-dim);
+        font-size: 10px;
+    }
+
+    #scene-director-panel .sd-owner-connection-panel {
+        flex: 0 0 auto;
+        display: grid;
+        gap: 7px;
+        padding-top: 12px;
+        border-top: 1px solid var(--sd-border);
+    }
+
+    #scene-director-panel .sd-owner-connection-title {
+        font-size: 11px;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+
+    #scene-director-panel .sd-agent-detail-pane {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    #scene-director-panel .sd-agent-toolbar {
+        min-height: 46px;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--sd-border);
+        background: rgba(255, 255, 255, 0.025);
+    }
+
+    #scene-director-panel .sd-agent-content {
+        min-width: 0;
+        min-height: 0;
+        padding: 14px;
+        overflow-y: auto;
     }
 
     #scene-director-panel .sd-agent-count {
@@ -779,12 +991,42 @@
         min-width: 0;
     }
 
-    #scene-director-panel .sd-agent-list {
+    #scene-director-panel .sd-agent-empty-state {
         display: flex;
         flex-direction: column;
-        gap: 6px;
-        min-height: 0;
-        overflow: auto;
+        gap: 5px;
+        padding: 24px 10px;
+        color: var(--sd-text-dim);
+        text-align: center;
+    }
+
+    #scene-director-panel .sd-connection-resolution {
+        margin-top: 8px;
+        padding: 8px 10px;
+        border-left: 3px solid var(--sd-info);
+        background: rgba(108, 196, 255, 0.07);
+        color: var(--sd-text-dim);
+        font-size: 11px;
+    }
+
+    #scene-director-panel .sd-metric-table {
+        overflow-x: auto;
+    }
+
+    #scene-director-panel .sd-metric-row {
+        display: grid;
+        grid-template-columns: minmax(170px, 1.3fr) minmax(120px, 1fr) 70px 80px 90px 90px;
+        gap: 12px;
+        min-width: 760px;
+        padding: 10px 8px;
+        border-top: 1px solid var(--sd-border);
+    }
+
+    #scene-director-panel .sd-metric-row--head {
+        border-top: 0;
+        color: var(--sd-text-dim);
+        font-size: 11px;
+        text-transform: uppercase;
     }
 
     #scene-director-panel .sd-agent-list-item {
@@ -1114,17 +1356,35 @@
 
     @media (max-width: 1050px) {
         #scene-director-panel {
+            right: 18px;
             width: calc(100vw - 36px);
         }
 
-        #scene-director-panel .sd-shell,
         #scene-director-panel .sd-summary-grid,
         #scene-director-panel .sd-grid--double {
             grid-template-columns: 1fr;
         }
 
+        #scene-director-panel .sd-shell {
+            grid-template-columns: 176px minmax(0, 1fr);
+            gap: 10px;
+        }
+
         #scene-director-panel .sd-sidebar {
-            order: 2;
+            padding: 12px;
+        }
+
+        #scene-director-panel .sd-stage-link {
+            padding: 11px 10px;
+        }
+
+        #scene-director-panel .sd-agent-workbench {
+            grid-template-columns: minmax(150px, 0.7fr) minmax(180px, 0.85fr) minmax(300px, 2fr);
+            gap: 8px;
+        }
+
+        #scene-director-panel .sd-router-workbench {
+            grid-template-columns: minmax(260px, 0.8fr) minmax(360px, 1.2fr);
         }
     }
 
@@ -1144,9 +1404,38 @@
         }
 
         #scene-director-panel .sd-header,
-        #scene-director-panel .sd-hero {
+        #scene-director-panel .sd-hero,
+        #scene-director-panel .sd-agent-workspace-header {
             flex-direction: column;
             align-items: stretch;
+        }
+
+        #scene-director-panel .sd-shell {
+            grid-template-columns: 1fr;
+            grid-template-rows: auto minmax(0, 1fr);
+        }
+
+        #scene-director-panel .sd-sidebar {
+            gap: 8px;
+            padding: 8px;
+            overflow: hidden;
+        }
+
+        #scene-director-panel .sd-sidebar-title,
+        #scene-director-panel .sd-sidebar-copy,
+        #scene-director-panel .sd-stage-copy {
+            display: none;
+        }
+
+        #scene-director-panel .sd-stage-nav {
+            flex-direction: row;
+            overflow-x: auto;
+        }
+
+        #scene-director-panel .sd-stage-link {
+            flex: 0 0 auto;
+            min-width: 92px;
+            padding: 8px 10px;
         }
 
         #scene-director-panel .sd-hero-meta {
@@ -1157,13 +1446,34 @@
             grid-template-columns: 1fr;
         }
 
-        #scene-director-panel .sd-agent-shell {
+        #scene-director-panel .sd-agent-workbench {
             grid-template-columns: 1fr;
-            min-height: 0;
+            grid-template-rows: minmax(130px, 0.7fr) minmax(160px, 0.8fr) minmax(260px, 2fr);
+            overflow-y: auto;
         }
 
-        #scene-director-panel .sd-agent-list {
-            max-height: 240px;
+        #scene-director-panel .sd-main--router {
+            overflow-y: auto;
+        }
+
+        #scene-director-panel .sd-router-content {
+            overflow: visible;
+        }
+
+        #scene-director-panel .sd-router-workbench {
+            grid-template-columns: 1fr;
+            height: auto;
+            overflow: visible;
+        }
+
+        #scene-director-panel .sd-router-column {
+            overflow: visible;
+        }
+
+        #scene-director-panel .sd-agent-owner-pane,
+        #scene-director-panel .sd-agent-list-pane,
+        #scene-director-panel .sd-agent-detail-pane {
+            min-height: 0;
         }
 
         #scene-director-panel .sd-agent-injection-target {
