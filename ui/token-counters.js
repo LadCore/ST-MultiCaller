@@ -55,6 +55,7 @@ export function refreshReadOnlyTokenCounters(root, getTokenCountAsync) {
     if (!root) return;
 
     root.querySelectorAll('[data-token-count-container]').forEach(container => {
+        if (!container.getClientRects().length) return;
         const disclosure = container.closest('details');
         if (disclosure && !disclosure.open) return;
 

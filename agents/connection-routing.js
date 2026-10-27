@@ -1,3 +1,5 @@
+import { normalizeSummaryConfig } from '../memory/character-summary.js';
+
 export const AGENT_OWNER_TYPES = Object.freeze({
     GLOBAL: 'global',
     CHARACTER: 'character',
@@ -24,6 +26,7 @@ export function normalizeCharacterConnection(character) {
             : CHARACTER_AGENT_CONNECTION_MODES.GENERATION,
         agentProfileId: String(character?.agentProfileId ?? ''),
         agentProfileName: String(character?.agentProfileName ?? ''),
+        summary: normalizeSummaryConfig(character?.summary),
     };
 }
 

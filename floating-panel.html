@@ -296,6 +296,16 @@
         scrollbar-gutter: stable;
     }
 
+    #scene-director-panel .sd-main--logs,
+    #scene-director-panel .sd-main--memory {
+        scrollbar-gutter: stable;
+    }
+
+    #scene-director-panel .sd-main--logs > *,
+    #scene-director-panel .sd-main--memory > * {
+        flex: 0 0 auto;
+    }
+
     #scene-director-panel .sd-router-content,
     #scene-director-panel .sd-router-workbench,
     #scene-director-panel .sd-router-column {
@@ -676,7 +686,7 @@
     }
 
     #scene-director-panel .sd-log-table {
-        max-height: min(58vh, 620px);
+        max-height: min(60vh, 700px);
         overflow: auto;
         scrollbar-gutter: stable;
         overscroll-behavior: contain;
@@ -782,6 +792,7 @@
     #scene-director-panel .sd-log-detail .sd-console {
         min-height: 0;
         max-height: 360px;
+        overflow: auto;
     }
 
     #scene-director-panel .sd-log-empty {
@@ -1206,7 +1217,7 @@
 
     #scene-director-panel .sd-agent-injection-target {
         display: grid;
-        grid-template-columns: minmax(150px, 1.25fr) minmax(130px, 0.8fr) minmax(120px, 1fr) auto;
+        grid-template-columns: minmax(150px, 1.25fr) minmax(130px, 0.8fr) minmax(120px, 1fr) auto auto;
         gap: 8px;
         align-items: center;
     }
@@ -1485,3 +1496,4 @@
         }
     }
 </style>
+<link rel="stylesheet" href="/scripts/extensions/third-party/MultiCaller/ui/characters.css">

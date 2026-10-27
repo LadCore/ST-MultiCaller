@@ -15,7 +15,7 @@ const TOOL_DEFINITIONS = [
     {
         name: GRAPHITI_TOOL_NAMES.status,
         displayName: 'Backstage Memory Status',
-        description: 'Check whether the Backstage long-term memory service is available. Use this only to diagnose availability or configuration. It does not search, create, change, or delete memories.',
+        description: 'Diagnose memory service availability or configuration when the operator requests it or a memory operation fails. Do not call as a routine prerequisite or follow-up to other memory tools. A successful search or write already confirms availability. Returns service configuration, not RP memories.',
         parameters: {
             type: 'object',
             properties: {},
@@ -27,26 +27,26 @@ const TOOL_DEFINITIONS = [
     {
         name: GRAPHITI_TOOL_NAMES.search,
         displayName: 'Search Backstage Memory',
-        description: 'Search long-term RP memories semantically. Use before relying on an old event, before correcting or deleting memory, and whenever recent context is insufficient. Search only the groups explicitly permitted in the group_ids parameter. Treat facts with invalid_at as historical or superseded, not currently true. Never invent a fact UUID.',
+        description: 'Retrieve missing past RP facts by semantic search. Reuse recent context, persisted output, and results already returned in this run when sufficient. Plan missing topics first: use one focused query per related topic, include relevant permitted groups together, and emit independent searches as tool calls in the same assistant response. Search again only for a specific unresolved information need, not to paraphrase a successful query or confirm a completed write. Stop when the evidence suffices for the assigned task. Empty results mean no match, not proof an event never happened. Returns facts with exact UUIDs, group IDs, and temporal fields; invalidated or expired facts are historical, not current.',
         parameters: {
             type: 'object',
             properties: {
                 query: {
                     type: 'string',
-                    description: 'Focused semantic question describing the event, belief, relationship, place, or fact to recall.',
+                    description: 'A focused information need naming the relevant characters and event, relationship, or period. Combine closely related questions about that topic. For example: "What did Mirella witness about Aiko during the escape from Mills?" Do not repeat an answered question with different wording.',
                 },
                 group_ids: {
                     type: 'array',
                     items: { type: 'string' },
                     minItems: 1,
-                    description: 'Exact memory groups to search. Use only group IDs listed as permitted in this description.',
+                    description: 'All permitted groups relevant to this query, searched together in one call. Do not make a separate call per group for the same question. Use only the exact group IDs listed as permitted.',
                 },
                 num_results: {
                     type: 'integer',
                     minimum: 1,
                     maximum: 50,
                     default: 10,
-                    description: 'Maximum number of matching facts to return.',
+                    description: 'Maximum matching facts. Default 10 suits a focused question; request more, up to 50, when the task needs a broader history instead of repeating the same query with gradually larger limits. Fewer than requested is a valid result.',
                 },
             },
             required: ['query', 'group_ids'],
@@ -65,7 +65,7 @@ const TOOL_DEFINITIONS = [
     {
         name: GRAPHITI_TOOL_NAMES.remember,
         displayName: 'Remember in Backstage Memory',
-        description: 'Store a new durable RP memory in long-term memory. Use for events, discoveries, decisions, relationships, persistent beliefs, injuries, promises, and other information likely to matter later. Do not store transient prose, momentary chain-of-thought, writing instructions, future plans, or facts the perspective character could not know. A later event that changes an earlier belief is a new memory, not a correction.',
+        description: 'Store new durable RP events, discoveries, decisions, relationships, persistent beliefs, injuries, or promises. Group related facts from the same event or RP interval into one coherent episode rather than one call per fact. Reuse available context and previous search results; search first only when missing history is needed to distinguish new information from an existing memory. Do not rewrite memories already stored in this run. Do not store transient prose, momentary chain-of-thought, writing instructions, future plans, or facts the perspective character could not know. A later development is a new memory, not a correction. Success returns episode_uuid, group_id, entity_count, and fact_count: the write completed, so do not search or write again merely to verify it.',
         parameters: {
             type: 'object',
             properties: {
@@ -79,7 +79,7 @@ const TOOL_DEFINITIONS = [
                 },
                 content: {
                     type: 'string',
-                    description: 'Compact durable memory written from the required epistemic perspective. State who knows, believes, witnessed, inferred, or remains uncertain when relevant.',
+                    description: 'One coherent event or RP interval containing its related durable facts, using the required perspective and voice. State who knows, believes, witnessed, inferred, or remains uncertain. Preserve distinct events and their order; omit facts already stored unless new information changes them.',
                 },
                 source_description: {
                     type: 'string',
@@ -93,13 +93,13 @@ const TOOL_DEFINITIONS = [
             required: ['group_id', 'name', 'content'],
             additionalProperties: false,
         },
-        action: rememberMemory,
+        action: async parameters => summarizeMemoryWrite(await rememberMemory(parameters)),
         formatMessage: parameters => `Writing long-term memory: ${String(parameters?.name ?? '').trim()}`,
     },
     {
         name: GRAPHITI_TOOL_NAMES.correct,
         displayName: 'Correct Backstage Memory',
-        description: 'Correct a fact that was inaccurate from the moment it was recorded. Always call the memory search tool first and use the exact fact_uuid and group_id returned by it. Do not use when the world changed later or a character learned new information; store that later development with the remember tool instead. This operation invalidates the inaccurate fact and records an authoritative correction.',
+        description: 'Replace a fact that was inaccurate when recorded. Use the exact fact UUID and group ID from a search result already available in this run; search first only if that evidence is missing. Never invent identifiers. A later world change or newly learned information belongs in remember instead. Success invalidates the inaccurate fact and records its correction; use the returned result without a confirmation search or repeated correction.',
         parameters: {
             type: 'object',
             properties: {
@@ -141,7 +141,7 @@ const TOOL_DEFINITIONS = [
     {
         name: GRAPHITI_TOOL_NAMES.forget,
         displayName: 'Forget Backstage Memory',
-        description: 'Permanently delete an incorrectly stored fact, episode, or entire memory group. This is destructive administration, not normal story evolution. Always search or inspect first. Use only when the user explicitly asks to remove data. Prefer correction when a false fact should be replaced, and prefer remember when later events changed what was true.',
+        description: 'Permanently delete a fact, episode, or entire group only when the operator explicitly requests removal. Reuse exact identifiers and ownership from results already available in this run; search or inspect only if needed to identify the requested target. Never guess UUIDs or delete memories because of normal story evolution. Use correct for an originally false fact and remember for a later development. A successful deletion is final; no confirmation search or repeated deletion is needed.',
         parameters: {
             type: 'object',
             properties: {
@@ -223,6 +223,15 @@ async function deterministicEpisodeUuid(parameters) {
     const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
     const hex = Array.from(new Uint8Array(bytes), value => value.toString(16).padStart(2, '0')).join('');
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function summarizeMemoryWrite(result) {
+    return {
+        episode_uuid: result.episode_uuid,
+        group_id: result.group_id,
+        entity_count: result.entities?.length ?? 0,
+        fact_count: result.facts?.length ?? 0,
+    };
 }
 
 async function rememberMemory(parameters, signal = null) {

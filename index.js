@@ -35,6 +35,15 @@ import {
     resolveAgentConnection,
 } from './agents/connection-routing.js';
 import { CancellationRegistry, isAbortError } from './runtime/cancellation.js';
+import { getSectionSelection, mountSectionTabs, nestAgentSectionNavigation } from './ui/section-tabs.js';
+import { formatAgentMessages, selectRpMessages, normalizeContextMessageOffset, sliceChatBeforeOffset } from './agents/rp-context.js';
+import { getRegexedString, regex_placement } from '/scripts/extensions/regex/engine.js';
+import { createSummaryCreation, DEFAULT_SUMMARY_CREATION_PROMPT, SUMMARY_CREATION_TYPE } from './memory/summary-creation.js';
+import { buildSummaryInjection, fetchCharacterSummary, saveCharacterSummary } from './memory/character-summary.js';
+import { createMemoryReinforcement } from './memory/reinforcement-runner.js';
+import { createMemoryReinforcementLogger } from './logging/memory-reinforcement.js';
+import { createCharacterSummaryPanel } from './ui/character-summary.js';
+import { destroyTextEditors, flushTextEditors, mountTextEditors } from './ui/text-editors.js';
 import {
     destroyAgentScriptEditor,
     getAgentScriptEditorValue,
@@ -47,7 +56,6 @@ const EXTENSION_NAME = 'MultiCaller';
 const EXTENSION_DISPLAY_NAME = 'Backstage';
 const EXTENSION_LABEL = 'Backstage';
 const ROUTER_LABEL = 'Turn Router';
-const AGENTS_LABEL = 'Agents';
 const CURRENT_CONFIG_VERSION = 15;
 const PROFILE_SWITCH_SETTLE_QUIET_MS = 2000;
 const PROFILE_SWITCH_SETTLE_MAX_WAIT_MS = 12000;
@@ -58,7 +66,7 @@ const MAX_OPERATION_LOGS = 100;
 const DEFAULT_AGENT_CONTEXT_MESSAGES = 100;
 const DEFAULT_AGENT_MAX_TOOL_ROUNDS = 16;
 const MAX_AGENT_TOOL_ROUNDS = 64;
-const AGENT_SCHEDULE_TYPES = new Set(['manual', 'user-turns', 'total-turns', 'character-turns']);
+const AGENT_SCHEDULE_TYPES = new Set(['manual', 'user-turns', 'total-turns', 'character-turns', 'before-character']);
 const GRAPHITI_PERMISSION_TYPES = new Set(['search', 'remember', 'correct', 'forget']);
 const LOCAL_CONFIG_STORAGE_KEY = `st_${EXTENSION_NAME}_settings`;
 const LEGACY_CONFIG_BACKUP_KEY = `${LOCAL_CONFIG_STORAGE_KEY}_legacy_backup`;
@@ -110,6 +118,7 @@ const DEFAULT_CONFIG = {
     globalAgentProfileId: '',
     globalAgentProfileName: '',
     consoleLogLevel:  'debug',
+    memorySearchLogs: true,
     enabled:           true,
     routerPrompt:      DEFAULT_ROUTER_PROMPT,
     characters: [],
@@ -132,6 +141,8 @@ let sceneDirectorState = {
     activeTab: 'router',
     routerView: 'workspace',
     agentView: 'workspace',
+    characterView: 'agents',
+    characterConnectionsOpen: false,
     activeAgentOwnerKey: '',
     activeAgentId: '',
     routerStatus: 'idle',
@@ -198,6 +209,7 @@ let pendingNativeCharacterMessage = null;
 const handledCharacterTurnMessages = new WeakSet();
 let activeTriggerSettleMonitor = null;
 let memoryIngestionController = null;
+let routerPromptSaveTimer = null;
 
 // ================= FLOW LOG =================
 
@@ -213,6 +225,7 @@ function fl(direction, method, detail = '') {
 function buildNativeRouterAgentConfig() {
     return {
         storageVersion: NATIVE_SETTINGS_STORAGE_VERSION,
+        configVersion: CURRENT_CONFIG_VERSION,
         router: {
             enabled: config.enabled,
             profileId: config.routerProfileId,
@@ -226,6 +239,7 @@ function buildNativeRouterAgentConfig() {
         },
         logging: {
             level: config.consoleLogLevel,
+            memorySearches: config.memorySearchLogs !== false,
         },
         agents: structuredClone(config.agents),
     };
@@ -237,11 +251,12 @@ function hasMeaningfulRouterAgentValues(value) {
     const characters = Array.isArray(source.characters) ? source.characters : [];
     return agents.length > 0
         || !!String(source.routerProfileId ?? '').trim()
-        || characters.some(character => String(character?.profileId ?? '').trim())
+        || characters.some(character => String(character?.profileId ?? '').trim() || character?.summary?.namespace)
         || (!!String(source.routerPrompt ?? '').trim() && source.routerPrompt !== DEFAULT_ROUTER_PROMPT)
         || Math.max(0, parseInt(source.routerInputTokenBudget) || 0) !== DEFAULT_CONFIG.routerInputTokenBudget
         || !!String(source.globalAgentProfileId ?? '').trim()
         || normalizeLogLevel(source.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel }) !== DEFAULT_CONFIG.consoleLogLevel
+        || source.memorySearchLogs === false
         || source.enabled === false;
 }
 
@@ -256,6 +271,7 @@ function applyNativeRouterAgentConfig(nativeSettings) {
         ? nativeSettings.connections
         : {};
 
+    config.configVersion = CURRENT_CONFIG_VERSION;
     config.enabled = router.enabled ?? config.enabled;
     config.routerProfileId = String(router.profileId ?? config.routerProfileId ?? '');
     config.routerInputTokenBudget = Math.max(0, parseInt(router.inputTokenBudget) || 0);
@@ -267,6 +283,7 @@ function applyNativeRouterAgentConfig(nativeSettings) {
         ? storedCharacters.map(normalizeCharacterConnection)
         : config.characters;
     config.consoleLogLevel = normalizeLogLevel(logging.level ?? config.consoleLogLevel, { fallback: DEFAULT_CONFIG.consoleLogLevel });
+    config.memorySearchLogs = logging.memorySearches ?? config.memorySearchLogs ?? true;
     config.agents = normalizeAgentDefinitions(nativeSettings?.agents);
 }
 
@@ -401,6 +418,7 @@ function normalizeGraphitiPermissions(values, defaults = []) {
 }
 
 function normalizeAgentDefinition(agent, index = 0) {
+    const internal = agent?.internalType === SUMMARY_CREATION_TYPE;
     const name = String(agent?.name ?? `Agent ${index + 1}`).trim() || `Agent ${index + 1}`;
     const scheduleType = AGENT_SCHEDULE_TYPES.has(String(agent?.scheduleType ?? 'manual'))
         ? String(agent.scheduleType)
@@ -411,6 +429,8 @@ function normalizeAgentDefinition(agent, index = 0) {
     return {
         id: normalizeAgentId(agent?.id) || createUniqueAgentId(name, []),
         name,
+        internalType: internal ? SUMMARY_CREATION_TYPE : '',
+        displayOrder: Number.isFinite(agent?.displayOrder) ? agent.displayOrder : 0,
         enabled: agent?.enabled !== false,
         profileId: String(agent?.profileId ?? ''),
         profileName: String(agent?.profileName ?? ''),
@@ -419,6 +439,8 @@ function normalizeAgentDefinition(agent, index = 0) {
         ownerCharacterName: connection.ownerCharacterName,
         connectionMode: connection.connectionMode,
         prompt: String(agent?.prompt ?? ''),
+        includeHiddenMessages: agent?.includeHiddenMessages === true,
+        applyPromptRegex: agent?.applyPromptRegex === true,
         scheduleType,
         interval: Math.min(10000, Math.max(1, parseInt(agent?.interval) || 5)),
         characterName: String(agent?.characterName ?? '').trim(),
@@ -427,8 +449,8 @@ function normalizeAgentDefinition(agent, index = 0) {
         worldInfoBooks: Array.isArray(agent?.worldInfoBooks)
             ? agent.worldInfoBooks.map(name => String(name ?? '').trim()).filter(Boolean)
             : [],
-        graphitiOocEnabled: agent?.graphitiOocEnabled === true || agent?.graphitiToolEnabled === true,
-        graphitiAutomaticEnabled: agent?.graphitiAutomaticEnabled === true,
+        graphitiOocEnabled: !internal && (agent?.graphitiOocEnabled === true || agent?.graphitiToolEnabled === true),
+        graphitiAutomaticEnabled: !internal && agent?.graphitiAutomaticEnabled === true,
         graphitiReadGroupIds: normalizeGraphitiGroupIds(agent?.graphitiReadGroupIds),
         graphitiWriteGroupId: isValidGraphitiGroupId(agent?.graphitiWriteGroupId)
             ? String(agent.graphitiWriteGroupId).trim()
@@ -445,13 +467,14 @@ function normalizeAgentDefinition(agent, index = 0) {
             ? String(agent.logLevel).trim().toLowerCase()
             : 'inherit',
         contextMessages: Math.min(5000, Math.max(1, parseInt(agent?.contextMessages) || DEFAULT_AGENT_CONTEXT_MESSAGES)),
+        contextMessageOffset: normalizeContextMessageOffset(agent?.contextMessageOffset),
         maxToolRounds: Math.min(MAX_AGENT_TOOL_ROUNDS, Math.max(1, parseInt(agent?.maxToolRounds) || DEFAULT_AGENT_MAX_TOOL_ROUNDS)),
-        validateOutputFormat: agent?.validateOutputFormat === true,
-        actionEnabled: agent?.actionEnabled === true,
+        validateOutputFormat: !internal && agent?.validateOutputFormat === true,
+        actionEnabled: !internal && agent?.actionEnabled === true,
         actionAutoRun: agent?.actionAutoRun === true,
         actionScript: String(agent?.actionScript ?? ''),
         actionTestPayload: String(agent?.actionTestPayload ?? '{\n    "example": true\n}'),
-        characterInjectionEnabled: agent?.characterInjectionEnabled === true,
+        characterInjectionEnabled: !internal && agent?.characterInjectionEnabled === true,
         characterInjectionPosition: injectionPlacement.position,
         characterInjectionDepth: injectionPlacement.depth,
         characterInjectionRole: injectionPlacement.role,
@@ -478,6 +501,7 @@ function normalizeCharacterInjectionTargets(targets) {
             characterName: String(target?.characterName ?? '').trim(),
             mode: target?.mode === 'full' ? 'full' : 'tag',
             tag: normalizeOutputTagName(target?.tag),
+            optional: target?.optional === true,
         }))
         .filter(target => target.characterAvatar || target.characterName);
 }
@@ -516,15 +540,8 @@ function syncLoggerConfig() {
     });
 }
 
-function isLegacyRouterPrompt(prompt) {
-    return String(prompt ?? '').includes('ONE WORD ONLY') || !String(prompt ?? '').includes('{{worldContext}}');
-}
-
 function needsRouterPromptRefresh(prompt) {
-    const value = String(prompt ?? '');
-    return isLegacyRouterPrompt(value)
-        || !value.includes('If nextSpeaker is USER')
-        || !value.includes('Never instruct, command, script, or imply the user');
+    return !String(prompt ?? '').trim();
 }
 
 function migrateConfig() {
@@ -720,8 +737,25 @@ function clearDirectedOocPrompt() {
     }
 }
 
-function resolveAgentInjectionTarget(agent, charName, ctx = SillyTavern.getContext()) {
+function getAgentInjectionTargets(agent, ctx = SillyTavern.getContext()) {
     const targets = normalizeCharacterInjectionTargets(agent?.characterInjectionTargets);
+    if (agent?.ownerType !== AGENT_OWNER_TYPES.CHARACTER) return targets;
+
+    const owner = findCharacterConnection(agent, ctx.characters);
+    if (!owner) return [];
+    const existing = targets.find(target => target.characterAvatar === owner.avatar || target.characterName === owner.name)
+        ?? targets[0];
+    return [{
+        characterAvatar: owner.avatar,
+        characterName: owner.name,
+        mode: existing?.mode ?? 'full',
+        tag: existing?.tag ?? '',
+        optional: existing?.optional ?? false,
+    }];
+}
+
+function resolveAgentInjectionTarget(agent, charName, ctx = SillyTavern.getContext()) {
+    const targets = getAgentInjectionTargets(agent, ctx);
     if (!targets.length) return null;
 
     const resolvedCharacter = resolveCharacterByName(charName, ctx).character;
@@ -748,15 +782,19 @@ function isEmptyAgentInjectionContent(content) {
 }
 
 function validateAgentOutput(agent, output) {
+    const targets = agent?.characterInjectionEnabled ? getAgentInjectionTargets(agent) : [];
     if (agent?.validateOutputFormat) {
-        const formatValidation = validateTaggedOutputFormat(agent.prompt, output);
+        const optionalTags = targets.filter(target => target.mode === 'tag' && target.optional
+            && !targets.some(other => other.mode === 'tag' && other.tag === target.tag && !other.optional))
+            .map(target => target.tag);
+        const formatValidation = validateTaggedOutputFormat(agent.prompt, output, optionalTags);
         if (!formatValidation.valid) return formatValidation;
     }
 
     if (agent?.characterInjectionEnabled) {
-        for (const target of normalizeCharacterInjectionTargets(agent.characterInjectionTargets)) {
+        for (const target of targets) {
             if (target.mode !== 'tag') continue;
-            const extracted = extractTaggedOutputSection(output, target.tag);
+            const extracted = extractTaggedOutputSection(output, target.tag, target.optional);
             if (!extracted.valid) {
                 return {
                     valid: false,
@@ -791,7 +829,7 @@ function buildAgentCharacterInjection(charName, ctx = SillyTavern.getContext()) 
             continue;
         }
 
-        const extracted = extractTaggedOutputSection(output, target.tag);
+        const extracted = extractTaggedOutputSection(output, target.tag, target.optional);
         if (!extracted.valid) {
             errors.push(`${agent.name}: ${extracted.error}`);
             continue;
@@ -833,6 +871,9 @@ function applyAgentCharacterInjection(charName) {
     }
 
     const result = buildAgentCharacterInjection(charName, ctx);
+    const character = config.characters.find(item => item.name === charName);
+    const summaryInjection = character ? buildSummaryInjection(ctx, character) : null;
+    if (summaryInjection) result.injections.push(summaryInjection);
     if (result.errors.length) {
         recordBackstageIssue(`Agent injection: ${charName}`, result.errors.join(' | '));
     }
@@ -2479,6 +2520,10 @@ function clearBackstageIssue() {
     refreshSceneDirectorPanel();
 }
 
+function clearBackstageIssueIfSource(source) {
+    if (sceneDirectorState.persistentIssueSource === source) clearBackstageIssue();
+}
+
 function cloneRuntimeTiming() {
     const current = sceneDirectorState.runtimeTiming ?? {};
     return {
@@ -2765,6 +2810,9 @@ function resolveAgentTagsInText(template, ctx = SillyTavern.getContext(), snapsh
 
 function getAgentReferenceCharacter(agent, ctx = SillyTavern.getContext()) {
     const characters = Array.isArray(ctx.characters) ? ctx.characters : [];
+    if (agent?.ownerType === AGENT_OWNER_TYPES.CHARACTER) {
+        return findCharacterConnection(agent, characters);
+    }
     const avatar = String(agent?.referenceCharacterAvatar ?? '');
     const name = String(agent?.referenceCharacterName ?? '').trim();
 
@@ -2784,9 +2832,10 @@ function getCharacterCardValue(character, ...fieldNames) {
 
 function getAgentCharacterReference(agent, ctx = SillyTavern.getContext()) {
     const character = getAgentReferenceCharacter(agent, ctx);
+    const owned = agent?.ownerType === AGENT_OWNER_TYPES.CHARACTER;
     return {
-        name: String(character?.name ?? agent?.referenceCharacterName ?? '').trim(),
-        avatar: String(character?.avatar ?? agent?.referenceCharacterAvatar ?? ''),
+        name: String(character?.name ?? (owned ? agent.ownerCharacterName : agent?.referenceCharacterName) ?? '').trim(),
+        avatar: String(character?.avatar ?? (owned ? agent.ownerCharacterAvatar : agent?.referenceCharacterAvatar) ?? ''),
         personality: getCharacterCardValue(character, 'personality'),
         scenario: getCharacterCardValue(character, 'scenario'),
         creatorNotes: getCharacterCardValue(character, 'creator_notes', 'creatorcomment'),
@@ -2794,14 +2843,22 @@ function getAgentCharacterReference(agent, ctx = SillyTavern.getContext()) {
 }
 
 async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getContext()) {
-    const realMessages = getRpContextMessages(ctx.chat);
-    const recentMessages = realMessages.slice(-agent.contextMessages);
-    const recentChatEntries = formatRpContextMessages(recentMessages, ctx.name1 || '');
+    const realMessages = getRpContextMessages(ctx.chat, agent.includeHiddenMessages, agent.contextMessageOffset);
+    const creationInput = agent.internalType === SUMMARY_CREATION_TYPE && trigger?.type !== 'ooc'
+        ? summaryCreation.prepare(agent, ctx) : null;
+    const recentMessages = creationInput ? creationInput.entries.map(entry => entry.message) : realMessages.slice(-agent.contextMessages);
+    const recentChatEntries = formatAgentRpContext(agent, recentMessages, ctx, !!creationInput);
+    const ownerCharacterName = agent.ownerType === AGENT_OWNER_TYPES.CHARACTER
+        ? (findCharacterConnection(agent, config.characters)?.name || agent.ownerCharacterName)
+        : '';
     const dependencies = getAgentDependencies(agent.prompt);
     const dependencySnapshots = new Map(
         dependencies.map(id => [id, getAgentOutputSnapshot(id, ctx)]),
     );
     const characterReference = getAgentCharacterReference(agent, ctx);
+    const summaryOwner = agent.ownerType === AGENT_OWNER_TYPES.CHARACTER
+        ? findCharacterConnection(agent, config.characters) : null;
+    const characterSummary = summaryOwner ? buildSummaryInjection(ctx, summaryOwner)?.prompt ?? '' : '';
     const characterPersonalityReferences = getCharacterPersonalityTagReferences(agent.prompt, ctx);
     const [lorebookContext, lorebookCatalog] = await Promise.all([
         routerPromptUsesTag('lorebookContext', agent.prompt)
@@ -2826,8 +2883,12 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
     return {
         agentId: agent.id,
         agentName: agent.name,
-        promptTemplate: agent.prompt,
+        applyPromptRegex: agent.applyPromptRegex === true,
+        contextMessageOffset: normalizeContextMessageOffset(agent.contextMessageOffset),
+        promptTemplate: creationInput ? `Memory owner: ${creationInput.character.name}\n\n${agent.prompt}` : agent.prompt,
+        creationInput,
         previousOutput: getAgentRuntimeState(agent.id, ctx).output,
+        ownerCharacterName,
         recentChatEntries,
         recentChat: recentChatEntries.join('\n'),
         humanName: String(ctx.name1 ?? ''),
@@ -2835,6 +2896,7 @@ async function buildAgentContextSnapshot(agent, trigger, ctx = SillyTavern.getCo
         trigger: String(trigger?.label ?? trigger?.type ?? 'manual'),
         dependencies: Object.fromEntries(dependencySnapshots),
         characterReference,
+        characterSummary,
         characterPersonalityReferences,
         lorebookContext,
         lorebookCatalog,
@@ -2847,6 +2909,7 @@ function buildAgentMessages(agentContext, options = {}) {
     const templateUsesPreviousOutput = routerPromptUsesTag('previousOutput', agentContext.promptTemplate);
     const systemPrompt = renderTemplate(withAgentOutputs, {
         recentChat: agentContext.recentChat,
+        recentCharChat: agentContext.recentCharChat || '[No recent messages from the agent owner]',
         previousOutput: agentContext.previousOutput || '[No previous output]',
         user: agentContext.humanName,
         lastSpeaker: agentContext.lastSpeaker,
@@ -2854,6 +2917,7 @@ function buildAgentMessages(agentContext, options = {}) {
         characterPersonality: agentContext.characterReference?.personality || '[Character personality not provided]',
         characterScenario: agentContext.characterReference?.scenario || '[Character scenario not provided]',
         characterCreatorNotes: agentContext.characterReference?.creatorNotes || '[Character creator notes not provided]',
+        characterSummary: agentContext.characterSummary || '[No character summary selected for injection]',
         lorebookContext: agentContext.lorebookContext?.text || '[No activated lorebook context]',
         lorebookCatalog: agentContext.lorebookCatalog?.text || '[No selected lorebook catalog]',
     });
@@ -2899,6 +2963,11 @@ function formatAgentContextForLog(agentContext) {
         user: agentContext.humanName,
         lastSpeaker: agentContext.lastSpeaker,
         recentChatMessages: agentContext.recentChatEntries?.length ?? 0,
+        applyPromptRegex: agentContext.applyPromptRegex,
+        contextMessageOffset: agentContext.contextMessageOffset,
+        recentCharacterMessages: agentContext.recentCharChatEntries?.length ?? 0,
+        ownerCharacterName: agentContext.ownerCharacterName,
+        characterSummary: agentContext.characterSummary,
         previousOutput: agentContext.previousOutput,
         dependencies: agentContext.dependencies,
         characterReference: agentContext.characterReference,
@@ -2946,7 +3015,9 @@ function agentScheduleMatchesEvent(agent, event) {
     if (agent.scheduleType === 'total-turns') return event.type === 'user' || event.type === 'character';
     if (agent.scheduleType !== 'character-turns' || event.type !== 'character') return false;
 
-    const target = String(agent.characterName ?? '').trim().toLocaleLowerCase();
+    const target = String(agent.ownerType === AGENT_OWNER_TYPES.CHARACTER
+        ? getAgentOwnerLabel(agent)
+        : agent.characterName ?? '').trim().toLocaleLowerCase();
     const speaker = String(event.characterName ?? '').trim().toLocaleLowerCase();
     if (!target || !speaker) return false;
     return target === speaker || target.split(/\s+/)[0] === speaker.split(/\s+/)[0];
@@ -3014,6 +3085,7 @@ async function executeConfiguredAgentAction(agent, rawOutput, trigger, ctx = Sil
             ].join('\n'),
         });
         completeOperationLog(logId, 'success');
+        clearBackstageIssueIfSource(`Agent action: ${operationName}`);
         backstageLogger.info(logScope, 'Action completed', {
             trigger: triggerLabel,
             durationMs: execution.durationMs,
@@ -3072,6 +3144,7 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         mode: 'run',
         agentId: agent.id,
     });
+    let rawOutput = '';
     runningAgentIds.add(agent.id);
     saveAgentRuntimeState(agent.id, {
         lastStatus: 'running',
@@ -3086,6 +3159,16 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
     });
 
     try {
+        if (agent.internalType === SUMMARY_CREATION_TYPE && trigger.type === 'retry-save') {
+            const registered = await summaryCreation.retry(agent, ctx, cancellation.controller.signal);
+            saveAgentRuntimeState(agent.id, { output: registered.output, lastStatus: 'success', lastError: '',
+                updatedAt: new Date().toISOString() }, ctx);
+            appendOperationLogDetail(logId, `MemoryBox retry: ${registered.saved.length} memories saved.`);
+            await refreshSummaryAfterCreation(agent, ctx, logId, cancellation.controller.signal);
+            completeOperationLog(logId, 'success');
+            clearBackstageIssueIfSource(`Agent: ${operationName}`);
+            return registered.output;
+        }
         if (!connection.profileId) throw new Error(`Agent ${agent.name} has no resolved Connection Profile (${connection.label}).`);
         if (!agent.prompt.trim()) throw new Error(`Agent ${agent.name} has an empty prompt.`);
         cancellableOperations.assertActive(cancellation);
@@ -3099,6 +3182,9 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             buildAgentMessages,
         );
         cancellableOperations.assertActive(cancellation);
+        if (agentContext.creationInput && budgetedRequest.trimmed) {
+            throw new Error('Memory creation input exceeds the connection budget. Reduce recent messages; no memories were saved.');
+        }
         const messages = budgetedRequest.messages;
         updateOperationLog(logId, {
             context: formatAgentContextForLog(budgetedRequest.context),
@@ -3111,9 +3197,10 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
                 `Dependencies: ${getAgentDependencies(agent.prompt).map(id => `agent:${id}`).join(', ') || 'none'}`,
                 `Lorebooks: ${(agent.worldInfoBooks ?? []).join(', ') || 'none'}`,
                 `Recent RP messages: ${budgetedRequest.context?.recentChatEntries?.length ?? 0}`,
+                `Recent owner messages: ${budgetedRequest.context?.recentCharChatEntries?.length ?? 0}`,
                 `Output validation: ${agent.validateOutputFormat ? 'enabled' : 'disabled'}`,
                 `JavaScript action: ${agent.actionEnabled ? (agent.actionAutoRun ? 'enabled, automatic' : 'enabled, manual') : 'disabled'}`,
-                `Character injection targets: ${normalizeCharacterInjectionTargets(agent.characterInjectionTargets).map(target => `${target.characterName}:${target.mode}${target.mode === 'tag' ? `:<${target.tag}>` : ''}`).join(', ') || 'none'}`,
+                `Character injection targets: ${getAgentInjectionTargets(agent).map(target => `${target.characterName}:${target.mode}${target.mode === 'tag' ? `:<${target.tag}>` : ''}`).join(', ') || 'none'}`,
                 `Character injection placement: ${formatAgentInjectionPlacement(agent)}`,
                 `Tool-call round limit: ${agent.maxToolRounds}`,
                 `Input budget: ${budgetedRequest.budget}`,
@@ -3138,7 +3225,8 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             : await sendAgentStreamingRequest(connection.profileId, messages, cancellation.controller.signal);
         cancellableOperations.assertActive(cancellation);
         const reasoning = response?.reasoning ?? response?.reasoning_content ?? response?.thinking ?? '';
-        const responseText = stripMarkdownFence(extractResponseText(response));
+        rawOutput = extractResponseText(response);
+        const responseText = stripMarkdownFence(rawOutput);
         updateOperationLog(logId, {
             response: responseText,
             reasoning: String(reasoning ?? ''),
@@ -3152,9 +3240,17 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
         if (getChatContextKey(completionCtx) !== originChatKey) {
             throw new Error(`Chat changed while agent ${agent.name} was running. Output was not saved.`);
         }
+        if (agentContext.creationInput) {
+            const registered = await summaryCreation.save(agent, responseText, agentContext.creationInput,
+                completionCtx, cancellation.controller.signal);
+            appendOperationLogDetail(logId, `MemoryBox: ${registered.saved.length} memories saved.`);
+            await refreshSummaryAfterCreation(agent, completionCtx, logId, cancellation.controller.signal);
+        }
 
         const currentRuntime = getAgentRuntimeState(agent.id, completionCtx);
-        const consumedTurns = trigger.type === 'manual'
+        const consumedTurns = trigger.type === 'before-character'
+            ? 0
+            : trigger.type === 'manual'
             ? currentRuntime.pendingTurns
             : Math.max(1, Number(trigger.consumedTurns) || agent.interval);
         const runId = `agent-run-${Date.now()}-${agent.id}`;
@@ -3200,9 +3296,12 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             } catch (actionError) {
                 appendOperationLogDetail(logId, `Automatic JavaScript action failed: ${actionError?.message ?? String(actionError)}`);
                 toastr.error(`${agent.name} output was saved, but its action failed.`, EXTENSION_LABEL);
+                if (trigger.type === 'before-character') throw actionError;
             }
         }
+        cancellableOperations.assertActive(cancellation);
         completeOperationLog(logId, 'success');
+        clearBackstageIssueIfSource(`Agent: ${operationName}`);
         backstageLogger.info(logScope, 'Execution completed', {
             outputCharacters: responseText.length,
             runId,
@@ -3216,12 +3315,15 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
             backstageLogger.info(logScope, 'Execution stopped');
             return null;
         }
+        const diagnostic = rawOutput
+            ? `${message}\n\nLLM output (original):\n${rawOutput}`
+            : message;
         saveAgentRuntimeState(agent.id, {
             lastStatus: 'error',
             lastError: message,
             lastTrigger: trigger.label || trigger.type,
         }, ctx);
-        updateOperationLog(logId, { error: message });
+        updateOperationLog(logId, { error: diagnostic });
         completeOperationLog(logId, 'error');
         backstageLogger.error(logScope, 'Execution failed', error);
         sceneDirectorState = {
@@ -3377,6 +3479,7 @@ async function runAgentOocRequest(agentId) {
             reasoning: String(reasoning ?? ''),
         });
         completeOperationLog(logId, 'success');
+        clearBackstageIssueIfSource(`Agent OOC: ${operationName}`);
         backstageLogger.info(logScope, 'OOC request completed', { responseCharacters: responseText.length });
         return responseText;
     } catch (error) {
@@ -3479,6 +3582,64 @@ function scheduleAgentsForTurn(event) {
     agentSchedulerQueue = agentSchedulerQueue
         .catch(() => {})
         .then(() => runDueAgents(dueIds, event));
+}
+
+async function runAgentsBeforeCharacter(char, cancellation = null) {
+    const originChatKey = getChatContextKey(SillyTavern.getContext());
+    const agents = (config.agents ?? []).filter(agent => {
+        if (!agent.enabled || agent.scheduleType !== 'before-character') return false;
+        if (agent.ownerType === AGENT_OWNER_TYPES.CHARACTER) {
+            return findCharacterConnection(agent, config.characters) === char;
+        }
+        const target = String(agent.characterName ?? '').trim().toLocaleLowerCase();
+        const speaker = String(char.name ?? '').trim().toLocaleLowerCase();
+        return !!target && (target === speaker || target === speaker.split(/\s+/)[0]);
+    });
+
+    for (const id of sortScheduledAgents(agents.map(agent => agent.id))) {
+        if (cancellation) cancellableOperations.assertActive(cancellation);
+        const agent = getAgentDefinition(id);
+        if (getChatContextKey(SillyTavern.getContext()) !== originChatKey) {
+            throw new Error('Chat changed before the character turn. Generation was blocked.');
+        }
+        if (runningAgentIds.has(id) || runningAgentActionIds.has(id) || cancellableOperations.isActive(`agent:${id}`)) {
+            throw new Error(`Required agent ${agent.name} is already running. ${char.name}'s turn was blocked.`);
+        }
+
+        updateRouterState({ status: 'waiting-agents' });
+        backstageLogger.info(`Character:${char.name}`, 'Waiting for required agent', { agentId: id, agent: agent.name });
+        const execution = executeAgent(id, {
+            type: 'before-character',
+            label: `Before character turn: ${char.name}`,
+        });
+        const operation = cancellableOperations.get(`agent:${id}`);
+        const agentSignal = operation?.controller.signal;
+        const parentSignal = cancellation?.controller.signal;
+        let rejectWait;
+        const interrupted = new Promise((_, reject) => { rejectWait = reject; });
+        const onAgentStopped = () => rejectWait(new Error(`Required agent ${agent.name} was stopped. ${char.name}'s turn was blocked.`));
+        const onRouterStopped = () => {
+            if (operation && cancellableOperations.get(operation.key)?.token === operation.token) {
+                stopAgentExecution(id);
+            }
+            rejectWait(parentSignal.reason);
+        };
+        agentSignal?.addEventListener('abort', onAgentStopped, { once: true });
+        parentSignal?.addEventListener('abort', onRouterStopped, { once: true });
+        try {
+            if (parentSignal?.aborted) onRouterStopped();
+            if (agentSignal?.aborted) onAgentStopped();
+            const output = await Promise.race([execution, interrupted]);
+            if (cancellation) cancellableOperations.assertActive(cancellation);
+            if (!output) throw new Error(`Required agent ${agent.name} did not complete. ${char.name}'s turn was blocked.`);
+            if (getChatContextKey(SillyTavern.getContext()) !== originChatKey) {
+                throw new Error('Chat changed during required agents. Character generation was blocked.');
+            }
+        } finally {
+            agentSignal?.removeEventListener('abort', onAgentStopped);
+            parentSignal?.removeEventListener('abort', onRouterStopped);
+        }
+    }
 }
 
 function normalizePersistedSnapshot(snapshot) {
@@ -3726,7 +3887,7 @@ function getOutputFormatContract(promptTemplate) {
     return { valid: true, error: '', contract };
 }
 
-function validateTaggedOutputFormat(promptTemplate, output) {
+function validateTaggedOutputFormat(promptTemplate, output, optionalTags = []) {
     const format = getOutputFormatContract(promptTemplate);
     if (!format.valid) return format;
 
@@ -3738,7 +3899,13 @@ function validateTaggedOutputFormat(promptTemplate, output) {
         };
     }
 
-    const expectedSignature = format.contract.signature;
+    const optionalNames = new Set(optionalTags);
+    const presentNames = new Set(actual.tokens.map(token => token.name));
+    const omittedBlocks = format.contract.nodes.filter(node => optionalNames.has(node.name) && !presentNames.has(node.name));
+    const expectedSignature = format.contract.tokens
+        .filter(token => format.contract.structuralNames.has(token.name)
+            && !omittedBlocks.some(node => token.start >= node.start && token.end <= node.closeEnd))
+        .map(token => `${token.closing ? '/' : ''}${token.name}`);
     const actualSignature = actual.signature;
     const mismatchIndex = expectedSignature.findIndex((tag, index) => actualSignature[index] !== tag);
     if (mismatchIndex >= 0 || expectedSignature.length !== actualSignature.length) {
@@ -3759,7 +3926,7 @@ function validateTaggedOutputFormat(promptTemplate, output) {
     };
 }
 
-function extractTaggedOutputSection(output, tagName) {
+function extractTaggedOutputSection(output, tagName, optional = false) {
     const normalizedTag = normalizeOutputTagName(tagName);
     if (!normalizedTag) return { valid: false, content: '', error: 'No output tag was configured.' };
     if (!isValidXmlTagName(normalizedTag)) {
@@ -3772,6 +3939,7 @@ function extractTaggedOutputSection(output, tagName) {
     }
 
     const matches = parsed.nodes.filter(node => node.name === normalizedTag && node.closeStart >= 0);
+    if (optional && matches.length === 0) return { valid: true, content: '', block: '', error: '' };
     if (matches.length !== 1) {
         return {
             valid: false,
@@ -3788,14 +3956,9 @@ function extractTaggedOutputSection(output, tagName) {
     };
 }
 
-function getRpContextMessages(chat) {
-    return (Array.isArray(chat) ? chat : []).filter(m =>
-        !m.is_system &&
-        m.extra?.type !== 'tool_call' &&
-        m.extra?.type !== 'tool_response' &&
-        m.mes != null &&
-        !isBackstageOocMessage(m.mes)
-    );
+function getRpContextMessages(chat, includeHidden = false, offset = 0) {
+    return selectRpMessages(sliceChatBeforeOffset(chat, offset), { includeHidden, isOoc: isBackstageOocMessage,
+        characterNames: [...(SillyTavern.getContext().characters ?? []), ...(config.characters ?? [])].map(character => character.name) });
 }
 
 function isToolInvocationChatMessage(message) {
@@ -3821,10 +3984,21 @@ function formatRpContextMessages(messages, humanName = '') {
         .map(message => `${message?.name || 'Unknown'}: ${sanitize(message?.mes || '')}`);
 }
 
+function formatAgentRpContext(agent, messages, ctx, withIndices = false) {
+    return formatAgentMessages(messages, ctx.chat, { humanName: ctx.name1 || '', withIndices,
+        regexTransform: agent?.applyPromptRegex ? (text, isUser, depth) => getRegexedString(text,
+            isUser ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT, { isPrompt: true, depth }) : null });
+}
+
 function setRecentChatEntries(target, entries) {
     const normalized = Array.isArray(entries) ? entries.map(entry => String(entry ?? '')) : [];
     target.recentChatEntries = normalized;
     target.recentChat = normalized.join('\n');
+    if (target.ownerCharacterName) {
+        const prefix = `${target.ownerCharacterName}: `.toLowerCase();
+        target.recentCharChatEntries = normalized.filter(entry => entry.replace(/^\[message_index=\d+\]\s*/, '').toLowerCase().startsWith(prefix));
+        target.recentCharChat = target.recentCharChatEntries.join('\n');
+    }
 }
 
 async function buildRouterContextSnapshot(chatHistory, ctx) {
@@ -3946,6 +4120,7 @@ async function runRouterOocRequest() {
             lastDecision: sceneDirectorState.lastDecision,
             lastError: '',
         });
+        clearBackstageIssueIfSource('Router OOC');
         return responseText;
     } catch (error) {
         if (isAbortError(error) || cancellation.controller.signal.aborted) {
@@ -4185,6 +4360,7 @@ async function callRouterAgent(chatHistory, cancellation = null) {
             lastDecision: decision,
             lastError: '',
         });
+        if (decision.nextSpeaker) clearBackstageIssueIfSource('Router');
         return decision.nextSpeaker ? decision : null;
 
     } catch (error) {
@@ -4330,6 +4506,11 @@ async function triggerChar(char, decision = null, options = {}) {
     let ctx = SillyTavern.getContext();
     const cancellation = options.cancellation ?? null;
     if (cancellation) cancellableOperations.assertActive(cancellation);
+    if (!options.directOocText) {
+        await runAgentsBeforeCharacter(char, cancellation);
+        if (cancellation) cancellableOperations.assertActive(cancellation);
+        ctx = SillyTavern.getContext();
+    }
     const targetProfile = resolveCharacterProfileForSwitch(char, ctx);
 
     if (char.name !== lastActiveChar && targetProfile.profileName) {
@@ -4394,6 +4575,16 @@ async function triggerChar(char, decision = null, options = {}) {
         });
     }
 
+    if (!options.directOocText) {
+        const reinforcement = await memoryReinforcement.beforeCharacter(char, {
+            signal: cancellation?.controller.signal,
+        });
+        if (cancellation) cancellableOperations.assertActive(cancellation);
+        if (reinforcement?.status === 'stopped') {
+            throw new DOMException(reinforcement.error || 'Memory reinforcement stopped.', 'AbortError');
+        }
+        ctx = SillyTavern.getContext();
+    }
     setCharacterNote(char.name);
     setDirectedOocPrompt(char.name, options.directOocText);
     const agentInjection = applyAgentCharacterInjection(char.name);
@@ -4622,8 +4813,17 @@ async function runRouter(triggerEvent = 'unknown') {
             backstageLogger.warn('Router', 'No routing decision returned');
         }
     } catch (e) {
+        if (cancellableOperations.get('router')?.token !== cancellation.token) return;
+        pendingAutoRouter = false;
+        skipNextCharacterAutoRouter = false;
+        clearCharacterNote();
+        clearAgentCharacterInjection();
+        clearDirectedOocPrompt();
+        isProcessing = false;
+        unlockChat();
         if (isAbortError(e) || cancellation.controller.signal.aborted) {
             fl('← END', 'runRouter', 'stopped');
+            updateRouterState({ status: 'stopped', lastError: '' });
             return;
         }
         backstageLogger.error('Router', 'Routing failed', e);
@@ -4825,6 +5025,7 @@ function getTogglePipelineStatus() {
     }
 
     if (routerStatus === 'calling-director') return runtimeView.activeElapsedText !== 'Idle' ? `Router ${runtimeView.activeElapsedText}` : 'Router';
+    if (routerStatus === 'waiting-agents') return 'Waiting for agents';
     if (routerStatus === 'building-context' || routerStatus === 'running') return runtimeView.activeElapsedText !== 'Idle' ? `Routing ${runtimeView.activeElapsedText}` : 'Routing';
     if (routerStatus === 'blocked-processing') return runtimeView.activeElapsedText !== 'Idle' ? `${lastActiveChar || 'Busy'} ${runtimeView.activeElapsedText}` : (lastActiveChar || 'Busy');
 
@@ -5028,10 +5229,28 @@ function getActiveAgentOwner() {
 
 function getAgentsForOwner(ownerKey = getActiveAgentOwner().key) {
     return (Array.isArray(config.agents) ? config.agents : [])
-        .filter(agent => getAgentOwnerKey(agent) === ownerKey);
+        .filter(agent => agent.internalType !== SUMMARY_CREATION_TYPE && getAgentOwnerKey(agent) === ownerKey)
+        .sort((left, right) => (left.displayOrder || 0) - (right.displayOrder || 0));
+}
+
+function reorderVisibleAgent(sourceId, targetId, after = false) {
+    const agents = getAgentsForOwner();
+    const source = agents.find(agent => agent.id === sourceId);
+    if (!source || sourceId === targetId || !agents.some(agent => agent.id === targetId)) return;
+    const reordered = agents.filter(agent => agent !== source);
+    reordered.splice(reordered.findIndex(agent => agent.id === targetId) + (after ? 1 : 0), 0, source);
+    reordered.forEach((agent, index) => { agent.displayOrder = index; });
+    saveConfig();
 }
 
 function getSelectedAgent() {
+    const owner = getActiveAgentOwner();
+    if (sceneDirectorState.characterView === 'summary' && owner.character
+        && getSectionSelection(`summary:${owner.key}`, 'Memories') === 'Creation') {
+        if (sceneDirectorState.agentView === 'script') sceneDirectorState.agentView = 'config';
+        return getSummaryCreationAgent(owner.character);
+    }
+    if (sceneDirectorState.characterView === 'summary') return null;
     const agents = getAgentsForOwner();
     const selected = agents.find(agent => agent.id === sceneDirectorState.activeAgentId) ?? agents[0] ?? null;
     if (selected && sceneDirectorState.activeAgentId !== selected.id) {
@@ -5047,18 +5266,11 @@ function formatAgentSchedule(agent) {
     if (!agent || agent.scheduleType === 'manual') return 'Manual only';
     if (agent.scheduleType === 'user-turns') return `Every ${agent.interval} user turns`;
     if (agent.scheduleType === 'total-turns') return `Every ${agent.interval} total turns`;
-    return `Every ${agent.interval} turns by ${agent.characterName || 'unassigned character'}`;
-}
-
-function renderAgentOwnerOptions(agent = null) {
-    const selectedKey = agent ? getAgentOwnerKey(agent) : AGENT_OWNER_TYPES.GLOBAL;
-    return `
-        <option value="global" ${selectedKey === AGENT_OWNER_TYPES.GLOBAL ? 'selected' : ''}>Global</option>
-        ${config.characters.map(character => {
-            const key = `character:${character.avatar || character.name}`;
-            return `<option value="${escapeHtml(key)}" ${selectedKey === key ? 'selected' : ''}>${escapeHtml(character.name)}</option>`;
-        }).join('')}
-    `;
+    const characterName = agent.ownerType === AGENT_OWNER_TYPES.CHARACTER
+        ? getAgentOwnerLabel(agent)
+        : agent.characterName;
+    if (agent.scheduleType === 'before-character') return `Before each turn by ${characterName || 'unassigned character'}`;
+    return `Every ${agent.interval} turns by ${characterName || 'unassigned character'}`;
 }
 
 function getAgentOwnerLabel(agent) {
@@ -5088,55 +5300,69 @@ function applyAgentOwnerValue(agent, value) {
     agent.ownerCharacterName = String(character?.name ?? identity);
 }
 
-function renderAgentOwnerPane(activeOwner) {
-    const agents = Array.isArray(config.agents) ? config.agents : [];
-    const owners = getAgentOwners();
+function renderCharacterConnections(activeOwner) {
     const connectionContent = activeOwner.type === AGENT_OWNER_TYPES.GLOBAL
         ? `
+            <div class="sd-connection-field">
             <label>Agent Connection</label>
             <select id="global-agent-profile" class="text_pole"></select>
-            <div class="sd-footnote">Default connection for agents in the Global block.</div>
+            </div>
         `
         : `
+            <div class="sd-connection-field">
             <label>Generation Connection</label>
             <select id="char-generation-profile-${activeOwner.characterIndex}" class="text_pole"></select>
+            </div>
+            <div class="sd-connection-field">
             <label>Agent Connection</label>
             <select class="text_pole" data-character-agent-mode="${activeOwner.characterIndex}">
                 <option value="generation" ${activeOwner.character.agentProfileMode === CHARACTER_AGENT_CONNECTION_MODES.GENERATION ? 'selected' : ''}>Inherit Generation Connection</option>
                 <option value="profile" ${activeOwner.character.agentProfileMode === CHARACTER_AGENT_CONNECTION_MODES.PROFILE ? 'selected' : ''}>Use another profile</option>
             </select>
             <select id="char-agent-profile-${activeOwner.characterIndex}" class="text_pole ${activeOwner.character.agentProfileMode === CHARACTER_AGENT_CONNECTION_MODES.PROFILE ? '' : 'sd-hidden'}"></select>
+            </div>
         `;
 
+    return `<div id="character-connections" class="sd-character-connections${sceneDirectorState.characterConnectionsOpen ? '' : ' sd-hidden'}">${connectionContent}</div>`;
+}
+
+function renderCharacterPortrait(owner) {
+    const initial = String(owner.label || '?').slice(0, 1).toUpperCase();
+    const avatar = String(owner.character?.avatar ?? '');
+    const image = avatar && avatar !== 'none'
+        ? `<img data-character-portrait src="${escapeHtml(`/thumbnail?${new URLSearchParams({ type: 'avatar', file: avatar })}`)}" alt="" width="64" height="64" loading="lazy" decoding="async">`
+        : '';
+    return `<span class="sd-character-portrait" aria-hidden="true">${owner.type === AGENT_OWNER_TYPES.GLOBAL ? '<i class="fa-solid fa-globe"></i>' : `<span>${escapeHtml(initial)}</span>`}${image}</span>`;
+}
+
+function renderCharacterPicker(activeOwner) {
+    const agents = Array.isArray(config.agents) ? config.agents : [];
+    const owners = getAgentOwners();
     return `
-        <aside class="sd-agent-owner-pane">
-            <div class="sd-pane-heading">
-                <div>
-                    <div class="sd-card-title">Owner</div>
-                    <div class="sd-card-subtitle">Choose whose agents you want to manage.</div>
+        <details class="sd-character-picker">
+            <summary title="Select character" aria-label="${escapeHtml(`Choose character: ${activeOwner.label}`)}" aria-expanded="false">
+                ${renderCharacterPortrait(activeOwner)}
+                <span class="sd-character-selector-name">${escapeHtml(activeOwner.label)}</span>
+                <i class="fa-solid fa-chevron-down sd-character-picker-chevron" aria-hidden="true"></i>
+            </summary>
+            <div class="sd-character-picker-menu" role="group" aria-label="Characters">
+                <div class="sd-character-picker-heading"><b>Characters</b>
+                <button id="agent-refresh-group" class="sd-editor-tool" title="Refresh active group" aria-label="Refresh active group"><i class="fa-solid fa-rotate" aria-hidden="true"></i></button>
                 </div>
-                <button id="agent-refresh-group" class="menu_button sd-compact-button" title="Refresh active group">Refresh</button>
-            </div>
-            <nav class="sd-agent-owner-list" aria-label="Agent owners">
+            <div class="sd-character-picker-grid">
                 ${owners.map(owner => {
                     const count = agents.filter(agent => getAgentOwnerKey(agent) === owner.key).length;
                     return `
-                        <button class="sd-agent-owner-item${owner.key === activeOwner.key ? ' sd-agent-owner-item--active' : ''}" data-agent-owner-key="${escapeHtml(owner.key)}">
-                            <span class="sd-agent-owner-mark">${escapeHtml(owner.type === AGENT_OWNER_TYPES.GLOBAL ? 'G' : String(owner.label || '?').slice(0, 1).toUpperCase())}</span>
-                            <span class="sd-agent-owner-copy">
-                                <b>${escapeHtml(owner.label)}</b>
-                                <small>${owner.type === AGENT_OWNER_TYPES.GLOBAL ? 'Shared agents' : 'Character agents'}</small>
-                            </span>
-                            <span class="sd-agent-count">${count}</span>
+                        <button type="button" class="sd-character-choice" data-agent-owner-key="${escapeHtml(owner.key)}" aria-pressed="${owner.key === activeOwner.key}" title="${escapeHtml(owner.label)}">
+                            ${renderCharacterPortrait(owner)}
+                            <span class="sd-character-choice-name">${escapeHtml(owner.label)}</span>
+                            <small>${count} ${count === 1 ? 'agent' : 'agents'}</small>
                         </button>
                     `;
                 }).join('')}
-            </nav>
-            <section class="sd-owner-connection-panel">
-                <div class="sd-owner-connection-title">${escapeHtml(activeOwner.label)} connections</div>
-                ${connectionContent}
-            </section>
-        </aside>
+            </div>
+            </div>
+        </details>
     `;
 }
 
@@ -5160,7 +5386,9 @@ function renderAgentList(selectedAgent, activeOwner) {
                     const runtime = getAgentRuntimeState(agent.id);
                     const connection = resolveAgentConnection(agent, config);
                     return `
-                        <button class="sd-agent-list-item${selectedAgent?.id === agent.id ? ' sd-agent-list-item--active' : ''}" data-agent-id="${escapeHtml(agent.id)}">
+                        <button class="sd-agent-list-item${selectedAgent?.id === agent.id ? ' sd-agent-list-item--active' : ''}" data-agent-id="${escapeHtml(agent.id)}" draggable="true" title="${escapeHtml(agent.name)} — drag to reorder; Alt+Up/Down to move">
+                            <i class="fa-solid fa-grip-vertical sd-agent-drag-handle" aria-hidden="true"></i>
+                            <span class="sd-agent-list-copy">
                             <span class="sd-agent-list-title-row">
                                 <span class="sd-agent-list-name">${escapeHtml(agent.name)}</span>
                                 <span class="sd-agent-state-dot sd-agent-state-dot--${escapeHtml(getStatusTone(runtime.lastStatus))}"></span>
@@ -5168,6 +5396,7 @@ function renderAgentList(selectedAgent, activeOwner) {
                             <span class="sd-agent-list-tag">{{agent:${escapeHtml(agent.id)}}}</span>
                             <span class="sd-agent-list-schedule">${escapeHtml(formatAgentSchedule(agent))}</span>
                             <span class="sd-agent-list-schedule">${escapeHtml(connection.profileName || connection.label)}</span>
+                            </span>
                         </button>
                     `;
                 }).join('') : `<div class="sd-agent-empty-state"><b>No agents for ${escapeHtml(activeOwner.label)}</b><span>Create one above. It will inherit this owner's connection.</span></div>`}
@@ -5181,18 +5410,23 @@ function renderAgentWorkspacePanel(agent) {
     const latestLog = getLatestAgentOperation(agent.id);
     const dependencies = getAgentDependencies(agent.prompt);
     const updatedAt = runtime.updatedAt ? formatPanelTime(new Date(runtime.updatedAt)) : 'never';
-    const turnsUntilRun = agent.scheduleType === 'manual' ? '-' : Math.max(0, agent.interval - runtime.pendingTurns);
-    const injectionTargets = normalizeCharacterInjectionTargets(agent.characterInjectionTargets);
+    const beforeCharacter = agent.scheduleType === 'before-character';
+    const turnsUntilRun = agent.scheduleType === 'manual' || beforeCharacter ? '-' : Math.max(0, agent.interval - runtime.pendingTurns);
+    const injectionTargets = getAgentInjectionTargets(agent);
     const outputValidation = runtime.output ? validateAgentOutput(agent, runtime.output) : { valid: true, error: '' };
     const injectionSummary = injectionTargets.length
         ? injectionTargets.map(target => `${target.characterName || 'Unknown'} -> ${target.mode === 'full' ? 'Full output' : `[${target.tag}]`}`).join('\n')
         : 'No character destinations configured.';
 
+    const latestError = runtime.lastStatus === 'error'
+        ? latestLog?.error || runtime.lastError
+        : '';
+
     return `
         <div class="sd-grid">
             <div class="sd-summary-grid">
-                ${renderStatCard('Status', formatStateLabel(runtime.lastStatus), runtime.lastError || 'Latest persisted state')}
-                ${renderStatCard('Pending turns', String(runtime.pendingTurns), agent.scheduleType === 'manual' ? 'Manual schedule' : `${turnsUntilRun} until next run`)}
+                ${renderStatCard('Status', formatStateLabel(runtime.lastStatus), runtime.lastError?.split('\n')[0] || 'Latest persisted state')}
+                ${renderStatCard('Pending turns', beforeCharacter ? '-' : String(runtime.pendingTurns), beforeCharacter ? formatAgentSchedule(agent) : agent.scheduleType === 'manual' ? 'Manual schedule' : `${turnsUntilRun} until next run`)}
                 ${renderStatCard('Dependencies', String(dependencies.length), dependencies.map(id => `agent:${id}`).join(', ') || 'No agent tags')}
                 ${renderStatCard('Last update', updatedAt, runtime.runId || 'No successful run')}
             </div>
@@ -5223,8 +5457,8 @@ function renderAgentWorkspacePanel(agent) {
             ${renderDisclosure('Request', 'Messages sent to the selected Connection Profile.', `
                 ${renderTokenCountedConsole(latestLog?.request, 'No request captured in this session.', 'sd-console--tall')}
             `)}
-            ${runtime.lastError || latestLog?.error ? renderDisclosure('Error', 'Latest execution failure. The previous valid output was preserved.', `
-                ${renderTokenCountedConsole(runtime.lastError || latestLog?.error, '', 'sd-console--error')}
+            ${latestError ? renderDisclosure('Error', 'Latest execution failure. The previous valid output was preserved.', `
+                ${renderTokenCountedConsole(latestError, '', 'sd-console--error')}
             `, { open: true }) : ''}
         </div>
     `;
@@ -5268,18 +5502,16 @@ function renderAgentOocPanel(agent) {
 
     return `
         <div class="sd-grid">
-            ${renderDisclosure('Agent OOC', 'Direct and disposable conversation with this agent using its current context.', `
+            ${renderDisclosure('Conversation', 'OOC', `
+                ${renderTokenCountedConsole(transcript, 'No OOC conversation yet.', 'sd-console--tall')}
+                <div class="sd-ooc-composer">
                 <textarea id="agent-ooc-request" class="text_pole sd-editor-textarea" spellcheck="false">${escapeHtml(getAgentOocDraft(agent.id))}</textarea>
                 <div class="sd-inline-actions">
                     <button id="agent-send-ooc" class="menu_button primary" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Send OOC</button>
                     <button id="agent-clear-ooc-draft" class="menu_button">Reset Draft</button>
                     <button id="agent-clear-ooc-history" class="menu_button">Clear Conversation</button>
                 </div>
-                <div class="sd-footnote">Uses this agent's profile, prompt, RP context, character reference, lorebooks and prior OOC messages. It does not replace Agent Output.</div>
-            `, { open: true })}
-
-            ${renderDisclosure('OOC Conversation', 'Newest messages are shown first.', `
-                ${renderTokenCountedConsole(transcript, 'No OOC conversation yet.', 'sd-console--tall')}
+                </div>
             `, { open: true })}
 
             ${agent.actionEnabled ? `
@@ -5394,22 +5626,24 @@ function renderAgentInjectionCharacterOptions(target, ctx = SillyTavern.getConte
 }
 
 function renderAgentInjectionTargets(agent) {
-    const targets = normalizeCharacterInjectionTargets(agent.characterInjectionTargets);
+    const owned = agent.ownerType === AGENT_OWNER_TYPES.CHARACTER;
+    const targets = getAgentInjectionTargets(agent);
     if (!targets.length) {
         return '<div class="sd-log-empty">No character destinations configured.</div>';
     }
 
     return targets.map((target, index) => `
         <div class="sd-agent-injection-target" data-agent-injection-target data-target-index="${index}">
-            <select class="text_pole" data-agent-injection-character>
+            ${owned ? `<input type="hidden" data-agent-injection-character value="${escapeHtml(target.characterAvatar)}" data-character-name="${escapeHtml(target.characterName)}">` : `<select class="text_pole" data-agent-injection-character>
                 ${renderAgentInjectionCharacterOptions(target)}
-            </select>
+            </select>`}
             <select class="text_pole" data-agent-injection-mode>
                 <option value="tag" ${target.mode === 'tag' ? 'selected' : ''}>Tagged section</option>
                 <option value="full" ${target.mode === 'full' ? 'selected' : ''}>Full output</option>
             </select>
             <input class="text_pole" data-agent-injection-tag type="text" value="${escapeHtml(target.tag ? `<${target.tag}>` : '')}" placeholder="<Mirella>" ${target.mode === 'full' ? 'disabled' : ''}>
-            <button class="menu_button" data-agent-injection-remove="${index}" title="Remove destination">Remove</button>
+            <label class="sd-checkbox-row sd-agent-injection-optional"><input type="checkbox" data-agent-injection-optional ${target.optional ? 'checked' : ''} ${target.mode === 'full' ? 'disabled' : ''}><span>Optional block</span></label>
+            ${owned ? '' : `<button class="menu_button" data-agent-injection-remove="${index}" title="Remove destination">Remove</button>`}
         </div>
     `).join('');
 }
@@ -5440,7 +5674,10 @@ function renderGraphitiPermissionOptions(agent, mode) {
 }
 
 function renderAgentConfigPanel(agent) {
-    const characterSchedule = agent.scheduleType === 'character-turns';
+    const internal = agent.internalType === SUMMARY_CREATION_TYPE;
+    const owned = agent.ownerType === AGENT_OWNER_TYPES.CHARACTER;
+    const beforeCharacter = agent.scheduleType === 'before-character';
+    const characterSchedule = agent.scheduleType === 'character-turns' || beforeCharacter;
     const selectedLorebookCount = Array.isArray(agent.worldInfoBooks) ? agent.worldInfoBooks.length : 0;
     const injectionPlacement = normalizeAgentInjectionPlacement(agent);
     const injectionEnabled = agent.characterInjectionEnabled;
@@ -5456,16 +5693,14 @@ function renderAgentConfigPanel(agent) {
                     <input id="agent-enabled" type="checkbox" ${agent.enabled ? 'checked' : ''}>
                     <span>Enable automatic execution</span>
                 </label>
-                <label>Name</label>
+                ${internal ? '' : `<label>Name</label>
                 <input id="agent-name" class="text_pole" type="text" maxlength="80" value="${escapeHtml(agent.name)}">
                 <label>Agent ID</label>
                 <input id="agent-id" class="text_pole" type="text" maxlength="64" value="${escapeHtml(agent.id)}">
                 <div class="sd-footnote">Character agents use <code>character:agent</code>. Changing the ID migrates stored output and prompt references.</div>
                 <label>Output tag</label>
                 <input class="text_pole" type="text" readonly value="{{agent:${escapeHtml(agent.id)}}}">
-                <div class="sd-footnote">The display name can change without changing this tag.</div>
-                <label>Owner block</label>
-                <select id="agent-owner" class="text_pole">${renderAgentOwnerOptions(agent)}</select>
+                <div class="sd-footnote">The display name can change without changing this tag.</div>`}
                 <label>Agent Connection</label>
                 <select id="agent-connection-mode" class="text_pole">
                     <option value="parent" ${usesOwnConnection ? '' : 'selected'}>Inherit from ${escapeHtml(getAgentOwnerLabel(agent))}</option>
@@ -5473,24 +5708,30 @@ function renderAgentConfigPanel(agent) {
                 </select>
                 <div class="sd-connection-resolution">Resolved: <b>${escapeHtml(resolvedConnection.profileName || resolvedConnection.profileId || 'not configured')}</b> via ${escapeHtml(resolvedConnection.label)}</div>
                 <select id="agent-profile-dropdown" class="text_pole ${usesOwnConnection ? '' : 'sd-hidden'}"></select>
-                <label>Reference character</label>
+                ${owned ? '' : `<label>Reference character</label>
                 <select id="agent-reference-character" class="text_pole">
                     ${renderAgentReferenceCharacterOptions(agent)}
                 </select>
-                <div class="sd-footnote">Makes the selected card fields available through prompt tags. Nothing is injected unless a tag is used.</div>
+                <div class="sd-footnote">Makes the selected card fields available through prompt tags. Nothing is injected unless a tag is used.</div>`}
                 <label>Schedule</label>
                 <select id="agent-schedule-type" class="text_pole">
                     <option value="manual" ${agent.scheduleType === 'manual' ? 'selected' : ''}>Manual only</option>
                     <option value="user-turns" ${agent.scheduleType === 'user-turns' ? 'selected' : ''}>User turns</option>
                     <option value="total-turns" ${agent.scheduleType === 'total-turns' ? 'selected' : ''}>Total RP turns</option>
-                    <option value="character-turns" ${characterSchedule ? 'selected' : ''}>Specific character turns</option>
+                    <option value="character-turns" ${agent.scheduleType === 'character-turns' ? 'selected' : ''}>Specific character turns</option>
+                    <option value="before-character" ${beforeCharacter ? 'selected' : ''}>Before character turn</option>
                 </select>
-                <label>Turns between updates</label>
-                <input id="agent-interval" class="text_pole" type="number" min="1" max="10000" value="${agent.interval}">
-                <label>Character name</label>
-                <input id="agent-character-name" class="text_pole" type="text" value="${escapeHtml(agent.characterName)}" ${characterSchedule ? '' : 'disabled'} placeholder="Exact or first name">
-                <label>Recent RP messages available to {{recentChat}}</label>
+                ${beforeCharacter ? '' : `<label>Turns between updates</label>
+                <input id="agent-interval" class="text_pole" type="number" min="1" max="10000" value="${agent.interval}">`}
+                ${owned ? '' : `<label>Character name</label>
+                <input id="agent-character-name" class="text_pole" type="text" value="${escapeHtml(agent.characterName)}" ${characterSchedule ? '' : 'disabled'} placeholder="Exact or first name">`}
+                <label>Recent RP messages available to {{recentChat}} and {{recentCharChat}}</label>
                 <input id="agent-context-messages" class="text_pole" type="number" min="1" max="5000" value="${agent.contextMessages}">
+                <label for="agent-context-message-offset">Final message offset</label>
+                <input id="agent-context-message-offset" class="text_pole" type="number" min="0" step="1" value="${normalizeContextMessageOffset(agent.contextMessageOffset)}">
+                <div id="agent-recent-chat-tokens" class="sd-footnote" aria-live="polite">Current chat: calculating...</div>
+                <label class="sd-checkbox-row"><input id="agent-include-hidden" type="checkbox" ${agent.includeHiddenMessages ? 'checked' : ''}><span>Include hidden RP messages</span></label>
+                <label class="sd-checkbox-row"><input id="agent-apply-prompt-regex" type="checkbox" ${agent.applyPromptRegex ? 'checked' : ''}><span>Apply ST prompt regex to recent messages</span></label>
                 <label>Maximum tool-call rounds</label>
                 <input id="agent-max-tool-rounds" class="text_pole" type="number" min="1" max="${MAX_AGENT_TOOL_ROUNDS}" value="${agent.maxToolRounds}">
                 <div class="sd-footnote">Shared by automatic and OOC runs. A round may contain multiple tool calls before the agent returns its final answer.</div>
@@ -5502,23 +5743,23 @@ function renderAgentConfigPanel(agent) {
             `)}
             ${renderCard('Prompt Template', 'The complete system prompt for this specialized agent.', `
                 <div class="sd-template-tags">
-                    <code>{{recentChat}}</code><code>{{previousOutput}}</code><code>{{user}}</code>
+                    <code>{{recentChat}}</code><code>{{recentCharChat}}</code><code>{{previousOutput}}</code><code>{{user}}</code>
                     <code>{{lastSpeaker}}</code><code>{{trigger}}</code><code>{{agent:id}}</code>
-                    <code>{{characterPersonality}}</code><code>{{characterScenario}}</code><code>{{characterCreatorNotes}}</code>
+                    <code>{{characterPersonality}}</code><code>{{characterScenario}}</code><code>{{characterCreatorNotes}}</code><code>{{characterSummary}}</code>
                     <code>{{characterPersonality:Name}}</code>
                     <code>{{lorebookContext}}</code><code>{{lorebookCatalog}}</code>
                 </div>
                 <textarea id="agent-prompt" class="text_pole sd-editor-textarea sd-editor-textarea--tall" spellcheck="false">${escapeHtml(agent.prompt)}</textarea>
                 ${renderEditorMeta('Dependencies are detected from {{agent:id}} tags. Autosaves on blur.', 'agent-prompt-token-counter')}
             `)}
-            ${renderCard('Output Contract', 'Validate the response and route the latest valid output into character prompts.', `
+            ${internal ? '' : renderCard('Output Contract', 'Validate the response and route the latest valid output into character prompts.', `
                 <label class="sd-checkbox-row" for="agent-validate-output-format">
                     <input id="agent-validate-output-format" type="checkbox" ${agent.validateOutputFormat ? 'checked' : ''}>
                     <span>Validate XML tags from the final OUTPUT FORMAT section</span>
                 </label>
                 <label class="sd-checkbox-row" for="agent-character-injection-enabled">
                     <input id="agent-character-injection-enabled" type="checkbox" ${agent.characterInjectionEnabled ? 'checked' : ''}>
-                    <span>Inject output into characters</span>
+                    <span>${owned ? `Inject output into ${escapeHtml(getAgentOwnerLabel(agent))}` : 'Inject output into characters'}</span>
                 </label>
                 <div class="floating_prompt_radio_group ${injectionEnabled ? '' : 'sd-control-disabled'}">
                     <label class="checkbox_label" for="agent-injection-position-before">
@@ -5545,13 +5786,13 @@ function renderAgentConfigPanel(agent) {
                 <div id="agent-injection-targets" class="sd-agent-injection-targets ${agent.characterInjectionEnabled ? '' : 'sd-control-disabled'}">
                     ${renderAgentInjectionTargets(agent)}
                 </div>
-                <div class="sd-inline-actions">
+                ${owned ? '' : `<div class="sd-inline-actions">
                     <button id="agent-injection-add" class="menu_button" ${agent.characterInjectionEnabled ? '' : 'disabled'}>Add destination</button>
-                </div>
+                </div>`}
                 <div class="sd-footnote">Use valid, case-sensitive XML names such as &lt;Mirella&gt; or &lt;Tio_Klarus&gt;. Each destination must appear exactly once in the final OUTPUT FORMAT and response. Tagged section removes only that outer tag; Full output injects the entire validated payload.</div>
             `)}
             ${renderCard('Knowledge Context', 'Configure long-term memory tools and direct lorebook context.', `
-                <label class="sd-checkbox-row" for="agent-graphiti-ooc-enabled">
+                ${internal ? '' : `<label class="sd-checkbox-row" for="agent-graphiti-ooc-enabled">
                     <input id="agent-graphiti-ooc-enabled" type="checkbox" ${agent.graphitiOocEnabled ? 'checked' : ''}>
                     <span>Enable long-term memory (RAG) tools in OOC</span>
                 </label>
@@ -5572,7 +5813,7 @@ function renderAgentConfigPanel(agent) {
                 <div class="sd-checkbox-list">
                     ${renderGraphitiPermissionOptions(agent, 'automatic')}
                 </div>
-                <div class="sd-footnote">Status is always available when memory tools are enabled. Search is restricted to readable groups. Remember, Correct and Forget are restricted to the single writable group. Every tool round appears in Operation History.</div>
+                <div class="sd-footnote">Status is always available when memory tools are enabled. Search is restricted to readable groups. Remember, Correct and Forget are restricted to the single writable group. Every tool round appears in Operation History.</div>`}
                 <div class="sd-inline-actions">
                     <button id="agent-world-info-all" class="menu_button">Select All</button>
                     <button id="agent-world-info-none" class="menu_button">Clear All</button>
@@ -5581,13 +5822,13 @@ function renderAgentConfigPanel(agent) {
                 <div id="agent-world-info-books" class="sd-checkbox-list"></div>
                 <div class="sd-footnote"><code>{{lorebookContext}}</code> resolves activated entries. <code>{{lorebookCatalog}}</code> resolves every entry from the selected books.</div>
             `)}
-            <div class="sd-agent-danger-zone">
+            ${internal ? '' : `<div class="sd-agent-danger-zone">
                 <div>
                     <div class="sd-card-title">Delete agent</div>
                     <div class="sd-card-subtitle">Removes the global definition and this chat's stored output.</div>
                 </div>
                 <button id="agent-delete" class="menu_button danger">Delete</button>
-            </div>
+            </div>`}
         </div>
     `;
 }
@@ -5607,8 +5848,10 @@ function switchAgentView(nextView) {
 
     $('#scene-director-panel-body [data-agent-view]')
         .removeClass('sd-subnav-button--active')
+        .attr('aria-pressed', 'false')
         .filter(`[data-agent-view="${view}"]`)
-        .addClass('sd-subnav-button--active');
+        .addClass('sd-subnav-button--active')
+        .attr('aria-pressed', 'true');
     $('#scene-director-panel-body [data-agent-workspace-action]')
         .toggleClass('sd-hidden', view !== 'workspace');
 
@@ -5618,6 +5861,7 @@ function switchAgentView(nextView) {
         return;
     }
 
+    destroyTextEditors();
     content.html(agent
         ? renderAgentViewPanel(agent, view)
         : '<div class="sd-agent-empty"><h4>Create the first agent</h4><p>Give it a name, assign a Connection Profile and write one focused task.</p></div>');
@@ -5631,6 +5875,145 @@ function switchAgentView(nextView) {
         initAgentScriptEditor(agent);
     }
     refreshVisiblePromptTokenCounters();
+    initAgentContentTabs();
+}
+
+function initAgentContentTabs() {
+    const agent = getSelectedAgent();
+    const root = document.querySelector('#scene-director-panel .sd-agent-content > .sd-grid');
+    const navigationRoot = document.querySelector('#scene-director-panel .sd-agent-section-navigation');
+    const navigation = document.querySelector('#scene-director-panel .sd-agent-navigation');
+    const summary = document.querySelector('#scene-director-panel .sd-memory-summary');
+    if (summary && navigation) {
+        const creationTab = [...summary.querySelectorAll(':scope > .sd-section-tabs > .sd-section-tab')]
+            .find(button => button.textContent === 'Creation');
+        if (creationTab) {
+            creationTab.after(navigation);
+            navigation.hidden = creationTab.getAttribute('aria-selected') !== 'true';
+        }
+    }
+    if (!root) navigationRoot?.replaceChildren();
+    if (agent && root) {
+        mountSectionTabs(root, {
+            key: `${agent.id}:${sceneDirectorState.agentView}`,
+            navigationRoot,
+            orientation: 'vertical',
+            defaultLabel: sceneDirectorState.agentView === 'config' ? 'Prompt' : 'Output',
+            onSelect: () => {
+                refreshVisiblePromptTokenCounters();
+                refreshAgentRecentChatTokenCount();
+                mountVisibleTextEditors();
+                window.dispatchEvent(new Event('resize'));
+            },
+        });
+    }
+    nestAgentSectionNavigation(navigation);
+    mountVisibleTextEditors();
+}
+
+function mountVisibleTextEditors() {
+    mountTextEditors(document.getElementById('scene-director-panel-body')).catch(error => {
+        backstageLogger.warn('UI', 'Text editor unavailable; using the original text fields', error);
+    });
+}
+
+/** Keep confirmed out-of-box recalls visible until the operator dismisses them. */
+function notifyOutsideMemoryUse(event) {
+    if (event.stage !== 'outside-memory-used') return;
+    const text = String(event.text ?? '').replace(/\s+/g, ' ').trim();
+    const percent = value => `${(value * 100).toFixed(1)}%`;
+    toastr.info(`${text.slice(0, 220)}${text.length > 220 ? '...' : ''}\nP(used): ${percent(event.result.usage_probability)} | Confidence: ${percent(event.result.confidence)}`,
+        `Memory used outside box: ${event.character}`, {
+            timeOut: 0, extendedTimeOut: 0, closeButton: true, tapToDismiss: false, escapeHtml: true,
+        });
+}
+
+const memoryReinforcementLogger = createMemoryReinforcementLogger({ appendOperationLog, updateOperationLog, completeOperationLog,
+    isProgressEnabled: () => config.memorySearchLogs !== false });
+const memoryReinforcement = createMemoryReinforcement({
+    getContext: () => SillyTavern.getContext(),
+    getCharacters: () => config.enabled ? config.characters : [],
+    isOocMessage: isBackstageOocMessage,
+    onEvent: event => {
+        memoryReinforcementLogger(event);
+        notifyOutsideMemoryUse(event);
+    },
+});
+
+const summaryCreation = createSummaryCreation({
+    getContext: () => SillyTavern.getContext(),
+    getCharacter: value => config.characters.find(character =>
+        (value.ownerCharacterAvatar || value.avatar)
+            ? character.avatar === (value.ownerCharacterAvatar || value.avatar)
+            : character.name === (value.ownerCharacterName || value.name)),
+    selectMessages: (agent, ctx) => getRpContextMessages(ctx.chat, agent.includeHiddenMessages),
+    onEvent: event => {
+        const id = getActiveOperationLogId(`agent:${event.agentId}`);
+        if (id) appendOperationLogDetail(id, `${event.stage}\n${JSON.stringify(event, null, 2)}`);
+        backstageLogger.info(`MemoryCreation:${event.agentId}`, event.stage, event);
+    },
+});
+const characterSummaryPanel = createCharacterSummaryPanel({
+    getContext: () => SillyTavern.getContext(),
+    getOwner: getActiveAgentOwner,
+    saveConfig,
+    refresh: refreshSceneDirectorPanel,
+    reportError: recordBackstageIssue,
+    escapeHtml,
+    getReinforcementStatus: character => memoryReinforcement.getStatus(character),
+    stopReinforcement: character => memoryReinforcement.stop(character),
+    renderCreation: renderSummaryCreationPanel,
+    refreshTokens: refreshVisiblePromptTokenCounters,
+    onTabSelected: label => {
+        const agent = getSelectedAgent();
+        if (label === 'Creation' && agent && sceneDirectorState.agentView === 'config') {
+            initAgentProfileDropdown();
+            initAgentWorldInfoSelect();
+        }
+        initAgentContentTabs();
+        refreshAgentRecentChatTokenCount();
+    },
+});
+
+function getSummaryCreationAgent(character) {
+    const existing = config.agents.find(agent => agent.internalType === SUMMARY_CREATION_TYPE
+        && (character.avatar ? agent.ownerCharacterAvatar === character.avatar : agent.ownerCharacterName === character.name));
+    if (existing) return existing;
+    const agent = normalizeAgentDefinition({ id: createUniqueAgentId(`memory-creation:${character.name}`),
+        name: 'Memory creation', internalType: SUMMARY_CREATION_TYPE, ownerType: 'character',
+        ownerCharacterAvatar: character.avatar, ownerCharacterName: character.name, connectionMode: 'parent',
+        enabled: false, scheduleType: 'manual', contextMessages: 50, prompt: DEFAULT_SUMMARY_CREATION_PROMPT });
+    config.agents.push(agent);
+    saveConfig();
+    return agent;
+}
+
+async function refreshSummaryAfterCreation(agent, ctx, logId, signal) {
+    const character = findCharacterConnection(agent, config.characters);
+    try {
+        const summary = await fetchCharacterSummary(character, { currentMessageIndex: ctx.chat.length, signal });
+        if (SillyTavern.getContext().chatMetadata !== ctx.chatMetadata) return;
+        await saveCharacterSummary(ctx, character, summary);
+    } catch (error) {
+        if (signal?.aborted) throw error;
+        appendOperationLogDetail(logId, `Memories saved, but summary refresh failed: ${error.message}`);
+    }
+}
+
+function renderSummaryCreationPanel(character) {
+    const agent = getSummaryCreationAgent(character);
+    const view = ['workspace', 'ooc', 'config'].includes(sceneDirectorState.agentView) ? sceneDirectorState.agentView : 'config';
+    const state = summaryCreation.getState(agent);
+    return `<section class="sd-agent-detail-pane sd-summary-creation">
+        <div class="sd-agent-detail-heading"><b>Memory creation</b>${renderStatusBadge(getAgentRuntimeState(agent.id).lastStatus)}</div>
+        <div class="sd-agent-navigation"><nav class="sd-agent-view-tabs" aria-label="Memory creation views">${['workspace', 'ooc', 'config'].map(tab => `<button type="button" class="sd-subnav-button${view === tab ? ' sd-subnav-button--active' : ''}" data-agent-view="${tab}" aria-pressed="${view === tab}">${{ workspace: 'Workspace', ooc: 'OOC', config: 'Config' }[tab]}</button>`).join('')}</nav><div class="sd-agent-section-navigation"></div></div>
+        <div class="sd-agent-toolbar"><button id="agent-run" class="menu_button" ${runningAgentIds.has(agent.id) || state?.pending ? 'disabled' : ''}>Create memories</button>${runningAgentIds.has(agent.id) ? '<button data-agent-stop class="menu_button">Stop</button>' : ''}${state?.pending ? `<button data-summary-creation-retry class="menu_button" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Retry Save</button>` : ''}<span class="sd-muted">${state?.pending ? `Pending save: ${state.pending.saved.length}/${state.pending.bodies.length}` : state?.lastBatch ? `${state.lastBatch.count} saved · through message ${state.lastSavedIndex}` : 'No memories created yet'}</span></div>
+        <div class="sd-agent-content">${renderAgentViewPanel(agent, view)}</div>
+    </section>`;
+}
+
+function renderCharacterSummary(activeOwner) {
+    return characterSummaryPanel.render(activeOwner);
 }
 
 function renderAgentsWorkspace() {
@@ -5641,35 +6024,36 @@ function renderAgentsWorkspace() {
         : 'workspace';
     const runtime = agent ? getAgentRuntimeState(agent.id) : null;
     const snapshots = runtime?.snapshots ?? [];
+    const summaryView = sceneDirectorState.characterView === 'summary';
     return `
         <div class="sd-main sd-main--agents">
-            <section class="sd-agent-workspace-header">
-                <div>
-                    <div class="sd-eyebrow">${escapeHtml(AGENTS_LABEL)} / ${escapeHtml(activeOwner.label)}</div>
-                    <h3>${agent ? escapeHtml(agent.name) : `No ${escapeHtml(activeOwner.label)} agent selected`}</h3>
-                </div>
-                <div class="sd-agent-header-actions">
-                    ${agent ? `<span class="sd-agent-tag">{{agent:${escapeHtml(agent.id)}}}</span>` : ''}
-                    ${renderStatusBadge(runtime?.lastStatus || 'idle')}
-                    <div class="sd-subnav">
-                        <button class="menu_button sd-subnav-button${view === 'workspace' ? ' sd-subnav-button--active' : ''}" data-agent-view="workspace">Workspace</button>
-                        <button class="menu_button sd-subnav-button${view === 'ooc' ? ' sd-subnav-button--active' : ''}" data-agent-view="ooc">OOC</button>
-                        <button class="menu_button sd-subnav-button${view === 'script' ? ' sd-subnav-button--active' : ''}" data-agent-view="script">Script</button>
-                        <button class="menu_button sd-subnav-button${view === 'config' ? ' sd-subnav-button--active' : ''}" data-agent-view="config">Config</button>
-                    </div>
-                </div>
-            </section>
             ${renderPersistentIssueBanner()}
-            <div class="sd-agent-workbench">
-                ${renderAgentOwnerPane(activeOwner)}
-                ${renderAgentList(agent, activeOwner)}
+            <div class="sd-character-workbench">
+                <div class="sd-character-body">
+                    <header class="sd-character-heading">${renderCharacterPicker(activeOwner)}<span>${getAgentsForOwner(activeOwner.key).length} agents <button type="button" class="sd-editor-tool" data-character-connections aria-controls="character-connections" aria-expanded="${sceneDirectorState.characterConnectionsOpen}" title="Connections" aria-label="Connections"><i class="fa-solid fa-plug" aria-hidden="true"></i></button></span></header>
+                    ${renderCharacterConnections(activeOwner)}
+                    <div class="sd-character-tabs" role="tablist" aria-label="Character workspace">
+                        <button type="button" role="tab" id="character-summary-tab" aria-controls="character-workspace" aria-selected="${summaryView}" data-character-view="summary">Summary</button>
+                        <button type="button" role="tab" id="character-agents-tab" aria-controls="character-workspace" aria-selected="${!summaryView}" data-character-view="agents">Agents</button>
+                    </div>
+                    <div id="character-workspace" class="sd-character-stage" role="tabpanel" aria-labelledby="character-${summaryView ? 'summary' : 'agents'}-tab">
+                    ${summaryView ? renderCharacterSummary(activeOwner) : `
+                    <div class="sd-agent-workbench">
+                        ${renderAgentList(agent, activeOwner)}
                 <section class="sd-agent-detail-pane">
+                    <div class="sd-agent-detail-heading"><div><b>${agent ? escapeHtml(agent.name) : 'Agents'}</b>${agent ? `<span class="sd-agent-tag">{{agent:${escapeHtml(agent.id)}}}</span>` : ''}</div><span class="sd-agent-detail-tools">${agent ? `<button type="button" class="sd-editor-tool" data-agent-move="-1" title="Move agent up" aria-label="Move agent up" ${getAgentsForOwner()[0]?.id === agent.id ? 'disabled' : ''}><i class="fa-solid fa-arrow-up" aria-hidden="true"></i></button><button type="button" class="sd-editor-tool" data-agent-move="1" title="Move agent down" aria-label="Move agent down" ${getAgentsForOwner().at(-1)?.id === agent.id ? 'disabled' : ''}><i class="fa-solid fa-arrow-down" aria-hidden="true"></i></button>` : ''}${renderStatusBadge(runtime?.lastStatus || 'idle')}</span></div>
+                    <div class="sd-agent-navigation">
+                        <nav class="sd-agent-view-tabs" aria-label="Agent views">
+                            ${['workspace', 'ooc', 'config', 'script'].map(tab => `<button type="button" class="sd-subnav-button${view === tab ? ' sd-subnav-button--active' : ''}" data-agent-view="${tab}" aria-pressed="${view === tab}">${({workspace:'Workspace', ooc:'OOC', config:'Config', script:'Script'})[tab]}</button>`).join('')}
+                        </nav>
+                        <div class="sd-agent-section-navigation"></div>
+                    </div>
                     <div class="sd-agent-toolbar">
                         ${agent ? `<button id="agent-run" data-agent-workspace-action class="menu_button primary${view === 'workspace' ? '' : ' sd-hidden'}" ${runningAgentIds.has(agent.id) ? 'disabled' : ''}>Run Now</button>` : ''}
                         ${agent && runningAgentIds.has(agent.id) ? '<button data-agent-stop class="menu_button">Stop</button>' : ''}
                         ${agent?.actionEnabled ? `<button id="agent-run-action" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${runtime?.output && !runningAgentIds.has(agent.id) && !runningAgentActionIds.has(agent.id) ? '' : 'disabled'}>Run Action</button>` : ''}
                         ${agent ? `<button id="agent-copy-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Copy Output</button>` : ''}
-                        ${agent ? [0, 1, 2].map(index => `<button data-agent-copy-snapshot="${index}" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}" ${snapshots.length <= index ? 'disabled' : ''} title="${snapshots[index]?.savedAt ? escapeHtml(new Date(snapshots[index].savedAt).toLocaleString()) : 'No snapshot'}">Snapshot ${index + 1}</button>`).join('') : ''}
+                        ${agent ? `<details data-agent-workspace-action class="sd-snapshot-menu${view === 'workspace' ? '' : ' sd-hidden'}"><summary>Snapshots</summary><div>${[0, 1, 2].map(index => `<button data-agent-copy-snapshot="${index}" class="menu_button" ${snapshots.length <= index ? 'disabled' : ''} title="${snapshots[index]?.savedAt ? escapeHtml(new Date(snapshots[index].savedAt).toLocaleString()) : 'No snapshot'}">Snapshot ${index + 1}</button>`).join('')}</div></details>` : ''}
                         ${agent ? `<button id="agent-clear-output" data-agent-workspace-action class="menu_button${view === 'workspace' ? '' : ' sd-hidden'}">Clear Output</button>` : ''}
                     </div>
                     <div class="sd-agent-content">
@@ -5678,6 +6062,9 @@ function renderAgentsWorkspace() {
                             : `<div class="sd-agent-empty"><h4>No agent in ${escapeHtml(activeOwner.label)}</h4><p>Create one from the middle column to start configuring this owner.</p></div>`}
                     </div>
                 </section>
+                    </div>`}
+                    </div>
+                </div>
             </div>
         </div>
     `;
@@ -5687,7 +6074,7 @@ function renderMemoryWorkspace() {
     const state = sceneDirectorState.memoryWorkspace;
     const progress = state.total ? `${state.completed}/${state.total}` : '0/0';
     return `
-        <div class="sd-main">
+        <div class="sd-main sd-main--memory">
             ${renderPersistentIssueBanner()}
             <section class="sd-hero">
                 <div>
@@ -5839,7 +6226,7 @@ function renderWorkspaceNav() {
         },
         {
             key: 'agents',
-            title: AGENTS_LABEL,
+            title: 'Characters',
             copy: 'Configure focused agents, schedules, outputs and dependencies.',
         },
         {
@@ -5926,7 +6313,7 @@ function renderOperationLogEntry(log) {
 
 function renderOperationLogBody(log) {
     return `
-        ${log?.detail ? `<div class="sd-log-context">${escapeHtml(log.detail)}</div>` : ''}
+        ${log?.detail ? `<div class="sd-log-context${log.kind === 'memory-boost' ? ' sd-log-context--memory' : ''}">${escapeHtml(log.detail)}</div>` : ''}
         ${renderOperationLogDetail('Error', log?.error, 'sd-console--error')}
         ${renderOperationLogDetail('Context', log?.context)}
         ${renderOperationLogDetail('Request', log?.request)}
@@ -5961,7 +6348,7 @@ function renderLogsWorkspace() {
     const errorCount = logs.filter(log => log.status === 'error').length;
 
     return `
-        <div class="sd-main">
+        <div class="sd-main sd-main--logs">
             ${renderPersistentIssueBanner()}
             <section class="sd-hero sd-hero--logs">
                 <div>
@@ -5970,7 +6357,7 @@ function renderLogsWorkspace() {
                     <p>Runtime history for routing, agents and character generations.</p>
                 </div>
                 <div class="sd-hero-meta">
-                    ${renderStatusBadge(errorCount ? 'error' : (runningCount ? 'running' : 'ready'))}
+                    ${renderStatusBadge(logs[0]?.status ?? 'ready')}
                     <div class="sd-hero-note">${logs.length} retained operations</div>
                 </div>
             </section>
@@ -5991,6 +6378,10 @@ function renderLogsWorkspace() {
                 <select id="backstage-console-log-level" class="text_pole">
                     ${renderLogLevelOptions(config.consoleLogLevel)}
                 </select>
+                <label class="sd-checkbox-row" for="backstage-memory-search-logs">
+                    <input id="backstage-memory-search-logs" type="checkbox" ${config.memorySearchLogs !== false ? 'checked' : ''}>
+                    <span>Show MemoryBox search and verification progress in logs</span>
+                </label>
                 <div class="sd-footnote">Filter the browser console with <code>[Backstage]</code>. Debug includes request assembly and tool lifecycle summaries; Trace includes high-frequency flow events. Operation History remains available independently.</div>
             `)}
 
@@ -6167,6 +6558,11 @@ function refreshSceneDirectorPanel() {
         .attr('title', sceneDirectorState.persistentIssue ? `${sceneDirectorState.persistentIssueSource || 'Issue'}: ${sceneDirectorState.persistentIssue}` : toggleStatusText);
     if (!panel.length) return;
 
+    characterSummaryPanel.dispose();
+
+    flushTextEditors();
+    destroyTextEditors();
+
     panel.toggleClass('sd-hidden', !sceneDirectorState.panelOpen);
     positionSceneDirectorPanel();
 
@@ -6188,14 +6584,13 @@ function refreshSceneDirectorPanel() {
                     ? renderLogsWorkspace()
                     : renderRouterWorkspace();
     body.html(`
-        <div class="sd-shell">
+        <div class="sd-shell${sceneDirectorState.activeTab === 'agents' ? ' sd-shell--characters' : ''}">
             ${renderWorkspaceNav()}
             ${workspace}
         </div>
     `);
 
-    const logErrorCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'error').length;
-    const logRunningCount = (sceneDirectorState.operationLogs ?? []).filter(log => log.status === 'running').length;
+    const latestLogStatus = sceneDirectorState.operationLogs?.[0]?.status ?? 'ready';
     const selectedAgent = getSelectedAgent();
     const selectedAgentStatus = selectedAgent ? getAgentRuntimeState(selectedAgent.id).lastStatus : 'idle';
     $('#scene-director-header-status').html(
@@ -6206,7 +6601,7 @@ function refreshSceneDirectorPanel() {
                 : sceneDirectorState.activeTab === 'evaluation'
                     ? renderStatusBadge(sceneDirectorState.evaluationWorkspace.status)
             : sceneDirectorState.activeTab === 'logs'
-                ? renderStatusBadge(logErrorCount ? 'error' : (logRunningCount ? 'running' : 'ready'))
+                ? renderStatusBadge(latestLogStatus)
                 : renderStatusBadge(sceneDirectorState.routerStatus)
     );
 
@@ -6228,7 +6623,50 @@ function refreshSceneDirectorPanel() {
     }
 
     refreshVisiblePromptTokenCounters();
+    characterSummaryPanel.updateControls(document.querySelector('.sd-memory-summary'));
+    characterSummaryPanel.initTabs();
+    if (sceneDirectorState.activeTab === 'agents') initAgentContentTabs();
+    else mountVisibleTextEditors();
+    refreshAgentRecentChatTokenCount();
     updateRuntimeTimingUi();
+}
+
+let recentChatTokenCountVersion = 0;
+let recentChatTokenCountDebounce = null;
+
+async function refreshAgentRecentChatTokenCount() {
+    const counter = document.getElementById('agent-recent-chat-tokens');
+    const input = document.getElementById('agent-context-messages');
+    if (!sceneDirectorState.panelOpen || !counter || !input || !input.getClientRects().length) return;
+
+    const version = ++recentChatTokenCountVersion;
+    const ctx = SillyTavern.getContext();
+    const limit = Math.min(5000, Math.max(1, parseInt(input.value) || DEFAULT_AGENT_CONTEXT_MESSAGES));
+    const includeHidden = document.getElementById('agent-include-hidden')?.checked ?? getSelectedAgent()?.includeHiddenMessages;
+    const agent = getSelectedAgent();
+    const offset = normalizeContextMessageOffset(document.getElementById('agent-context-message-offset')?.value ?? agent?.contextMessageOffset);
+    const formatSettings = { ...agent,
+        applyPromptRegex: document.getElementById('agent-apply-prompt-regex')?.checked ?? agent?.applyPromptRegex };
+    let entries;
+    try {
+        entries = agent?.internalType === SUMMARY_CREATION_TYPE
+            ? formatAgentRpContext(formatSettings, summaryCreation.prepare({ ...agent, contextMessages: limit,
+                contextMessageOffset: offset, includeHiddenMessages: includeHidden }, ctx).entries.map(entry => entry.message), ctx, true)
+            : formatAgentRpContext(formatSettings, getRpContextMessages(ctx.chat, includeHidden, offset).slice(-limit), ctx);
+    } catch (error) {
+        counter.textContent = error.message;
+        return;
+    }
+    const text = entries.join('\n');
+    counter.textContent = `Current chat: ${entries.length} messages · calculating...`;
+    try {
+        const tokens = text ? await ctx.getTokenCountAsync(text) : 0;
+        if (version !== recentChatTokenCountVersion || !counter.isConnected) return;
+        counter.textContent = `Current chat: ${entries.length} messages · ${Number(tokens) || 0} tokens`;
+    } catch {
+        if (version !== recentChatTokenCountVersion || !counter.isConnected) return;
+        counter.textContent = `Current chat: ${entries.length} messages · token count unavailable`;
+    }
 }
 
 function startToggleStatusTicker() {
@@ -6242,7 +6680,11 @@ function startToggleStatusTicker() {
             .text(toggleStatusText)
             .attr('title', sceneDirectorState.persistentIssue ? `${sceneDirectorState.persistentIssueSource || 'Issue'}: ${sceneDirectorState.persistentIssue}` : toggleStatusText);
         updateRuntimeTimingUi();
+        characterSummaryPanel.refreshRatings();
     }, 400);
+
+    if (window.__backstageRecentChatTokenInterval) window.clearInterval(window.__backstageRecentChatTokenInterval);
+    window.__backstageRecentChatTokenInterval = window.setInterval(refreshAgentRecentChatTokenCount, 10000);
 }
 
 function formatRouterPromptForCopy(request) {
@@ -6290,17 +6732,19 @@ function getAgentInjectionTargetsFromPanel() {
             const selectedOption = characterSelect.find('option:selected');
             return {
                 characterAvatar: String(characterSelect.val() ?? ''),
-                characterName: String(selectedOption.attr('data-character-name') ?? selectedOption.text() ?? '')
+                characterName: String(characterSelect.attr('data-character-name') ?? selectedOption.attr('data-character-name') ?? selectedOption.text() ?? '')
                     .replace(/\s*\(unavailable\)\s*$/i, '')
                     .trim(),
                 mode: element.find('[data-agent-injection-mode]').val() === 'full' ? 'full' : 'tag',
                 tag: normalizeOutputTagName(element.find('[data-agent-injection-tag]').val()),
+                optional: element.find('[data-agent-injection-optional]').is(':checked'),
             };
         })
         .get();
 }
 
 function preserveVisiblePanelDrafts() {
+    flushTextEditors();
     const routerPrompt = $('#router-prompt');
     if (routerPrompt.length) {
         config.routerPrompt = routerPrompt.val();
@@ -6325,6 +6769,22 @@ function preserveVisiblePanelDrafts() {
         sceneDirectorState.evaluationWorkspace.count = Math.min(50, Math.max(1, Number($('#evaluation-count').val()) || 8));
     }
     destroyAgentScriptEditor();
+    clearRouterPromptSaveTimer();
+    saveConfig();
+}
+
+function clearRouterPromptSaveTimer() {
+    if (!routerPromptSaveTimer) return;
+    window.clearTimeout(routerPromptSaveTimer);
+    routerPromptSaveTimer = null;
+}
+
+function scheduleRouterPromptSave() {
+    clearRouterPromptSaveTimer();
+    routerPromptSaveTimer = window.setTimeout(() => {
+        routerPromptSaveTimer = null;
+        saveConfig();
+    }, 500);
 }
 
 function schedulePromptTokenCounterUpdate(textareaId, counterId) {
@@ -6372,6 +6832,7 @@ function persistDirectorPanelFields() {
         sceneDirectorState.routerOocDraft = String($('#router-ooc-request').val() ?? '');
     }
 
+    clearRouterPromptSaveTimer();
     saveConfig();
 }
 
@@ -6381,7 +6842,6 @@ function persistAgentPanelFields() {
 
     if ($('#agent-enabled').length) agent.enabled = $('#agent-enabled').is(':checked');
     if ($('#agent-name').length) agent.name = String($('#agent-name').val() ?? '').trim() || agent.name;
-    if ($('#agent-owner').length) applyAgentOwnerValue(agent, $('#agent-owner').val());
     if ($('#agent-connection-mode').length) {
         agent.connectionMode = $('#agent-connection-mode').val() === AGENT_CONNECTION_MODES.PROFILE
             ? AGENT_CONNECTION_MODES.PROFILE
@@ -6429,6 +6889,11 @@ function persistAgentPanelFields() {
     if ($('#agent-context-messages').length) {
         agent.contextMessages = Math.min(5000, Math.max(1, parseInt($('#agent-context-messages').val()) || DEFAULT_AGENT_CONTEXT_MESSAGES));
     }
+    if ($('#agent-include-hidden').length) agent.includeHiddenMessages = $('#agent-include-hidden').is(':checked');
+    if ($('#agent-context-message-offset').length) {
+        agent.contextMessageOffset = normalizeContextMessageOffset($('#agent-context-message-offset').val());
+    }
+    if ($('#agent-apply-prompt-regex').length) agent.applyPromptRegex = $('#agent-apply-prompt-regex').is(':checked');
     if ($('#agent-max-tool-rounds').length) {
         agent.maxToolRounds = Math.min(MAX_AGENT_TOOL_ROUNDS, Math.max(1, parseInt($('#agent-max-tool-rounds').val()) || DEFAULT_AGENT_MAX_TOOL_ROUNDS));
     }
@@ -6538,6 +7003,7 @@ function createAgentFromPanel() {
         prompt: `You are ${name}, a focused support agent for an ongoing group roleplay.\n\nTask:\n- Define one narrow responsibility here.\n- Maintain only information relevant to that responsibility.\n- Update the prior state instead of discarding valid facts.\n- Do not narrate the roleplay.\n\nPrevious output:\n{{previousOutput}}\n\nRecent RP context:\n{{recentChat}}`,
     }, config.agents.length);
     applyAgentOwnerValue(agent, activeOwner.key);
+    agent.displayOrder = Math.max(-1, ...getAgentsForOwner(activeOwner.key).map(item => item.displayOrder || 0)) + 1;
     config.agents.push(agent);
     sceneDirectorState.activeAgentId = agent.id;
     sceneDirectorState.agentView = 'config';
@@ -6617,6 +7083,46 @@ function attachFloatingPanelEvents() {
     $('#scene-director-panel-body').on('click', '.sd-disclosure-summary', () => {
         window.setTimeout(refreshVisiblePromptTokenCounters, 0);
     });
+    document.getElementById('scene-director-panel-body').addEventListener('error', event => {
+        if (event.target.matches('img[data-character-portrait]')) event.target.remove();
+    }, true);
+    $(document).off('mousedown.backstageCharacterPicker keydown.backstageCharacterPicker')
+        .on('mousedown.backstageCharacterPicker', event => {
+            const picker = document.querySelector('#scene-director-panel .sd-character-picker[open]');
+            if (picker && !picker.contains(event.target)) {
+                picker.open = false;
+                picker.querySelector('summary').setAttribute('aria-expanded', 'false');
+            }
+        })
+        .on('keydown.backstageCharacterPicker', event => {
+            const picker = document.querySelector('#scene-director-panel .sd-character-picker[open]');
+            if (!picker || event.key !== 'Escape') return;
+            event.preventDefault();
+            event.stopPropagation();
+            picker.open = false;
+            picker.querySelector('summary').setAttribute('aria-expanded', 'false');
+            picker.querySelector('summary').focus();
+        });
+    $('#scene-director-panel-body').on('click', '.sd-character-picker > summary', function () {
+        const picker = this.parentElement;
+        window.setTimeout(() => {
+            this.setAttribute('aria-expanded', String(picker.open));
+            if (picker.open) picker.querySelector('[data-agent-owner-key][aria-pressed="true"]')?.focus();
+        }, 0);
+    });
+    $('#scene-director-panel-body').on('keydown', '[data-agent-owner-key]', function (event) {
+        const grid = this.closest('.sd-character-picker-grid');
+        const choices = [...grid.querySelectorAll('[data-agent-owner-key]')];
+        const columns = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+        const offset = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -columns, ArrowDown: columns }[event.key];
+        let index = choices.indexOf(this);
+        if (event.key === 'Home') index = 0;
+        else if (event.key === 'End') index = choices.length - 1;
+        else if (offset != null) index = Math.min(choices.length - 1, Math.max(0, index + offset));
+        else return;
+        event.preventDefault();
+        choices[index].focus();
+    });
     $('#scene-director-panel-body').on('click', '[data-router-view]', function () {
         preserveVisiblePanelDrafts();
         updateRouterState({ routerView: $(this).data('router-view') || 'workspace' });
@@ -6624,9 +7130,96 @@ function attachFloatingPanelEvents() {
     $('#scene-director-panel-body').on('click', '[data-agent-view]', function () {
         switchAgentView($(this).data('agent-view') || 'workspace');
     });
+    $('#scene-director-panel-body').on('click', '[data-character-view]', function () {
+        preserveVisiblePanelDrafts();
+        sceneDirectorState.characterView = $(this).attr('data-character-view') === 'summary' ? 'summary' : 'agents';
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('change', '[data-summary-field]', function () {
+        characterSummaryPanel.saveField(this);
+    });
+    $('#scene-director-panel-body').on('click', '[data-summary-refresh]', () => {
+        characterSummaryPanel.load();
+    });
+    $('#scene-director-panel-body').on('click', '[data-summary-usage-run]', () => {
+        characterSummaryPanel.runUsageTest();
+    });
+    $('#scene-director-panel-body').on('input', '[data-summary-usage-text]', function () {
+        characterSummaryPanel.updateUsageDraft(this.value);
+    });
+    $('#scene-director-panel-body').on('click', '[data-summary-usage-stop]', () => {
+        characterSummaryPanel.stopUsageTest();
+    });
+    $('#scene-director-panel-body').on('click', '[data-summary-reinforcement-stop]', () => {
+        characterSummaryPanel.stopReinforcement();
+    });
+    $('#scene-director-panel-body').on('click', '[data-character-connections]', function () {
+        sceneDirectorState.characterConnectionsOpen = !sceneDirectorState.characterConnectionsOpen;
+        $(this).attr('aria-expanded', String(sceneDirectorState.characterConnectionsOpen));
+        $('#character-connections').toggleClass('sd-hidden', !sceneDirectorState.characterConnectionsOpen);
+        window.dispatchEvent(new Event('resize'));
+    });
+    $('#scene-director-panel-body').on('keydown', '[data-character-view]', function (event) {
+        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+        event.preventDefault();
+        const target = $(this).attr('data-character-view') === 'summary' ? 'agents' : 'summary';
+        $(`[data-character-view="${target}"]`).trigger('click');
+        $(`[data-character-view="${target}"]`).trigger('focus');
+    });
     $('#scene-director-panel-body').on('click', '[data-agent-id]', function () {
         preserveVisiblePanelDrafts();
         updateSceneDirectorState({ activeAgentId: String($(this).data('agent-id') ?? '') });
+    });
+    $('#scene-director-panel-body').on('click', '[data-agent-move]', function () {
+        preserveVisiblePanelDrafts();
+        const agents = getAgentsForOwner();
+        const agent = getSelectedAgent();
+        const offset = Number($(this).attr('data-agent-move'));
+        const target = agents[agents.indexOf(agent) + offset];
+        if (!agent || !target) return;
+        reorderVisibleAgent(agent.id, target.id, offset > 0);
+        refreshSceneDirectorPanel();
+    });
+    let draggedAgentId = '';
+    $('#scene-director-panel-body').on('dragstart', '[data-agent-id]', function (event) {
+        draggedAgentId = String($(this).attr('data-agent-id'));
+        event.originalEvent.dataTransfer.setData('text/plain', draggedAgentId);
+        event.originalEvent.dataTransfer.effectAllowed = 'move';
+        $(this).addClass('sd-agent-dragging');
+    });
+    $('#scene-director-panel-body').on('dragover', '[data-agent-id]', function (event) {
+        if (!draggedAgentId || draggedAgentId === $(this).attr('data-agent-id')) return;
+        event.preventDefault();
+        const bounds = this.getBoundingClientRect();
+        const after = event.originalEvent.clientY > bounds.top + bounds.height / 2;
+        $('#scene-director-panel .sd-agent-drop-before, #scene-director-panel .sd-agent-drop-after').removeClass('sd-agent-drop-before sd-agent-drop-after');
+        $(this).addClass(after ? 'sd-agent-drop-after' : 'sd-agent-drop-before');
+    });
+    $('#scene-director-panel-body').on('drop', '[data-agent-id]', function (event) {
+        if (!draggedAgentId) return;
+        event.preventDefault();
+        preserveVisiblePanelDrafts();
+        reorderVisibleAgent(draggedAgentId, String($(this).attr('data-agent-id')), $(this).hasClass('sd-agent-drop-after'));
+        draggedAgentId = '';
+        refreshSceneDirectorPanel();
+    });
+    $('#scene-director-panel-body').on('dragend', '[data-agent-id]', () => {
+        draggedAgentId = '';
+        $('#scene-director-panel .sd-agent-dragging, #scene-director-panel .sd-agent-drop-before, #scene-director-panel .sd-agent-drop-after')
+            .removeClass('sd-agent-dragging sd-agent-drop-before sd-agent-drop-after');
+    });
+    $('#scene-director-panel-body').on('keydown', '[data-agent-id]', function (event) {
+        if (!event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+        const agents = getAgentsForOwner();
+        const index = agents.findIndex(agent => agent.id === $(this).attr('data-agent-id'));
+        const target = agents[index + (event.key === 'ArrowUp' ? -1 : 1)];
+        if (!target || index < 0) return;
+        event.preventDefault();
+        preserveVisiblePanelDrafts();
+        const id = agents[index].id;
+        reorderVisibleAgent(id, target.id, event.key === 'ArrowDown');
+        refreshSceneDirectorPanel();
+        $('#scene-director-panel [data-agent-id]').filter((_, item) => item.dataset.agentId === id).trigger('focus');
     });
     $('#scene-director-panel-body').on('click', '[data-agent-owner-key]', function () {
         preserveVisiblePanelDrafts();
@@ -6634,6 +7227,7 @@ function attachFloatingPanelEvents() {
         sceneDirectorState.activeAgentOwnerKey = ownerKey;
         sceneDirectorState.activeAgentId = getAgentsForOwner(ownerKey)[0]?.id ?? '';
         refreshSceneDirectorPanel();
+        document.querySelector('#scene-director-panel .sd-character-picker > summary')?.focus();
     });
     $('#scene-director-panel-body').on('click', '#agent-create', () => createAgentFromPanel());
     $('#scene-director-panel-body').on('change', '#memory-source-characters input, #memory-source-lorebooks input', captureMemoryWorkspaceFields);
@@ -6695,6 +7289,12 @@ function attachFloatingPanelEvents() {
         } catch (error) {
             toastr.error(error?.message ?? String(error), EXTENSION_LABEL);
         }
+    });
+    $('#scene-director-panel-body').on('click', '[data-summary-creation-retry]', async () => {
+        const agent = getSelectedAgent();
+        if (!agent || agent.internalType !== SUMMARY_CREATION_TYPE) return;
+        try { await executeAgent(agent.id, { type: 'retry-save', label: 'Retry original memory registration' }); }
+        catch (error) { toastr.error(error.message, EXTENSION_LABEL); }
     });
     $('#scene-director-panel-body').on('click', '[data-agent-stop]', () => {
         const agent = getSelectedAgent();
@@ -6814,20 +7414,19 @@ function attachFloatingPanelEvents() {
         event.preventDefault();
         $(this).trigger('blur');
     });
-    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-max-tool-rounds, #agent-prompt, #agent-output, #agent-injection-depth, #agent-action-test-payload, #agent-graphiti-read-groups, #agent-graphiti-write-group, [data-agent-injection-tag]', () => {
+    $('#scene-director-panel-body').on('focusout', '#agent-name, #agent-interval, #agent-character-name, #agent-context-messages, #agent-context-message-offset, #agent-max-tool-rounds, #agent-prompt, #agent-output, #agent-injection-depth, #agent-action-test-payload, #agent-graphiti-read-groups, #agent-graphiti-write-group, [data-agent-injection-tag]', () => {
         persistAgentPanelFields();
     });
-    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-graphiti-ooc-enabled, #agent-graphiti-automatic-enabled, #agent-log-level, #agent-action-auto-run, [data-agent-graphiti-permission], [data-agent-injection-character]', () => {
-        persistAgentPanelFields();
+    $('#scene-director-panel-body').on('input', '#agent-context-messages, #agent-context-message-offset', () => {
+        if (recentChatTokenCountDebounce) window.clearTimeout(recentChatTokenCountDebounce);
+        recentChatTokenCountDebounce = window.setTimeout(refreshAgentRecentChatTokenCount, 400);
     });
-    $('#scene-director-panel-body').on('change', '#agent-owner, #agent-connection-mode', () => {
-        const selectedAgentId = sceneDirectorState.activeAgentId;
+    $('#scene-director-panel-body').on('change', '#agent-enabled, #agent-include-hidden, #agent-apply-prompt-regex, #agent-profile-dropdown, #agent-reference-character, #agent-validate-output-format, #agent-graphiti-ooc-enabled, #agent-graphiti-automatic-enabled, #agent-log-level, #agent-action-auto-run, [data-agent-graphiti-permission], [data-agent-injection-character], [data-agent-injection-optional]', () => {
         persistAgentPanelFields();
-        const agent = (config.agents ?? []).find(item => item.id === selectedAgentId);
-        if (agent && $('#agent-owner').length) {
-            sceneDirectorState.activeAgentOwnerKey = getAgentOwnerKey(agent);
-            sceneDirectorState.activeAgentId = agent.id;
-        }
+        refreshAgentRecentChatTokenCount();
+    });
+    $('#scene-director-panel-body').on('change', '#agent-connection-mode', () => {
+        persistAgentPanelFields();
         refreshSceneDirectorPanel();
     });
     $('#scene-director-panel-body').on('change', '#agent-action-enabled', () => {
@@ -6937,11 +7536,17 @@ function attachFloatingPanelEvents() {
         saveConfig();
         backstageLogger.info('Core', `Console log level changed to ${config.consoleLogLevel}`);
     });
+    $('#scene-director-panel-body').on('change', '#backstage-memory-search-logs', function () {
+        config.memorySearchLogs = this.checked;
+        saveConfig();
+    });
     $('#scene-director-panel-body').on('focusout', '#router-input-token-budget, #router-prompt', () => {
         persistDirectorPanelFields();
     });
-    $('#scene-director-panel-body').on('input', '#router-prompt', () => {
+    $('#scene-director-panel-body').on('input', '#router-prompt', function () {
+        config.routerPrompt = String($(this).val() ?? '');
         schedulePromptTokenCounterUpdate('router-prompt', 'router-prompt-token-counter');
+        scheduleRouterPromptSave();
     });
     $('#scene-director-panel-body').on('change', '#router-input-token-budget', () => {
         persistDirectorPanelFields();
@@ -7089,7 +7694,7 @@ async function initAgentWorldInfoSelect() {
 }
 
 async function initCharProfileDropdowns() {
-    if (!$('.sd-owner-connection-panel').length) return;
+    if (!$('.sd-character-connections').length) return;
     const service = await getConnService();
     config.characters.forEach((char, idx) => {
         if ($(`#char-generation-profile-${idx}`).length) {
@@ -7284,6 +7889,8 @@ jQuery(document).ready(async () => {
     });
 
     ctx.eventSource.on(ctx.event_types.GENERATION_STOPPED, () => {
+        const stoppedContext = SillyTavern.getContext();
+        memoryReinforcement.ignoreMessage(stoppedContext.chat?.at(-1));
         fl('← EVT', 'GENERATION_STOPPED', `isProcessing=${isProcessing}`);
         backstageLogger.warn('Generation', 'Generation stopped', { isProcessing });
         if (!isProcessing) {

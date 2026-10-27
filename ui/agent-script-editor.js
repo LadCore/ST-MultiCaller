@@ -27,7 +27,7 @@ function loadScriptOnce(src) {
     });
 }
 
-async function ensureAceLoaded() {
+export async function ensureAceLoaded() {
     if (window.ace) return window.ace;
     loadingPromise ??= loadScriptOnce(ACE_CORE_URL).then(() => {
         if (!window.ace) throw new Error('Ace loaded without exposing window.ace.');
