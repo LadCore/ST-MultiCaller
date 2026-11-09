@@ -1,5 +1,11 @@
 const API_URL = 'http://127.0.0.1:8091';
 
+/** Exclude balanced single-asterisk RP actions, preserving escaped stars and Markdown bold. */
+export function prepareSemanticQuery(text) {
+    return String(text ?? '').replace(/(?<![\\*])\*(?!\*)(?:\\[\s\S]|[^\\*])*\*(?!\*)/g, ' ')
+        .replace(/[ \t]{2,}/g, ' ').trim();
+}
+
 async function request(path, body, { method = 'POST', signal, fetchImpl = fetch } = {}) {
     const timeout = AbortSignal.timeout(60000);
     const response = await fetchImpl(`${API_URL}${path}`, {
@@ -28,23 +34,26 @@ function decodeSingle(response, id) {
     return memory;
 }
 
-/** Search all scoped memories, independently of the current box cutoff. */
-export async function findReinforcementCandidates(scope, query, limit, options = {}) {
-    const response = await request('/memorybox/query', { ...scope, query, limit }, options);
-    if (!Array.isArray(response?.results) || !response.meta || response.meta.partial) {
-        throw new Error('Incomplete MemoryBox semantic response.');
-    }
+/** Retrieve native fact matches grouped by source-memory ID, without a usage classifier or writes. */
+export async function findSemanticCandidates(scope, query, limit, { minSimilarity = null, ...options } = {}) {
+    const body = { ...scope, query, limit };
+    if (minSimilarity != null) body.min_similarity = minSimilarity;
+    const response = await request('/memorybox/semantic-candidates', body, options);
+    if (!Array.isArray(response)) throw new Error('Expected a semantic-candidates root array.');
     const candidates = new Map();
-    for (const fact of response.results) {
-        for (const reference of fact.references?.n2 ?? []) {
-            if (!reference.id || !String(reference.text ?? '').trim()) throw new Error('Invalid semantic N2 reference.');
-            if (!candidates.has(reference.id)) candidates.set(reference.id, {
-                id: reference.id, text: reference.text, importance: reference.importance ?? null,
-                last_relevant_message_index: reference.last_relevant_message_index ?? null, boost: reference.boost ?? null,
-            });
+    for (const item of response) {
+        if (!item || typeof item.id !== 'string' || !item.id || typeof item.n1 !== 'string'
+            || !Array.isArray(item.matches) || !item.matches.length
+            || item.matches.some(match => !match || typeof match.fact_id !== 'string' || !match.fact_id
+                || !Number.isFinite(match.similarity))) {
+            throw new Error('Invalid semantic memory candidate.');
         }
+        const previous = candidates.get(item.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(item)) throw new Error('Conflicting semantic memory candidates.');
+        candidates.set(item.id, item);
     }
-    return { candidates: [...candidates.values()].slice(0, limit), found: candidates.size, meta: response.meta };
+    // The API limit bounds facts, not source-memory IDs. Do not truncate their sources again.
+    return { candidates: [...candidates.values()], found: candidates.size };
 }
 
 export async function readScopedMemory(scope, id, options = {}) {

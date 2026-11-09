@@ -14,7 +14,7 @@ export function createCharacterSummaryPanel({
     refreshTokens = () => {},
 }) {
     let disposeMemoryList = null;
-    const dispose = () => { disposeMemoryList?.(); disposeMemoryList = null; };
+    const dispose = () => { disposeMemoryList?.(); disposeMemoryList = null; usagePanel.dispose(); };
     const usagePanel = createSummaryUsagePanel({ getContext, getOwner, escapeHtml });
     const requests = new WeakMap();
     const statuses = new WeakMap();
@@ -56,20 +56,19 @@ export function createCharacterSummaryPanel({
                 </div>
             </details>
             <details class="sd-summary-settings" data-summary-expand="reinforcement"><summary>Automatic memory reinforcement</summary>
-                <label class="sd-checkbox-row"><input type="checkbox" data-summary-field="reinforcement.enabled" ${settings.reinforcement.enabled ? 'checked' : ''}><span>Reinforce memories before ${escapeHtml(character.name)} replies</span></label>
+                <label class="sd-checkbox-row"><input type="checkbox" data-summary-field="reinforcement.enabled" ${settings.reinforcement.enabled ? 'checked' : ''}><span>Semantic SideBox for ${escapeHtml(character.name)}</span></label>
                 <div class="sd-row">
-                    <label>Minimum P(used)<input class="text_pole" type="number" min="0" max="1" step="0.01" data-summary-field="reinforcement.minUsageProbability" value="${settings.reinforcement.minUsageProbability}"></label>
-                    <label>Minimum confidence<input class="text_pole" type="number" min="0" max="1" step="0.01" data-summary-field="reinforcement.minConfidence" value="${settings.reinforcement.minConfidence}"></label>
-                    <label>Maximum candidate memories<input class="text_pole" type="number" min="1" max="50" step="1" data-summary-field="reinforcement.candidateLimit" value="${settings.reinforcement.candidateLimit}"></label>
+                    <label>Minimum semantic similarity<input class="text_pole" type="number" min="-1" max="1" step="0.01" data-summary-field="reinforcement.minSimilarity" value="${settings.reinforcement.minSimilarity ?? ''}"></label>
+                    <label>Maximum semantic facts<input class="text_pole" type="number" min="1" max="50" step="1" data-summary-field="reinforcement.candidateLimit" value="${settings.reinforcement.candidateLimit}"></label>
                 </div>
-                <p class="sd-summary-status"><code>alvo = corte + (1 - corte) × (importance / 5)</code><br>Exige used e os dois limites. O boost completa o alvo sem reduzir um reforço efetivo maior. Importância e origem não mudam.</p>
+                <p class="sd-summary-status"><code>alvo = corte + (1 - corte) × (importance / 5)</code></p>
             </details>
             <section class="sd-card"><div class="sd-card-head"><h4 class="sd-card-title">Memories</h4></div><div class="sd-card-body">
             ${reinforcementStatus.pending ? `<div class="sd-summary-status">Memory reinforcement: ${reinforcementStatus.pending} pending <button type="button" class="menu_button" data-summary-reinforcement-stop><i class="fa-solid fa-stop" aria-hidden="true"></i> Stop</button></div>` : ''}
             ${reinforcementStatus.lastError ? `<div class="sd-summary-reinforcement-error" role="alert">${escapeHtml(reinforcementStatus.lastError)}</div>` : ''}
-            <div class="sd-summary-status" role="status">${summary ? `${summary.memories.length}/${summary.allMemories?.length ?? summary.memories.length} memories in box · ` : ''}<span data-token-count-result>...</span> · Chat index ${getContext().chat?.length ?? 0} · ${escapeHtml(status.error || (summary ? `${new Date(summary.updatedAt).toLocaleString()}${current ? '' : ' · Source changed or incomplete cache; update required'}` : 'No summary loaded.'))}</div>
+            <div class="sd-summary-status" role="status">${summary ? `${summary.memories.length} In · ${summary.sideMemories?.length ?? 0} Side · ${(summary.allMemories?.length ?? summary.memories.length) - summary.memories.length - (summary.sideMemories?.length ?? 0)} Out · ` : ''}<span data-token-count-result>...</span> · Chat index ${getContext().chat?.length ?? 0} · ${escapeHtml(status.error || (summary ? `${new Date(summary.updatedAt).toLocaleString()}${current ? '' : ' · Source changed or incomplete cache; update required'}` : 'No summary loaded.'))}</div>
             <div>
-                <pre id="character-summary-text" hidden data-token-count-source data-token-count-empty="${!summary?.text}">${escapeHtml(summary?.text || '')}</pre>
+                <pre id="character-summary-text" hidden data-token-count-source data-token-count-empty="${!summary?.injectionText}">${escapeHtml(summary?.injectionText || '')}</pre>
                 <div data-summary-virtual-list></div>
             </div>
             </div></section>
@@ -109,6 +108,9 @@ export function createCharacterSummaryPanel({
     function updateControls(root) {
         if (!root) return;
         const settings = normalizeSummaryConfig(getOwner().character?.summary);
+        root.querySelectorAll('[data-summary-field="reinforcement.minSimilarity"]').forEach(element => {
+            element.value = settings.reinforcement.minSimilarity ?? '';
+        });
         root.querySelectorAll('[data-summary-field^="characterInjection"]').forEach(element => {
             element.disabled = !settings.enabled || (element.type !== 'radio' && settings.characterInjectionPosition !== 'in-chat');
         });
@@ -162,10 +164,12 @@ export function createCharacterSummaryPanel({
                         disposeMemoryList = mountSummaryMemoryList(root.querySelector('[data-summary-virtual-list]'),
                             getCharacterSummary(getContext(), owner.character), escapeHtml, refreshTokens);
                     }
+                    if (label === 'Usage test') usagePanel.mount(); else usagePanel.dispose();
                     onTabSelected(label);
                 } });
         },
         stopReinforcement: () => { const owner = getOwner(); if (owner.character) stopReinforcement(owner.character); },
         runUsageTest: usagePanel.run, stopUsageTest: usagePanel.stop, updateUsageDraft: usagePanel.updateDraft,
+        updateUsageScope: usagePanel.updateScope,
     };
 }

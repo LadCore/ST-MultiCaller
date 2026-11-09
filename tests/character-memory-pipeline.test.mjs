@@ -26,14 +26,14 @@ function pipelineFixture({ failCheck = false } = {}) {
     const gate = new Promise(resolve => { release = resolve; });
     const engine = createMemoryReinforcement({
         getContext: () => ctx, getCharacters: () => [character],
-        findCandidates: async () => ({ candidates: [memory] }),
-        checkUsage: async (_reference, messages) => {
-            steps.push('check');
-            assert.equal(messages.length, 2);
+        findCandidates: async (_scope, query) => {
+            steps.push('search');
+            assert.match(query, /Juliano: Remember Aiko\?/);
+            assert.match(query, /Tio Klarus: I remember her\./);
             entered();
             await gate;
             if (failCheck) throw new Error('Verifier offline');
-            return { verdict: 'used', usage_probability: 0.99, confidence: 0.99 };
+            return { candidates: [{ id: memory.id, n1: 'Old memory', matches: [{ fact_id: 'fact', similarity: 0.9 }] }] };
         },
         readMemory: async () => structuredClone(memory),
         patchBoost: async (_scope, _id, boost) => { steps.push('patch'); return { ...memory, boost }; },
@@ -53,7 +53,7 @@ function pipelineFixture({ failCheck = false } = {}) {
         setCharacterNote: noop, setDirectedOocPrompt: noop,
         applyAgentCharacterInjection: () => {
             steps.push('injection');
-            sandbox.injectedSummary = getCharacterSummary(ctx, character).text;
+            sandbox.injectedSummary = getCharacterSummary(ctx, character).injectionText;
             return { applied: [], errors: [] };
         },
         beginRuntimePhase: noop, getTimingModelLabel: () => 'model', getActiveOperationLogId: () => 'turn',
@@ -76,14 +76,14 @@ function pipelineFixture({ failCheck = false } = {}) {
     return { sandbox, character, steps, started, release, engine };
 }
 
-test('native pipeline waits for reinforcement after profile settle and injects the boosted summary before trigger', async () => {
+test('native pipeline retrieves SideBox after profile settle and injects it without a pre-turn boost', async () => {
     const f = pipelineFixture();
     const pending = f.sandbox.triggerChar(f.character);
     await f.started;
-    assert.deepEqual(f.steps, ['agents', 'profile', 'check']);
+    assert.deepEqual(f.steps, ['agents', 'profile', 'search']);
     f.release();
     await pending;
-    assert.deepEqual(f.steps, ['agents', 'profile', 'check', 'patch', 'injection', 'trigger']);
+    assert.deepEqual(f.steps, ['agents', 'profile', 'search', 'injection', 'trigger']);
     assert.equal(f.sandbox.injectedSummary, 'An old memory.');
 });
 
@@ -114,4 +114,27 @@ test('directed OOC bypasses automatic reinforcement', async () => {
     const f = pipelineFixture();
     await f.sandbox.triggerChar(f.character, null, { directOocText: 'OOC test' });
     assert.deepEqual(f.steps, ['profile', 'injection', 'trigger']);
+});
+
+test('native completed-message handling waits for the SideBox comparison before scheduling the router', async () => {
+    const f = pipelineFixture();
+    const pending = f.sandbox.triggerChar(f.character);
+    await f.started;
+    f.release();
+    await pending;
+    const ctx = f.sandbox.SillyTavern.getContext();
+    const reply = { name: f.character.name, mes: 'Juliano: Remember Aiko? Tio Klarus: I remember her.' };
+    ctx.chat.push(reply);
+    Object.assign(f.sandbox, { handledCharacterTurnMessages: new WeakSet(), pendingNativeCharacterMessage: null,
+        isHostGenerationActive: async () => false, isToolInvocationChatMessage: () => false,
+        scheduleAgentsForTurn: () => f.steps.push('scheduled'), skipNextCharacterAutoRouter: false,
+        runRouter: () => f.steps.push('router') });
+    const processSource = source.match(/async function processCompletedCharacterMessage\([^]*?\n\}/)?.[0];
+    assert(processSource);
+    vm.runInContext(processSource, f.sandbox);
+    await f.sandbox.processCompletedCharacterMessage(reply, 'test');
+    assert.deepEqual(f.steps.slice(-4), ['search', 'patch', 'scheduled', 'router']);
+    assert.equal(getCharacterSummary(ctx, f.character).sideMemories.length, 0);
+    await f.sandbox.processCompletedCharacterMessage(reply, 'duplicate');
+    assert.equal(f.steps.filter(step => step === 'patch').length, 1);
 });

@@ -1,87 +1,128 @@
-import { getCharacterSummary, summarySourceKey } from '../memory/character-summary.js';
-import { checkSummaryMemoryUsage } from '../memory/summary-usage.js';
+import { getCharacterSummary, getSummaryScope, normalizeSummaryConfig, summarySourceKey } from '../memory/character-summary.js';
+import { findSemanticCandidates, prepareSemanticQuery } from '../memory/memorybox-client.js';
 import { refreshReadOnlyTokenCounters, scheduleTokenCounterUpdate } from './token-counters.js';
+import { selectSummaryMemories } from './summary-memory-list.js';
+import { SEMANTIC_COLUMNS, mountMemoryResultsTable } from './memory-results-table.js';
 
-/** Keep test snapshots and results in browser memory only, separately from persisted summaries. */
-export function createSummaryUsagePanel({ getContext, getOwner, escapeHtml, checkUsage = checkSummaryMemoryUsage }) {
+/** Preserve native fact matches without claiming that retrieval confirms use. */
+export function buildSemanticTestRows(summary, candidates) {
+    const remaining = new Map((summary.allMemories ?? []).map(memory => [memory.id, memory]));
+    const rows = candidates.map(candidate => {
+        const memory = remaining.get(candidate.id) ?? { id: candidate.id, text: candidate.n1, loaded: false };
+        remaining.delete(candidate.id);
+        return { memory, returned: true, matches: candidate.matches };
+    });
+    return [...rows, ...[...remaining.values()].map(memory => ({ memory, returned: false, matches: [] }))];
+}
+
+/** One read-only semantic request per test, with transient per-chat diagnostics. */
+export function createSummaryUsagePanel({ getContext, getOwner, escapeHtml, findCandidates = findSemanticCandidates }) {
     const states = new WeakMap();
+    let table;
     const stateMap = metadata => {
         if (!states.has(metadata)) states.set(metadata, new Map());
         return states.get(metadata);
     };
-    const percentage = value => Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : '-';
+    const current = () => stateMap(getContext().chatMetadata).get(getOwner().key);
+    const dispose = () => { table?.destroy(); table = null; };
+    const visibleRows = state => {
+        const ids = new Set(selectSummaryMemories({ allMemories: (state?.rows ?? []).map(row => row.memory) },
+            state?.scope ?? 'all').map(memory => memory.id));
+        return (state?.rows ?? []).filter(row => ids.has(row.memory.id));
+    };
 
     function render(owner) {
         const state = stateMap(getContext().chatMetadata).get(owner.key);
-        const rows = state?.rows ?? [];
-        return `<div class="sd-summary-usage-heading"><b>Usage test</b><button type="button" class="menu_button" ${state?.running ? 'data-summary-usage-stop' : 'data-summary-usage-run'}><i class="fa-solid fa-${state?.running ? 'stop' : 'flask'}" aria-hidden="true"></i> ${state?.running ? 'Stop' : 'Compare text'}</button></div>
-            <div data-token-count-container><label for="summary-usage-text">Text to compare</label><textarea id="summary-usage-text" data-summary-usage-text data-token-count-source class="text_pole" rows="6" spellcheck="false" ${state?.running ? 'readonly' : ''}>${escapeHtml(state?.draft ?? '')}</textarea><div class="sd-editor-meta"><span></span><span id="summary-usage-text-tokens" data-token-count-result>0 tokens</span></div></div>
-            <div class="sd-summary-status" role="status">${escapeHtml(state?.total != null ? state.error || `${rows.length}/${state.total} memories · ${state.running ? 'Running' : 'Finished'} · Ratings unchanged` : 'Not run')}</div>
-            ${rows.length ? `<div class="sd-summary-usage-table"><table><thead><tr><th>Memory / N2</th><th>Rating</th><th>Verdict</th><th>P(used)</th><th>Confidence</th></tr></thead><tbody>${rows.map(row => `<tr><td><details data-token-count-container open><summary>${escapeHtml(row.memory.id)} · <span data-token-count-result>...</span></summary><pre data-token-count-source>${escapeHtml(row.memory.text)}</pre></details>${row.result ? `<small>${escapeHtml(row.result.model ?? '')}</small>` : ''}${row.result?.warnings?.length ? `<div>${escapeHtml(row.result.warnings.join(' | '))}</div>` : ''}</td><td>${escapeHtml(row.memory.rating)}</td><td>${escapeHtml(row.error || row.result.verdict)}</td><td>${percentage(row.result?.usage_probability)}</td><td>${percentage(row.result?.confidence)}</td></tr>`).join('')}</tbody></table></div>` : ''}`;
+        const settings = normalizeSummaryConfig(owner.character?.summary).reinforcement;
+        const summary = owner.character ? getCharacterSummary(getContext(), owner.character) : null;
+        const source = state?.rows ? { allMemories: state.rows.map(row => row.memory) } : summary;
+        const scopes = [['all', 'All memories'], ['inside', 'In box'], ['side', 'Side box'], ['outside', 'Outside box']];
+        const status = state?.error || (state?.running ? 'Searching...' : state?.rows
+            ? `${state.rows.filter(row => row.returned).length} returned memories · ${visibleRows(state).length} displayed · Ratings unchanged`
+            : 'Not run');
+        return `<div class="sd-summary-usage-heading"><b>Semantic test</b><button type="button" class="menu_button" ${state?.running ? 'data-summary-usage-stop' : 'data-summary-usage-run'}><i class="fa-solid fa-${state?.running ? 'stop' : 'flask'}" aria-hidden="true"></i> ${state?.running ? 'Stop' : 'Search'}</button></div>
+            <label>Display filter<select class="text_pole" data-summary-usage-scope ${state?.running ? 'disabled' : ''}>${scopes.map(([value, label]) => `<option value="${value}" ${(state?.scope ?? 'all') === value ? 'selected' : ''}>${label} (${selectSummaryMemories(source, value).length})</option>`).join('')}</select></label>
+            <label>Minimum semantic similarity<input class="text_pole" type="number" min="-1" max="1" step="0.01" data-summary-field="reinforcement.minSimilarity" value="${settings.minSimilarity ?? ''}" ${state?.running ? 'disabled' : ''}></label>
+            <div data-token-count-container><label for="summary-usage-text">Text to search</label><textarea id="summary-usage-text" data-summary-usage-text data-token-count-source class="text_pole" rows="3" spellcheck="false" ${state?.running ? 'readonly' : ''}>${escapeHtml(state?.draft ?? '')}</textarea><div class="sd-editor-meta"><span>Min similarity: ${escapeHtml(settings.minSimilarity ?? 'none')} · Fact limit: ${settings.candidateLimit}</span><span id="summary-usage-text-tokens" data-token-count-result>0 tokens</span></div></div>
+            <div class="sd-summary-status" role="status">${escapeHtml(status)}</div><div data-summary-semantic-results></div>
+            ${state?.request ? `<details data-token-count-container><summary>Request · <span data-token-count-result>...</span></summary><pre data-token-count-source>${escapeHtml(JSON.stringify(state.request, null, 2))}</pre></details>` : ''}`;
     }
 
-    function notify(metadata, ownerKey) {
-        if (getContext().chatMetadata !== metadata || getOwner().key !== ownerKey) return;
+    function mount() {
+        dispose();
+        const root = document.querySelector('[data-summary-semantic-results]'), state = current();
+        if (!root || !state?.rows || root.closest('[hidden]')) return;
+        table = mountMemoryResultsTable(root, { rows: visibleRows(state), columns: SEMANTIC_COLUMNS, escapeHtml,
+            sort: state.sort ?? { column: 'returned', direction: 'asc' }, onSort: sort => { state.sort = sort; },
+            onRender: () => refreshReadOnlyTokenCounters(root, text => getContext().getTokenCountAsync(text)) });
+    }
+
+    function notify(metadata, key) {
+        if (getContext().chatMetadata !== metadata || getOwner().key !== key) return;
         const root = document.querySelector('[data-summary-usage]');
         if (!root) return;
+        dispose();
         root.innerHTML = render(getOwner());
+        mount();
         refreshReadOnlyTokenCounters(root, text => getContext().getTokenCountAsync(text));
     }
 
     async function run() {
-        const ctx = getContext();
-        const owner = getOwner();
+        const ctx = getContext(), owner = getOwner();
         if (!owner.character) return;
-        const map = stateMap(ctx.chatMetadata);
-        if (map.get(owner.key)?.running) return;
+        const map = stateMap(ctx.chatMetadata), previous = map.get(owner.key) ?? {};
+        if (previous.running) return;
         const summary = getCharacterSummary(ctx, owner.character);
-        const draft = map.get(owner.key)?.draft ?? '';
-        const messages = [{ role: 'assistant', name: owner.character.name, content: draft }];
-        const state = { draft, rows: [], total: summary?.memories.length ?? 0, running: false, error: '' };
+        const state = { draft: previous.draft ?? '', scope: previous.scope ?? 'all', sort: previous.sort, error: '' };
+        const query = prepareSemanticQuery(state.draft);
         map.set(owner.key, state);
-        if (!summary?.memories.length || summary.needsRefresh || summary.sourceKey !== summarySourceKey(owner.character)) {
+        if (!summary || summary.needsRefresh || summary.sourceKey !== summarySourceKey(owner.character)) {
             state.error = 'Update the summary before testing.';
-        } else if (!draft.trim()) {
-            state.error = 'Enter text to compare.';
-        }
+        } else if (!query) state.error = 'Enter text to search outside *actions*.';
         if (state.error) { notify(ctx.chatMetadata, owner.key); return; }
-        const controller = new AbortController();
+        const settingsKey = JSON.stringify(normalizeSummaryConfig(owner.character.summary));
+        const settings = normalizeSummaryConfig(owner.character.summary).reinforcement;
+        const scope = getSummaryScope(owner.character), controller = new AbortController();
         state.controller = controller;
         state.running = true;
+        state.request = { ...scope, query, limit: settings.candidateLimit,
+            ...(settings.minSimilarity != null ? { min_similarity: settings.minSimilarity } : {}) };
         notify(ctx.chatMetadata, owner.key);
         try {
-            for (const memory of summary.memories) {
-                if (controller.signal.aborted || getContext().chatMetadata !== ctx.chatMetadata) break;
-                try {
-                    const result = await checkUsage(memory.text, messages, { signal: controller.signal });
-                    state.rows.push({ memory, result });
-                } catch (error) {
-                    if (controller.signal.aborted) break;
-                    state.rows.push({ memory, error: error.message });
-                }
-                notify(ctx.chatMetadata, owner.key);
+            const result = await findCandidates(scope, query, settings.candidateLimit,
+                { signal: controller.signal, minSimilarity: settings.minSimilarity });
+            if (controller.signal.aborted) throw new Error('Test stopped. Ratings unchanged.');
+            if (getContext().chatMetadata !== ctx.chatMetadata) throw new Error('Chat changed. Results discarded.');
+            if (JSON.stringify(normalizeSummaryConfig(owner.character.summary)) !== settingsKey) {
+                throw new Error('Summary settings changed. Results discarded.');
             }
+            state.rows = buildSemanticTestRows(summary, result.candidates);
+        } catch (error) {
+            state.error = controller.signal.aborted ? 'Test stopped. Ratings unchanged.' : error.message;
         } finally {
             state.running = false;
-            if (controller.signal.aborted) state.error = 'Test stopped. Ratings unchanged.';
-            else if (getContext().chatMetadata !== ctx.chatMetadata) state.error = 'Chat changed. Test stopped.';
             notify(ctx.chatMetadata, owner.key);
         }
     }
 
-    function stop() {
-        stateMap(getContext().chatMetadata).get(getOwner().key)?.controller?.abort();
-    }
+    function stop() { current()?.controller?.abort(); }
 
     function updateDraft(text) {
-        const ctx = getContext();
-        const key = getOwner().key;
-        const map = stateMap(ctx.chatMetadata);
-        const state = map.get(key) ?? {};
+        const ctx = getContext(), key = getOwner().key, map = stateMap(ctx.chatMetadata), state = map.get(key) ?? {};
         if (state.running) return;
-        map.set(key, { draft: text });
+        map.set(key, { draft: text, scope: state.scope ?? 'all', sort: state.sort });
+        dispose();
+        document.querySelector('[data-summary-semantic-results]')?.replaceChildren();
         scheduleTokenCounterUpdate('summary-usage-text', 'summary-usage-text-tokens', value => ctx.getTokenCountAsync(value));
     }
 
-    return { render, run, stop, updateDraft };
+    function updateScope(value) {
+        const ctx = getContext(), key = getOwner().key, map = stateMap(ctx.chatMetadata), state = map.get(key) ?? {};
+        if (state.running) return;
+        state.scope = ['inside', 'side', 'outside', 'all'].includes(value) ? value : 'all';
+        map.set(key, state);
+        notify(ctx.chatMetadata, key);
+    }
+
+    return { render, mount, dispose, run, stop, updateDraft, updateScope };
 }

@@ -1,28 +1,13 @@
 import { calculateSummaryRating, normalizeSummaryHalfLives } from './summary-rating.js';
 
-/** Thresholds are experimental acceptance controls, not calibrated probabilities of correctness. */
+/** Preserve the native optional semantic cutoff without inventing a probability threshold. */
 export function normalizeReinforcementConfig(value = {}) {
-    const threshold = input => input != null && input !== '' && Number.isFinite(Number(input))
-        ? Math.min(1, Math.max(0, Number(input))) : 0.8;
     return {
         enabled: value.enabled === true,
-        minUsageProbability: threshold(value.minUsageProbability),
-        minConfidence: threshold(value.minConfidence),
+        minSimilarity: value.minSimilarity == null || value.minSimilarity === '' || !Number.isFinite(Number(value.minSimilarity))
+            ? null : Math.min(1, Math.max(-1, Number(value.minSimilarity))),
         candidateLimit: Math.min(50, Math.max(1, Math.floor(Number(value.candidateLimit) || 25))),
     };
-}
-
-export function decideMemoryUsage(result, settings) {
-    const policy = normalizeReinforcementConfig(settings);
-    const reasons = [];
-    if (result.verdict !== 'used') reasons.push(`verdict=${result.verdict}`);
-    if (!Number.isFinite(result.usage_probability) || result.usage_probability < policy.minUsageProbability) {
-        reasons.push(`usage_probability=${result.usage_probability} below ${policy.minUsageProbability}`);
-    }
-    if (!Number.isFinite(result.confidence) || result.confidence < policy.minConfidence) {
-        reasons.push(`confidence=${result.confidence} below ${policy.minConfidence}`);
-    }
-    return { accepted: !reasons.length, reasons };
 }
 
 /** Replace only the decaying boost; source importance and source message position are immutable here. */

@@ -1,6 +1,7 @@
 import { normalizeAgentInjectionPlacement } from '../agents/character-injection.js';
 import { evaluateSummaryMemories, normalizeSummaryHalfLives } from './summary-rating.js';
 import { normalizeReinforcementConfig } from './reinforcement-policy.js';
+import { getSideBox } from './side-box-state.js';
 
 const API_URL = 'http://127.0.0.1:8091';
 const PAGE_SIZE = 250;
@@ -36,9 +37,19 @@ export function getCharacterSummary(ctx, character) {
     if (!stored) return null;
     const needsRefresh = !Array.isArray(stored.allMemories);
     const candidates = needsRefresh ? stored.memories ?? [] : stored.allMemories;
+    const calculated = evaluateSummaryMemories(candidates, ctx.chat?.length ?? 0, normalizeSummaryConfig(character.summary));
+    const inIds = new Set(calculated.memories.map(memory => memory.id));
+    const settings = normalizeSummaryConfig(character.summary);
+    const sideMemories = settings.reinforcement.enabled
+        ? getSideBox(ctx, summarySourceKey(character)).filter(memory => !inIds.has(memory.id)) : [];
+    const sideIds = new Set(sideMemories.map(memory => memory.id));
+    const allMemories = calculated.allMemories.map(memory => ({ ...memory, side: sideIds.has(memory.id) }));
+    const knownIds = new Set(allMemories.map(memory => memory.id));
+    allMemories.push(...sideMemories.filter(memory => !knownIds.has(memory.id)).map(memory => ({ ...memory, side: true, included: false })));
     return {
         ...stored,
-        ...evaluateSummaryMemories(candidates, ctx.chat?.length ?? 0, normalizeSummaryConfig(character.summary)),
+        ...calculated, allMemories, sideMemories,
+        injectionText: [...calculated.memories, ...sideMemories].map(memory => memory.text).join('\n\n'),
         needsRefresh,
     };
 }
@@ -105,10 +116,10 @@ export async function fetchCharacterSummary(character, { fetchImpl = fetch, sign
 export function buildSummaryInjection(ctx, character) {
     const settings = normalizeSummaryConfig(character?.summary);
     const summary = getCharacterSummary(ctx, character);
-    if (!settings.enabled || !summary?.text || summary.needsRefresh || summary.sourceKey !== summarySourceKey(character)) return null;
+    if (!settings.enabled || !summary?.injectionText || summary.needsRefresh || summary.sourceKey !== summarySourceKey(character)) return null;
     return {
         agent: { id: `memorybox-${character.avatar || character.name}`, ...settings },
-        prompt: `<Summary>\n${summary.text}\n</Summary>`,
+        prompt: `<Summary>\n${summary.injectionText}\n</Summary>`,
         deliveries: [],
     };
 }

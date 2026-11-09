@@ -1,116 +1,79 @@
-/** Rating labels stay outside each N2 source; only selected N2 text is sent to the model. */
-export function renderSummaryMemoryList(summary, escapeHtml, filter = 'inside') {
-    const memories = selectSummaryMemories(summary, filter);
-    const position = memory => Number.isInteger(memory.last_relevant_message_index)
-        && memory.last_relevant_message_index > 0 ? memory.last_relevant_message_index : Infinity;
-    const renderGroup = included => {
-        const entries = memories.filter(memory => (memory.included === true) === included)
-            .sort((a, b) => position(a) - position(b));
-        if (!entries.length) return '';
-        return `<h4 class="sd-summary-group-heading sd-summary-group-heading--${included ? 'inside' : 'outside'}">${included ? 'In box' : 'Outside box'} (${entries.length})</h4>`
-            + entries.map(memory => renderMemoryRow(memory, escapeHtml)).join('');
-    };
-    return renderGroup(true) + renderGroup(false) || '<div class="sd-summary-status">No memories loaded.</div>';
-}
-
-/** Render one escaped row independently of grouping and virtualization. */
-function renderMemoryRow(memory, escapeHtml, rowIndex = '') {
-    const included = memory.included === true;
-    const rating = Number.isFinite(memory.rating) ? Number(memory.rating.toPrecision(6)).toString() : '-';
-    const details = memory.ratingError || `Importance ${memory.importance ?? '-'} · Last index ${memory.last_relevant_message_index ?? '-'} · Age ${memory.age ?? '-'} · Half-life ${memory.halfLife ?? '-'} · Base ${memory.baseRating?.toPrecision(4) ?? '-'} · Boost ${memory.boostRating?.toPrecision(4) ?? '0'}${memory.boost ? ` @ ${memory.boost.message_index}` : ''}`;
-    return `<article data-memory-row="${rowIndex}" class="sd-summary-memory sd-summary-memory--${included ? 'inside' : 'outside'}${memory.ratingError ? ' sd-summary-memory--invalid' : ''}" data-token-count-container>
-        <header><b>Rating ${escapeHtml(rating)}</b><span>${included ? 'In box' : 'Outside box'} · <span data-token-count-result>...</span></span></header>
-        <div class="sd-summary-status">${escapeHtml(details)}</div>
-        <pre data-token-count-source>${escapeHtml(memory.text)}</pre>
-    </article>`;
-}
+import { MEMORY_COLUMNS, mountMemoryResultsTable, renderMemoryRows, sortMemoryRows } from './memory-results-table.js';
+export { getMemoryWindow } from './memory-results-table.js';
 
 /** Filter display data without discarding memories used by rating and injection. */
-export function selectSummaryMemories(summary, filter = 'inside') {
+export function selectSummaryMemories(summary, filter = 'inside', search = '') {
+    const normalize = value => String(value ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('pt-BR');
+    const query = normalize(search).trim();
     return (summary?.allMemories ?? summary?.memories ?? []).filter(memory => filter === 'all'
-        || (memory.included === true) === (filter === 'inside'));
+        || (memory.loaded !== false && (filter === 'side' ? memory.side === true
+            : filter === 'inside' ? memory.included === true : !memory.included && !memory.side)))
+        .filter(memory => !query || normalize(`${memory.text ?? ''}\n${memory.id ?? ''}`).includes(query));
 }
 
-/** Locate the visible variable-height rows with a small overscan on either side. */
-export function getMemoryWindow(heights, scrollTop, viewportHeight, overscan = 600) {
-    const offsets = [0];
-    for (const height of heights) offsets.push(offsets.at(-1) + height);
-    let start = 0;
-    while (start < heights.length && offsets[start + 1] < scrollTop - overscan) start++;
-    let end = start;
-    while (end < heights.length && offsets[end] < scrollTop + viewportHeight + overscan) end++;
-    return { start, end, before: offsets[start], after: offsets.at(-1) - offsets[end] };
+/** Static rendering uses the same rows as the virtualized live table. */
+export function renderSummaryMemoryList(summary, escapeHtml, filter = 'inside') {
+    const rows = sortMemoryRows(selectSummaryMemories(summary, filter).map(memory => ({ memory })),
+        { column: 'box', direction: 'asc' });
+    return rows.length ? renderMemoryRows(rows, MEMORY_COLUMNS, escapeHtml)
+        : '<div class="sd-summary-status">No memories loaded.</div>';
 }
 
-/** Mount only the visible memory rows; release observers when the panel is rebuilt. */
+/** In/Side/Out tabs share a sortable virtual table; changing tabs never calls the memory backend. */
 export function mountSummaryMemoryList(root, summary, escapeHtml, onRender = () => {}) {
     if (!root) return () => {};
-    root.innerHTML = `<div class="sd-summary-filters" role="group" aria-label="Memory filter">
-        <button type="button" class="menu_button" data-memory-filter="inside">In box</button>
-        <button type="button" class="menu_button" data-memory-filter="outside">Outside box</button>
-        <button type="button" class="menu_button" data-memory-filter="all">All</button>
-        <span class="sd-summary-status" data-memory-count></span></div>
-        <div class="sd-summary-text" tabindex="0" aria-label="Memories" data-memory-viewport>
-            <div data-memory-before aria-hidden="true"></div><div data-memory-rows></div>
-            <div data-memory-after aria-hidden="true"></div></div>`;
-    const viewport = root.querySelector('[data-memory-viewport]');
-    const rows = root.querySelector('[data-memory-rows]');
-    let entries = [], heights = [], filter = 'inside', frame = 0, range = '';
-    const schedule = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; render(); }); };
-    const observer = new ResizeObserver(items => {
-        let changed = false;
-        for (const item of items) {
-            const index = Number(item.target.dataset.memoryRow);
-            const height = Math.ceil(item.target.getBoundingClientRect().height) + 6;
-            if (height > 6 && heights[index] !== height) { heights[index] = height; changed = true; }
-        }
-        if (changed) schedule();
-    });
-    function render() {
-        if (!root.isConnected || !viewport.clientHeight) return;
-        const window = getMemoryWindow(heights, viewport.scrollTop, viewport.clientHeight);
-        root.querySelector('[data-memory-before]').style.height = `${window.before}px`;
-        root.querySelector('[data-memory-after]').style.height = `${window.after}px`;
-        const nextRange = `${filter}:${window.start}:${window.end}`;
-        if (nextRange === range) return;
-        range = nextRange;
-        observer.disconnect();
-        rows.innerHTML = entries.length
-            ? entries.slice(window.start, window.end)
-                .map((memory, offset) => renderMemoryRow(memory, escapeHtml, window.start + offset)).join('')
-            : '<div class="sd-summary-status">No memories in this filter.</div>';
-        rows.querySelectorAll('[data-memory-row]').forEach(row => observer.observe(row));
-        onRender();
+    const tabs = [['inside', 'In'], ['side', 'Side'], ['outside', 'Out'], ['all', 'All']];
+    root.innerHTML = `<div class="sd-section-tabs sd-memory-filter-tabs" role="tablist" aria-label="Memory boxes">
+        ${tabs.map(([key, label]) => `<button type="button" class="sd-section-tab" id="sd-memory-tab-${key}" role="tab" data-memory-filter="${key}" aria-controls="sd-memory-panel">${label} <span>${selectSummaryMemories(summary, key).length}</span></button>`).join('')}
+        </div><div data-memory-search-controls>
+            <label><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i> Search In memories
+                <input type="search" class="text_pole" data-memory-search placeholder="Text or memory ID" autocomplete="off">
+            </label><div class="sd-summary-status" data-memory-search-count role="status" aria-live="polite"></div>
+        </div><div id="sd-memory-panel" role="tabpanel" data-memory-table-panel></div>`;
+    const panel = root.querySelector('[data-memory-table-panel]');
+    const table = mountMemoryResultsTable(panel, { rows: [], escapeHtml, onRender,
+        sort: { column: 'box', direction: 'asc' } });
+    let active = 'inside';
+    const searchInput = root.querySelector('[data-memory-search]');
+    function updateRows() {
+        const memories = selectSummaryMemories(summary, active, active === 'inside' ? searchInput.value : '');
+        root.querySelector('[data-memory-search-count]').textContent = `${memories.length} / ${selectSummaryMemories(summary, active).length} memories`;
+        table.setRows(memories.map(memory => ({ memory })));
     }
-    function select(nextFilter) {
-        filter = nextFilter;
-        entries = selectSummaryMemories(summary, filter).slice().sort((a, b) => {
-            if (a.included !== b.included) return a.included ? -1 : 1;
-            return (a.last_relevant_message_index ?? Infinity) - (b.last_relevant_message_index ?? Infinity);
-        });
-        heights = entries.map(() => 300);
-        viewport.scrollTop = 0;
-        range = '';
-        root.querySelector('[data-memory-count]').textContent = `${entries.length} memories`;
+    function select(filter) {
+        active = filter;
         root.querySelectorAll('[data-memory-filter]').forEach(button => {
-            button.setAttribute('aria-pressed', String(button.dataset.memoryFilter === filter));
+            const selected = button.dataset.memoryFilter === filter;
+            button.setAttribute('aria-selected', String(selected));
+            button.tabIndex = selected ? 0 : -1;
         });
-        render();
+        panel.setAttribute('aria-labelledby', `sd-memory-tab-${filter}`);
+        root.querySelector('[data-memory-search-controls]').hidden = filter !== 'inside';
+        updateRows();
     }
     const click = event => {
         const button = event.target.closest('[data-memory-filter]');
         if (button) select(button.dataset.memoryFilter);
     };
-    const viewportObserver = new ResizeObserver(schedule);
-    viewportObserver.observe(viewport);
+    const keydown = event => {
+        if (!event.target.matches('[data-memory-filter]')) return;
+        const index = tabs.findIndex(([key]) => key === active);
+        const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length
+            : event.key === 'ArrowLeft' ? (index - 1 + tabs.length) % tabs.length
+                : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
+        if (next < 0) return;
+        event.preventDefault();
+        select(tabs[next][0]);
+        root.querySelector(`[data-memory-filter="${active}"]`).focus();
+    };
     root.addEventListener('click', click);
-    viewport.addEventListener('scroll', schedule, { passive: true });
+    root.addEventListener('keydown', keydown);
+    searchInput.addEventListener('input', updateRows);
     select('inside');
     return () => {
-        cancelAnimationFrame(frame);
-        observer.disconnect();
-        viewportObserver.disconnect();
+        table.destroy();
         root.removeEventListener('click', click);
-        viewport.removeEventListener('scroll', schedule);
+        root.removeEventListener('keydown', keydown);
+        searchInput.removeEventListener('input', updateRows);
     };
 }

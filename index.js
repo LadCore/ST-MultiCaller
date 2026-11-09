@@ -3159,10 +3159,16 @@ async function executeAgent(agentId, trigger = { type: 'manual', label: 'Manual 
     });
 
     try {
-        if (agent.internalType === SUMMARY_CREATION_TYPE && trigger.type === 'retry-save') {
+        if (agent.internalType === SUMMARY_CREATION_TYPE
+            && (trigger.type === 'retry-save' || summaryCreation.getState(agent, ctx)?.pending)) {
+            appendOperationLogDetail(logId, `Resuming pending memory save; no new LLM request. Previous error: ${summaryCreation.getState(agent, ctx)?.pending?.error || 'none'}`);
             const registered = await summaryCreation.retry(agent, ctx, cancellation.controller.signal);
+            const currentRuntime = getAgentRuntimeState(agent.id, ctx);
+            const consumedTurns = trigger.type === 'before-character' ? 0
+                : Math.max(1, Number(trigger.consumedTurns) || agent.interval);
             saveAgentRuntimeState(agent.id, { output: registered.output, lastStatus: 'success', lastError: '',
-                updatedAt: new Date().toISOString() }, ctx);
+                updatedAt: new Date().toISOString(),
+                pendingTurns: Math.max(0, currentRuntime.pendingTurns - consumedTurns) }, ctx);
             appendOperationLogDetail(logId, `MemoryBox retry: ${registered.saved.length} memories saved.`);
             await refreshSummaryAfterCreation(agent, ctx, logId, cancellation.controller.signal);
             completeOperationLog(logId, 'success');
@@ -4237,6 +4243,9 @@ async function processCompletedCharacterMessage(message, triggerEvent) {
 
     handledCharacterTurnMessages.add(message);
     pendingNativeCharacterMessage = null;
+    await memoryReinforcement.afterCharacter(message);
+    const completedContext = SillyTavern.getContext();
+    if (completedContext.chatMetadata !== ctx.chatMetadata || completedContext.chat?.at(-1) !== message) return;
     scheduleAgentsForTurn({
         type: 'character',
         label: `Scheduled after ${String(message?.name ?? 'character')} turn`,
@@ -4510,6 +4519,8 @@ async function triggerChar(char, decision = null, options = {}) {
         await runAgentsBeforeCharacter(char, cancellation);
         if (cancellation) cancellableOperations.assertActive(cancellation);
         ctx = SillyTavern.getContext();
+    } else {
+        memoryReinforcement.stop(char);
     }
     const targetProfile = resolveCharacterProfileForSwitch(char, ctx);
 
@@ -4660,6 +4671,7 @@ async function triggerChar(char, decision = null, options = {}) {
     } catch (error) {
         const message = error?.message ?? String(error);
         const stopped = isAbortError(error) || cancellation?.controller.signal.aborted;
+        memoryReinforcement.stop(char);
         if (stopped) {
             appendOperationLogDetail(characterOperationLogId, 'Character generation stopped by operator.');
             completeOperationLog(characterOperationLogId, 'stopped');
@@ -5917,27 +5929,13 @@ function mountVisibleTextEditors() {
     });
 }
 
-/** Keep confirmed out-of-box recalls visible until the operator dismisses them. */
-function notifyOutsideMemoryUse(event) {
-    if (event.stage !== 'outside-memory-used') return;
-    const text = String(event.text ?? '').replace(/\s+/g, ' ').trim();
-    const percent = value => `${(value * 100).toFixed(1)}%`;
-    toastr.info(`${text.slice(0, 220)}${text.length > 220 ? '...' : ''}\nP(used): ${percent(event.result.usage_probability)} | Confidence: ${percent(event.result.confidence)}`,
-        `Memory used outside box: ${event.character}`, {
-            timeOut: 0, extendedTimeOut: 0, closeButton: true, tapToDismiss: false, escapeHtml: true,
-        });
-}
-
 const memoryReinforcementLogger = createMemoryReinforcementLogger({ appendOperationLog, updateOperationLog, completeOperationLog,
     isProgressEnabled: () => config.memorySearchLogs !== false });
 const memoryReinforcement = createMemoryReinforcement({
     getContext: () => SillyTavern.getContext(),
     getCharacters: () => config.enabled ? config.characters : [],
     isOocMessage: isBackstageOocMessage,
-    onEvent: event => {
-        memoryReinforcementLogger(event);
-        notifyOutsideMemoryUse(event);
-    },
+    onEvent: memoryReinforcementLogger,
 });
 
 const summaryCreation = createSummaryCreation({
@@ -7146,6 +7144,9 @@ function attachFloatingPanelEvents() {
     });
     $('#scene-director-panel-body').on('input', '[data-summary-usage-text]', function () {
         characterSummaryPanel.updateUsageDraft(this.value);
+    });
+    $('#scene-director-panel-body').on('change', '[data-summary-usage-scope]', function () {
+        characterSummaryPanel.updateUsageScope(this.value);
     });
     $('#scene-director-panel-body').on('click', '[data-summary-usage-stop]', () => {
         characterSummaryPanel.stopUsageTest();

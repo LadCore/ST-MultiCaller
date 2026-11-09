@@ -4,6 +4,18 @@ import { renderSummaryMemoryList, selectSummaryMemories, getMemoryWindow } from 
 
 const escapeHtml = text => String(text).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
+test('local In search matches text or ID without case/accent sensitivity or changing the box', () => {
+    const summary = { allMemories: [{ id: 'UUID-A', text: 'Memória da Aiko', included: true },
+        { id: 'UUID-B', text: 'Outro evento', included: true },
+        { id: 'UUID-C', text: 'Memória da Aiko fora', included: false }] };
+    const before = structuredClone(summary);
+    assert.deepEqual(selectSummaryMemories(summary, 'inside', 'MEMORIA').map(memory => memory.id), ['UUID-A']);
+    assert.deepEqual(selectSummaryMemories(summary, 'inside', 'uuid-b').map(memory => memory.id), ['UUID-B']);
+    assert.equal(selectSummaryMemories(summary, 'inside', 'not found').length, 0);
+    assert.equal(selectSummaryMemories(summary, 'inside', '  ').length, 2);
+    assert.deepEqual(summary, before);
+});
+
 test('groups inside before outside and sorts each group by chat position without changing source order', () => {
     const memories = [
         { text: 'Outside recent', included: false, last_relevant_message_index: 90 },
@@ -16,9 +28,8 @@ test('groups inside before outside and sorts each group by chat position without
     const html = renderSummaryMemoryList({ allMemories: memories }, escapeHtml, 'all');
     const order = ['Inside old', 'Inside recent', 'Outside old', 'Outside recent', 'Outside unknown'];
     for (let index = 1; index < order.length; index++) assert(html.indexOf(order[index - 1]) < html.indexOf(order[index]));
-    assert.match(html, /In box \(2\)/);
-    assert.match(html, /Outside box \(3\)/);
-    assert.match(html, /sd-summary-memory--invalid/);
+    assert.equal((html.match(/role="row"/g) ?? []).length, 5);
+    assert.match(html, /sd-memory-tone--invalid/);
     assert.deepEqual(memories, before);
 });
 
@@ -28,6 +39,20 @@ test('initial filter includes only box memories and outside data remains availab
     assert.deepEqual(selectSummaryMemories(summary, 'outside').map(memory => memory.text), ['Outside']);
     assert.equal(selectSummaryMemories(summary, 'all').length, 2);
     assert.doesNotMatch(renderSummaryMemoryList(summary, escapeHtml), /Outside/);
+});
+
+test('In, Side and Out filters are disjoint while All retains every memory', () => {
+    const summary = { allMemories: [{ id: 'in', text: 'In memory', included: true },
+        { id: 'side', text: 'Side memory', included: false, side: true },
+        { id: 'out', text: 'Out memory', included: false }] };
+    assert.deepEqual(selectSummaryMemories(summary, 'inside').map(item => item.id), ['in']);
+    assert.deepEqual(selectSummaryMemories(summary, 'side').map(item => item.id), ['side']);
+    assert.deepEqual(selectSummaryMemories(summary, 'outside').map(item => item.id), ['out']);
+    assert.equal(selectSummaryMemories(summary, 'all').length, 3);
+    const html = renderSummaryMemoryList(summary, escapeHtml, 'all');
+    assert.match(html, /sd-memory-tone--side/);
+    assert(html.indexOf('In memory') < html.indexOf('Side memory'));
+    assert(html.indexOf('Side memory') < html.indexOf('Out memory'));
 });
 
 test('virtual window bounds DOM rows across large lists and supports variable measured heights', () => {

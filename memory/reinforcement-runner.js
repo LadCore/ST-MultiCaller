@@ -1,7 +1,8 @@
-import { getSummaryScope, normalizeSummaryConfig, summarySourceKey } from './character-summary.js';
-import { decideMemoryUsage, planMemoryBoost } from './reinforcement-policy.js';
-import { checkSummaryMemoryUsage } from './summary-usage.js';
-import { findReinforcementCandidates, patchMemoryBoost, readScopedMemory } from './memorybox-client.js';
+import { getCharacterSummary, getSummaryScope, normalizeSummaryConfig, summarySourceKey } from './character-summary.js';
+import { calculateSummaryRating } from './summary-rating.js';
+import { planMemoryBoost } from './reinforcement-policy.js';
+import { findSemanticCandidates, patchMemoryBoost, prepareSemanticQuery, readScopedMemory } from './memorybox-client.js';
+import { setSideBox, clearSideBox } from './side-box-state.js';
 
 /** Capture every RP message after the character's last valid reply, preserving full-chat indices. */
 export function collectCharacterInterval(chat, character, isExcluded = () => false) {
@@ -14,10 +15,7 @@ export function collectCharacterInterval(chat, character, isExcluded = () => fal
             || message.extra?.tool_invocations?.length || isExcluded(message)) continue;
         const ownReply = !message.is_user && (message.original_avatar && character.avatar
             ? message.original_avatar === character.avatar : message.name === character.name);
-        if (ownReply) {
-            previousIndex = index + 1;
-            break;
-        }
+        if (ownReply) { previousIndex = index + 1; break; }
         entries.push({ index: index + 1, role: message.is_user ? 'user' : 'assistant',
             name: String(message.name ?? ''), content: String(message.mes) });
     }
@@ -26,169 +24,99 @@ export function collectCharacterInterval(chat, character, isExcluded = () => fal
         messages: entries.map(({ role, name, content }) => ({ role, name, content })) };
 }
 
-/** Pre-turn per-character queues; candidate checks run concurrently without changing host profiles. */
+/** Retrieve temporary Side memories before a turn; reinforce only matching IDs after its final reply. */
 export function createMemoryReinforcement({
     getContext, getCharacters, onEvent = () => {}, isOocMessage = () => false,
-    findCandidates = findReinforcementCandidates, checkUsage = checkSummaryMemoryUsage,
-    readMemory = readScopedMemory, patchBoost = patchMemoryBoost,
+    findCandidates = findSemanticCandidates, readMemory = readScopedMemory, patchBoost = patchMemoryBoost,
 }) {
     const chats = new WeakMap();
     const ignored = new WeakSet();
-    const collect = (ctx, character) => collectCharacterInterval(ctx.chat ?? [], character,
-        message => ignored.has(message) || isOocMessage(message.mes));
-    const statesFor = metadata => {
-        if (!chats.has(metadata)) chats.set(metadata, new Map());
-        return chats.get(metadata);
+    const statesFor = ctx => {
+        if (!chats.has(ctx.chatMetadata)) chats.set(ctx.chatMetadata, new Map());
+        return chats.get(ctx.chatMetadata);
     };
     const lookup = character => getCharacters().find(item => character.avatar
         ? item.avatar === character.avatar : item.name === character.name);
-    const persist = async ctx => {
-        if (getContext().chatMetadata !== ctx.chatMetadata) throw new DOMException('Chat changed before saving the reinforcement receipt.', 'AbortError');
-        await ctx.saveMetadata?.();
-    };
+    const excluded = message => ignored.has(message) || isOocMessage(message.mes);
+    const collect = (ctx, character, end = ctx.chat.length) => collectCharacterInterval(ctx.chat.slice(0, end), character, excluded);
 
     function emit(job, stage, data = {}, level = 'info') {
         onEvent({ runId: job.runId, character: job.character.name, scope: job.scope,
-            message_index: job.messageIndex, at: new Date().toISOString(), stage, level, ...data });
+            message_index: job.replyIndex ?? job.messageIndex, at: new Date().toISOString(), stage, level, ...data });
     }
 
-    function assertCurrent(job) {
-        const current = getContext();
-        const character = lookup(job.character);
-        if (job.signal.aborted || job.state.epoch !== job.epoch
-            || current.chatMetadata !== job.ctx.chatMetadata || current.chatId !== job.ctx.chatId
-            || current.groupId !== job.ctx.groupId || !character
-            || JSON.stringify(collect(current, character)) !== job.intervalSnapshot
-            || summarySourceKey(character) !== job.sourceKey
-            || !normalizeSummaryConfig(character.summary).reinforcement.enabled
-            || JSON.stringify(normalizeSummaryConfig(character.summary)) !== JSON.stringify(job.settings)) {
-            throw new DOMException('Memory reinforcement stopped: conversation interval, source or configuration changed.', 'AbortError');
+    function assertCurrent(job, reply = null) {
+        job.controller.signal.throwIfAborted();
+        const ctx = getContext();
+        const live = lookup(job.character);
+        if (ctx.chatMetadata !== job.ctx.chatMetadata || ctx.chatId !== job.ctx.chatId || ctx.groupId !== job.ctx.groupId
+            || statesFor(job.ctx).get(job.sourceKey) !== job || !live
+            || JSON.stringify(normalizeSummaryConfig(live.summary)) !== JSON.stringify(job.settings)
+            || JSON.stringify(collect(ctx, live, job.messageIndex)) !== job.intervalSnapshot
+            || (!reply && ctx.chat.length !== job.messageIndex)
+            || (reply && (ctx.chat.at(-1) !== reply || reply.mes !== job.replyText || ignored.has(reply)))) {
+            throw new DOMException('SideBox stopped: chat, source, settings or source messages changed.', 'AbortError');
         }
     }
 
-    function updateCache(job, memory) {
-        assertCurrent(job);
-        const cache = job.ctx.chatMetadata.sceneDirector?.characterSummaries?.[job.character.avatar || job.character.name];
-        if (cache?.sourceKey !== job.sourceKey || !Array.isArray(cache.allMemories)) return;
-        const existing = cache.allMemories.find(item => item.id === memory.id);
-        if (existing) Object.assign(existing, memory);
-        else cache.allMemories.push(memory);
-        // Native saveMetadata saves the whole chat; persist the cache once at the end of this job.
+    function clear(job) {
+        // An obsolete job must never clear a newer turn's SideBox.
+        if (statesFor(job.ctx).get(job.sourceKey) !== job) return;
+        clearSideBox(job.ctx, job.sourceKey);
+        job.stage = 'idle';
+        job.side = [];
+        job.detachSignal?.();
     }
 
-    async function reinforceCandidate(job, candidate) {
-        assertCurrent(job);
-        const verifiedText = candidate.text;
-        const options = { signal: job.signal };
-        const messages = job.messages;
-        const startedAt = performance.now();
-        emit(job, 'usage-request', { memoryId: candidate.id, request: { reference: candidate.text, messages } });
-        const usage = await checkUsage(candidate.text, messages, options);
-        assertCurrent(job);
-        const decision = decideMemoryUsage(usage, job.settings.reinforcement);
-        emit(job, 'usage-result', { memoryId: candidate.id, result: usage, decision,
-            durationMs: Math.round(performance.now() - startedAt) });
-        if (!decision.accepted) return { memoryId: candidate.id, action: 'rejected', ...decision };
-        emit(job, 'read-request', { memoryId: candidate.id, request: { operation: 'GET', scope: job.scope, id: candidate.id } });
-        const fresh = await readMemory(job.scope, candidate.id, options);
-        assertCurrent(job);
-        emit(job, 'read-result', { memoryId: candidate.id, memory: fresh });
-        updateCache(job, fresh);
-        if (fresh.text !== verifiedText) return { memoryId: candidate.id, action: 'skipped', reason: 'N2 changed since verification.' };
-        const plan = planMemoryBoost(fresh, job.messageIndex, job.settings);
-        emit(job, 'boost-calculation', { memoryId: candidate.id, importance: fresh.importance,
-            originIndex: fresh.last_relevant_message_index, previousBoost: fresh.boost, cutoff: job.settings.minRating, plan });
-        if (Number.isFinite(plan.calculated?.rating) && plan.calculated.rating < job.settings.minRating) {
-            emit(job, 'outside-memory-used', { memoryId: candidate.id, text: fresh.text, result: usage,
-                rating: plan.calculated.rating, cutoff: job.settings.minRating });
-        }
-        if (!plan.apply) return { memoryId: candidate.id, action: 'skipped', ...plan };
-        assertCurrent(job);
-        emit(job, 'patch-request', { memoryId: candidate.id, request: { operation: 'PATCH', id: candidate.id,
-            ...job.scope, boost: plan.boost } });
-        let confirmed;
+    async function search(job, query, phase, reply = null) {
+        assertCurrent(job, reply);
+        const policy = job.settings.reinforcement;
+        emit(job, 'search-request', { phase, request: { ...job.scope, query, limit: policy.candidateLimit,
+            ...(policy.minSimilarity == null ? {} : { min_similarity: policy.minSimilarity }) } });
+        const result = await findCandidates(job.scope, query, policy.candidateLimit,
+            { signal: job.controller.signal, minSimilarity: policy.minSimilarity });
+        assertCurrent(job, reply);
+        emit(job, 'search-result', { ...result, phase });
+        return result.candidates;
+    }
+
+    async function prepare(job) {
+        emit(job, 'start', { phase: 'before', context: { scope: job.scope, query: job.text,
+            messages: job.interval.messages, previousCharacterMessageIndex: job.interval.previousIndex,
+            throughMessageIndex: job.messageIndex }, settings: job.settings });
         try {
-            confirmed = await patchBoost(job.scope, candidate.id, plan.boost, options);
-        } catch (error) {
-            emit(job, 'patch-unconfirmed', { memoryId: candidate.id, error: error.message, retry: false }, 'error');
-            assertCurrent(job);
-            // A failed HTTP response may hide a successful write. Reconcile with GET, never another PATCH.
-            emit(job, 'reconciliation-request', { memoryId: candidate.id, request: { operation: 'GET', scope: job.scope, id: candidate.id } });
-            confirmed = await readMemory(job.scope, candidate.id, options);
-            emit(job, 'reconciliation-result', { memoryId: candidate.id, memory: confirmed });
-            if (confirmed.boost?.message_index !== plan.boost.message_index || !Number.isFinite(confirmed.boost.value)
-                || Math.abs(confirmed.boost.value - plan.boost.value) > 1e-12) {
-                throw new Error(`Unconfirmed boost for ${candidate.id}. No retry performed. ${error.message}`);
+            const summary = getCharacterSummary(job.ctx, job.character);
+            if (!summary || summary.needsRefresh || summary.sourceKey !== job.sourceKey) {
+                throw new Error('Update the character summary before using SideBox.');
             }
-        }
-        assertCurrent(job);
-        if (confirmed.importance !== fresh.importance
-            || confirmed.last_relevant_message_index !== fresh.last_relevant_message_index) {
-            throw new Error(`Memory source changed while boosting ${candidate.id}; refresh required.`);
-        }
-        updateCache(job, confirmed);
-        emit(job, 'patch-confirmed', { memoryId: candidate.id, memory: confirmed, target: plan.target });
-        return { memoryId: candidate.id, action: 'boosted', boost: confirmed.boost, target: plan.target };
-    }
-
-    async function run(job) {
-        job.state.running = true;
-        job.state.controller = job.controller;
-        job.state.lastError = '';
-        job.receipt.phase = 'running';
-        const outcomes = [];
-        const startedAt = performance.now();
-        try {
-            assertCurrent(job);
-            await persist(job.ctx);
-            assertCurrent(job);
-            emit(job, 'start', { context: { scope: job.scope, query: job.text, messages: job.messages,
-                previousCharacterMessageIndex: job.previousIndex, throughMessageIndex: job.messageIndex,
-                messageCount: job.messages.length, parallel: true,
-                limit: job.settings.reinforcement.candidateLimit }, settings: job.settings });
-            emit(job, 'search-request', { request: { ...job.scope, query: job.text, limit: job.settings.reinforcement.candidateLimit } });
-            const found = await findCandidates(job.scope, job.text, job.settings.reinforcement.candidateLimit,
-                { signal: job.signal });
-            assertCurrent(job);
-            emit(job, 'search-result', found);
-            // Settle every worker before completing the job, including cancellation and partial failures.
-            const results = await Promise.allSettled(found.candidates.map(async candidate => {
-                try {
-                    const outcome = await reinforceCandidate(job, candidate);
-                    emit(job, 'candidate-complete', outcome);
-                    return outcome;
-                } catch (error) {
-                    if (error.name === 'AbortError') throw error;
-                    const outcome = { memoryId: candidate.id, action: 'error', error: error.message };
-                    emit(job, 'candidate-error', outcome, 'error');
-                    return outcome;
-                }
+            const inIds = new Set(summary.memories.map(memory => memory.id));
+            const candidates = await search(job, job.text, 'before');
+            const unique = [...new Map(candidates.filter(item => !inIds.has(item.id)).map(item => [item.id, item])).values()];
+            const results = await Promise.allSettled(unique.map(async candidate => {
+                const memory = await readMemory(job.scope, candidate.id, { signal: job.controller.signal });
+                assertCurrent(job);
+                const calculated = calculateSummaryRating(memory, job.messageIndex, job.settings.halfLives);
+                if (calculated.rating == null || calculated.rating >= job.settings.minRating) return null;
+                return { ...memory, ...calculated, matches: candidate.matches ?? [] };
             }));
-            outcomes.push(...results.filter(result => result.status === 'fulfilled').map(result => result.value));
-            const rejected = results.find(result => result.status === 'rejected');
-            if (rejected) throw rejected.reason;
             assertCurrent(job);
-            const errors = outcomes.filter(outcome => outcome.action === 'error');
-            job.receipt.phase = errors.length ? 'error' : 'success';
-            job.state.lastError = errors.map(outcome => outcome.error).join(' | ');
+            job.side = results.filter(item => item.status === 'fulfilled' && item.value).map(item => item.value);
+            const failures = results.filter(item => item.status === 'rejected');
+            if (failures.length) job.lastError = failures.map(item => item.reason.message).join(' | ');
+            setSideBox(job.ctx, job.sourceKey, job.side);
+            job.stage = 'waiting';
+            emit(job, 'side-ready', { memories: job.side, inCount: inIds.size, sideCount: job.side.length,
+                inMemoryIds: [...inIds],
+                failedCount: failures.length, error: job.lastError }, failures.length ? 'warn' : 'info');
+            emit(job, 'finish', { phase: 'before', status: failures.length ? 'error' : 'success', error: job.lastError });
+            return { status: 'ready' };
         } catch (error) {
-            job.receipt.phase = error.name === 'AbortError' ? 'stopped' : 'error';
-            job.state.lastError = error.message;
-            emit(job, 'run-error', { error: error.message }, error.name === 'AbortError' ? 'warn' : 'error');
-        } finally {
-            job.state.running = false;
-            job.state.pending--;
-            job.receipt.completedAt = new Date().toISOString();
-            try { await persist(job.ctx); }
-            catch (error) {
-                job.receipt.phase = error.name === 'AbortError' ? 'stopped' : 'error';
-                job.state.lastError = error.message;
-                emit(job, 'receipt-save-error', { error: error.message }, 'error');
-            }
-            emit(job, 'finish', { status: job.receipt.phase, outcomes, error: job.state.lastError,
-                durationMs: Math.round(performance.now() - startedAt), messageCount: job.messages.length });
+            job.lastError = error.message;
+            clear(job);
+            const status = error.name === 'AbortError' ? 'stopped' : 'error';
+            emit(job, 'finish', { phase: 'before', status, error: error.message }, status === 'error' ? 'error' : 'warn');
+            return { status, error: error.message };
         }
-        return { status: job.receipt.phase, error: job.state.lastError };
     }
 
     async function beforeCharacter(character, { signal } = {}) {
@@ -196,57 +124,163 @@ export function createMemoryReinforcement({
         character = lookup(character);
         if (!character) return;
         const settings = normalizeSummaryConfig(character.summary);
-        if (!settings.reinforcement.enabled || !settings.namespace || !settings.groupId) return;
-        const interval = collect(ctx, character);
-        if (!interval.messages.length) return;
-        const { messageIndex, previousIndex, messages } = interval;
-        const intervalSnapshot = JSON.stringify(interval);
-        const text = messages.map(message => `${message.name}: ${message.content}`).join('\n\n');
         const sourceKey = summarySourceKey(character);
-        const bytes = new TextEncoder().encode(JSON.stringify(['pre-turn-v1', sourceKey, intervalSnapshot, settings]));
-        const digest = await crypto.subtle.digest('SHA-256', bytes);
-        const key = [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('');
-        if (getContext().chatMetadata !== ctx.chatMetadata || signal?.aborted) {
-            throw new DOMException('Memory reinforcement cancelled before scheduling.', 'AbortError');
-        }
-        ctx.chatMetadata.sceneDirector ??= {};
-        const ledger = ctx.chatMetadata.sceneDirector.memoryReinforcement ??= {};
-        const map = statesFor(ctx.chatMetadata);
-        if (!map.has(sourceKey)) map.set(sourceKey, { running: false, pending: 0, epoch: 0,
-            tail: Promise.resolve(), jobs: new Map(), lastError: '' });
-        const state = map.get(sourceKey);
-        if (state.jobs.has(key)) return state.jobs.get(key);
-        if (ledger[key]?.phase === 'success') {
-            onEvent({ runId: `duplicate-${key}`, character: character.name, stage: 'duplicate-skipped',
-                message_index: messageIndex, level: 'info', receipt: ledger[key] });
-            return;
-        }
-        state.pending++;
-        const receipt = ledger[key] = { phase: 'queued', messageIndex, previousIndex, createdAt: new Date().toISOString() };
-        const controller = new AbortController();
+        const existing = statesFor(ctx).get(sourceKey);
+        const interval = collect(ctx, character);
+        const intervalSnapshot = JSON.stringify(interval);
+        if (existing && ['preparing', 'waiting'].includes(existing.stage)
+            && existing.ctx.chatId === ctx.chatId && existing.ctx.groupId === ctx.groupId
+            && !existing.controller.signal.aborted && existing.intervalSnapshot === intervalSnapshot
+            && JSON.stringify(existing.settings) === JSON.stringify(settings)) return existing.beforeTask;
+        stop(character);
+        const text = interval.messages.map(message => ({ ...message, content: prepareSemanticQuery(message.content) }))
+            .filter(message => message.content).map(message => `${message.name}: ${message.content}`).join('\n\n');
+        if (!settings.enabled || !settings.reinforcement.enabled || !settings.namespace || !settings.groupId
+            || !text) return;
         const job = { ctx, character: structuredClone(character), scope: getSummaryScope(character), sourceKey,
-            settings, messages, previousIndex, intervalSnapshot, messageIndex, text,
-            runId: `memory-boost-${key}`, state, receipt, controller,
-            signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, epoch: state.epoch };
-        const task = state.tail.catch(() => {}).then(() => run(job)).finally(() => state.jobs.delete(key));
-        state.jobs.set(key, task);
-        state.tail = task;
-        return task;
+            interval, intervalSnapshot, settings, messageIndex: interval.messageIndex,
+            text,
+            controller: new AbortController(), side: [], lastError: '', stage: 'preparing',
+            runId: `side-before-${crypto.randomUUID()}` };
+        statesFor(ctx).set(sourceKey, job);
+        if (signal) {
+            const abort = () => { job.controller.abort(); clear(job); };
+            signal.addEventListener('abort', abort, { once: true });
+            job.detachSignal = () => signal.removeEventListener('abort', abort);
+            if (signal.aborted) abort();
+        }
+        job.beforeTask = prepare(job);
+        return job.beforeTask;
+    }
+
+    function updateCache(job, memory) {
+        const cache = job.ctx.chatMetadata.sceneDirector?.characterSummaries?.[job.character.avatar || job.character.name];
+        if (cache?.sourceKey !== job.sourceKey || !Array.isArray(cache.allMemories)) return;
+        const previous = cache.allMemories.find(item => item.id === memory.id);
+        if (previous) Object.assign(previous, memory);
+        else cache.allMemories.push(memory);
+    }
+
+    async function reinforce(job, memory, match, reply) {
+        assertCurrent(job, reply);
+        const fresh = await readMemory(job.scope, memory.id, { signal: job.controller.signal });
+        assertCurrent(job, reply);
+        if (fresh.text !== memory.text) return { memoryId: memory.id, action: 'skipped', reason: 'N2 changed after injection.' };
+        const plan = planMemoryBoost(fresh, job.replyIndex, job.settings);
+        emit(job, 'boost-calculation', { memoryId: memory.id, cutoff: job.settings.minRating, plan });
+        if (!plan.apply) return { memoryId: memory.id, action: 'skipped', ...plan };
+        emit(job, 'patch-request', { memoryId: memory.id, request: { ...job.scope, id: memory.id, boost: plan.boost } });
+        let confirmed;
+        try {
+            confirmed = await patchBoost(job.scope, memory.id, plan.boost, { signal: job.controller.signal });
+        } catch (error) {
+            emit(job, 'patch-unconfirmed', { memoryId: memory.id, error: error.message, retry: false }, 'error');
+            assertCurrent(job, reply);
+            confirmed = await readMemory(job.scope, memory.id, { signal: job.controller.signal });
+            if (confirmed.boost?.message_index !== plan.boost.message_index
+                || !Number.isFinite(confirmed.boost?.value) || Math.abs(confirmed.boost.value - plan.boost.value) > 1e-12) throw error;
+        }
+        assertCurrent(job, reply);
+        if (confirmed.text !== fresh.text || confirmed.importance !== fresh.importance
+            || confirmed.last_relevant_message_index !== fresh.last_relevant_message_index) {
+            throw new Error('Memory source changed while saving its boost.');
+        }
+        updateCache(job, confirmed);
+        emit(job, 'patch-confirmed', { memoryId: memory.id, memory: confirmed, matches: match.matches, target: plan.target });
+        const rating = calculateSummaryRating(confirmed, job.replyIndex, job.settings.halfLives).rating;
+        return { memoryId: memory.id, action: 'boosted', boost: confirmed.boost,
+            fromBox: 'Side', toBox: rating != null && rating >= job.settings.minRating ? 'In' : 'Out', rating };
+    }
+
+    async function finish(job, reply) {
+        job.runId = `side-after-${crypto.randomUUID()}`;
+        job.stage = 'comparing';
+        job.lastError = '';
+        let status = 'success';
+        emit(job, 'start', { phase: 'after', context: { response: job.replyText,
+            sideIds: job.side.map(memory => memory.id), sideMemories: job.side } });
+        try {
+            const query = prepareSemanticQuery(job.replyText);
+            if (!job.side.length) return { status: 'success' };
+            if (!query) {
+                for (const memory of job.side) emit(job, 'side-discarded', {
+                    memoryId: memory.id, reason: 'No text outside actions; search skipped.' });
+                return { status: 'success' };
+            }
+            const candidates = await search(job, query, 'after', reply);
+            const matches = new Map(candidates.map(candidate => [candidate.id, candidate]));
+            const outcomes = [];
+            for (const memory of job.side) {
+                assertCurrent(job, reply);
+                const match = matches.get(memory.id);
+                if (!match) {
+                    emit(job, 'side-discarded', { memoryId: memory.id });
+                    continue;
+                }
+                emit(job, 'side-match', { memoryId: memory.id, text: memory.text,
+                    beforeMatches: memory.matches, matches: match.matches });
+                try {
+                    const outcome = await reinforce(job, memory, match, reply);
+                    outcomes.push(outcome);
+                    emit(job, 'candidate-complete', outcome);
+                } catch (error) {
+                    if (error.name === 'AbortError') throw error;
+                    outcomes.push({ memoryId: memory.id, action: 'error', error: error.message });
+                    emit(job, 'candidate-error', outcomes.at(-1), 'error');
+                }
+            }
+            assertCurrent(job, reply);
+            await job.ctx.saveMetadata?.();
+            assertCurrent(job, reply);
+            job.lastError = outcomes.filter(item => item.action === 'error').map(item => item.error).join(' | ');
+            status = job.lastError ? 'error' : 'success';
+            return { status, error: job.lastError };
+        } catch (error) {
+            job.lastError = error.message;
+            status = error.name === 'AbortError' ? 'stopped' : 'error';
+            return { status, error: error.message };
+        } finally {
+            clear(job);
+            emit(job, 'finish', { phase: 'after', status, error: job.lastError }, status === 'error' ? 'error' : status === 'stopped' ? 'warn' : 'info');
+        }
+    }
+
+    async function afterCharacter(reply) {
+        const ctx = getContext();
+        if (!reply || ctx.chat.at(-1) !== reply || reply.is_user || reply.is_system || excluded(reply)
+            || !String(reply.mes ?? '').trim() || reply.extra?.tool_invocations?.length
+            || ['tool_call', 'tool_response'].includes(reply.extra?.type)) return;
+        const character = getCharacters().find(item => reply.original_avatar
+            ? reply.original_avatar === item.avatar : reply.name === item.name);
+        if (!character) return;
+        const job = statesFor(ctx).get(summarySourceKey(character));
+        if (!job || !['waiting', 'comparing'].includes(job.stage)) return;
+        if (job.afterTask) return job.afterTask;
+        if (ctx.chat.length <= job.messageIndex) return;
+        job.detachSignal?.();
+        job.replyIndex = ctx.chat.length;
+        job.replyText = String(reply.mes);
+        job.afterTask = finish(job, reply);
+        return job.afterTask;
     }
 
     function stop(character) {
-        const state = statesFor(getContext().chatMetadata).get(summarySourceKey(character));
-        if (!state) return;
-        state.epoch++;
-        state.controller?.abort();
+        const ctx = getContext();
+        const job = statesFor(ctx).get(summarySourceKey(character));
+        if (job) { job.controller.abort(); clear(job); }
     }
 
     return {
-        beforeCharacter, stop,
-        ignoreMessage(message) { if (message && typeof message === 'object') ignored.add(message); },
+        beforeCharacter, afterCharacter, stop,
+        ignoreMessage(message) {
+            if (message && typeof message === 'object') ignored.add(message);
+            for (const character of getCharacters()) stop(character);
+        },
         getStatus(character) {
-            const state = statesFor(getContext().chatMetadata).get(summarySourceKey(character));
-            return state ? { running: state.running, pending: state.pending, lastError: state.lastError } : {};
+            const job = statesFor(getContext()).get(summarySourceKey(character));
+            return job ? { running: ['preparing', 'comparing'].includes(job.stage),
+                pending: ['preparing', 'comparing'].includes(job.stage) ? 1 : 0,
+                sideCount: job.side.length, stage: job.stage, lastError: job.lastError } : {};
         },
     };
 }

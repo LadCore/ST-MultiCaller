@@ -31,7 +31,7 @@ function fixture({ invalid = false, failSave = false, trimmed = false } = {}) {
         fetchImpl: async (_url, options) => {
             const body = JSON.parse(options.body);
             bodies.push(body);
-            if (failSave && bodies.length === 1) throw new Error('API write timed out');
+            if (failSave && bodies.length <= (typeof failSave === 'number' ? failSave : 1)) throw new Error('API write timed out');
             return { ok: true, json: async () => ({ results: [{ kind: 'memory', id: 'saved',
                 importance: body.importance, last_relevant_message_index: body.last_relevant_message_index,
                 references: { n2: [{ text: body.descriptive }] } }], meta: {} }) };
@@ -109,6 +109,47 @@ test('retry-save uses the same native cancellation/log lifecycle but does not ca
     assert.equal(f.runtime.lastStatus, 'success');
     assert.equal(f.runtime.lastError, '');
     assert.equal(f.logs.at(-1).status, 'success');
+});
+
+test('the next scheduled execution resumes the pending save without regenerating and retains newer turns', async () => {
+    const f = fixture({ failSave: true });
+    const trigger = { type: 'scheduled', label: 'Character turn', consumedTurns: 3 };
+    await assert.rejects(f.sandbox.executeAgent(f.agent.id, trigger), /timed out/);
+    assert.equal(f.creation.getState(f.agent).pending.error, 'API write timed out');
+    f.runtime.pendingTurns++;
+    await f.sandbox.executeAgent(f.agent.id, trigger);
+    assert.equal(f.llmCalls(), 1);
+    assert.equal(f.bodies.length, 2);
+    assert.deepEqual(f.bodies[1], f.bodies[0]);
+    assert.equal(f.runtime.pendingTurns, 1);
+    assert.equal(f.runtime.lastStatus, 'success');
+    assert.equal(f.creation.getState(f.agent).pending, undefined);
+    assert.equal(f.creation.getState(f.agent).lastSavedIndex, 1);
+    assert.equal(f.sandbox.runningAgentIds.size, 0);
+});
+
+test('a failed resumed save waits for another execution and does not loop or consume turns', async () => {
+    const f = fixture({ failSave: 2 });
+    const trigger = { type: 'scheduled', label: 'Character turn', consumedTurns: 3 };
+    await assert.rejects(f.sandbox.executeAgent(f.agent.id, trigger), /timed out/);
+    await assert.rejects(f.sandbox.executeAgent(f.agent.id, trigger), /timed out/);
+    assert.equal(f.bodies.length, 2);
+    assert.equal(f.llmCalls(), 1);
+    assert.equal(f.runtime.pendingTurns, 3);
+    assert.equal(f.sandbox.runningAgentIds.size, 0);
+    await f.sandbox.executeAgent(f.agent.id, trigger);
+    assert.equal(f.bodies.length, 3);
+    assert.deepEqual(f.bodies[2], f.bodies[0]);
+    assert.equal(f.runtime.pendingTurns, 0);
+});
+
+test('a pending save is not resumed concurrently with an already running agent', async () => {
+    const f = fixture({ failSave: true });
+    await assert.rejects(f.sandbox.executeAgent(f.agent.id), /timed out/);
+    f.sandbox.runningAgentIds.add(f.agent.id);
+    assert.equal(await f.sandbox.executeAgent(f.agent.id, { type: 'scheduled' }), null);
+    assert.equal(f.bodies.length, 1);
+    assert.equal(f.llmCalls(), 1);
 });
 
 test('definition normalization persists hidden-message settings and disables unsupported internal capabilities', () => {

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { findReinforcementCandidates, patchMemoryBoost } from '../memory/memorybox-client.js';
+import { findSemanticCandidates, patchMemoryBoost, prepareSemanticQuery } from '../memory/memorybox-client.js';
 import { createMemoryReinforcementLogger } from '../logging/memory-reinforcement.js';
 
 const scope = { namespace: 'rp', group_id: 'mirella', character: 'Mirella Veyr' };
@@ -10,42 +10,90 @@ const boost = { value: 0.35, message_index: 9500 };
 const reference = { id: 'episode-one', text: 'A scoped N2.', importance: 4, last_relevant_message_index: 1, boost: null };
 const response = data => ({ ok: true, json: async () => data });
 
-test('confirmed outside use shows a dismissible persistent toast, not a transient search notice', () => {
-    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-    const body = source.match(/function notifyOutsideMemoryUse\([^]*?\n\}/)?.[0];
-    assert(body);
-    const calls = [];
-    const sandbox = { toastr: { info: (...args) => calls.push(args) } };
-    vm.createContext(sandbox);
-    vm.runInContext(body, sandbox);
-    sandbox.notifyOutsideMemoryUse({ stage: 'search-result' });
-    assert.equal(calls.length, 0);
-    sandbox.notifyOutsideMemoryUse({ stage: 'outside-memory-used', character: 'Mirella', text: '<b>A memory</b>',
-        result: { usage_probability: 0.95, confidence: 0.9 } });
-    assert.equal(calls.length, 1);
-    assert.match(calls[0][0], /95.0%.*90.0%/);
-    assert.match(calls[0][1], /Mirella/);
-    assert.equal(calls[0][2].timeOut, 0);
-    assert.equal(calls[0][2].extendedTimeOut, 0);
-    assert.equal(calls[0][2].closeButton, true);
-    assert.equal(calls[0][2].tapToDismiss, false);
-    assert.equal(calls[0][2].escapeHtml, true);
+test('semantic text excludes actions but preserves speech, bold, escaped and unmatched stars', () => {
+    assert.equal(prepareSemanticQuery('*looks back* Remember *sighs* Aiko?'), 'Remember Aiko?');
+    assert.equal(prepareSemanticQuery('*walks\nto the door* Hello.'), 'Hello.');
+    assert.equal(prepareSemanticQuery('*silence*'), '');
+    assert.equal(prepareSemanticQuery('**Important** and *action* speech'), '**Important** and speech');
+    assert.equal(prepareSemanticQuery(String.raw`Literal \*star\* and *action* speech`), String.raw`Literal \*star\* and speech`);
+    assert.equal(prepareSemanticQuery('Unfinished *action'), 'Unfinished *action');
 });
 
-test('semantic retrieval deduplicates episode references and sends only scoped query parameters', async () => {
+test('memory events go directly to the log without a toast notification', () => {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /notifyOutsideMemoryUse/);
+    assert.match(source, /onEvent: memoryReinforcementLogger/);
+});
+
+test('semantic retrieval uses the root-array route, native scores and the configured cutoff', async () => {
     let body;
-    const result = await findReinforcementCandidates(scope, 'A character reply.', 25, {
-        fetchImpl: async (_url, options) => {
+    const item = { id: reference.id, n1: 'Original bullet', matches: [{ fact_id: 'fact-one', similarity: 0.87 }] };
+    const result = await findSemanticCandidates(scope, 'A character reply.', 1, {
+        minSimilarity: 0.6,
+        fetchImpl: async (url, options) => {
+            assert.equal(url, 'http://127.0.0.1:8091/memorybox/semantic-candidates');
             body = JSON.parse(options.body);
-            return response({ results: [
-                { kind: 'fact', id: 'fact-one', references: { n2: [reference] } },
-                { kind: 'fact', id: 'fact-two', references: { n2: [reference] } },
-            ], meta: { partial: false, warnings: [] } });
+            return response([item, item, { ...item, id: 'second-episode' }]);
         },
     });
-    assert.deepEqual(body, { ...scope, query: 'A character reply.', limit: 25 });
-    assert.equal(result.candidates.length, 1);
+    assert.deepEqual(body, { ...scope, query: 'A character reply.', limit: 1, min_similarity: 0.6 });
+    assert.equal(result.candidates.length, 2, 'Fact limit must not truncate source episode IDs');
     assert.equal(result.candidates[0].id, 'episode-one');
+    assert.deepEqual(result.candidates[0].matches, item.matches);
+});
+
+test('semantic retrieval omits a blank cutoff and rejects partial envelopes or invalid scores', async () => {
+    await findSemanticCandidates(scope, 'Text', 25, { fetchImpl: async (_url, options) => {
+        assert.equal(Object.hasOwn(JSON.parse(options.body), 'min_similarity'), false);
+        return response([]);
+    } });
+    for (const value of [{ candidates: [] }, [{ id: 'id', n1: 'Bullet', matches: [] }],
+        [{ id: 'id', n1: 'Bullet', matches: [{ fact_id: 'fact', similarity: '0.9' }] }]]) {
+        await assert.rejects(findSemanticCandidates(scope, 'Text', 25, { fetchImpl: async () => response(value) }));
+    }
+});
+
+test('SideBox logs show native post-response matches and write outcomes rather than usage probabilities', t => {
+    t.mock.method(console, 'info', () => {});
+    const rows = [];
+    const sink = createMemoryReinforcementLogger({
+        appendOperationLog: entry => { rows.push(entry); return 0; },
+        updateOperationLog: (_id, patch) => Object.assign(rows[0], patch),
+        completeOperationLog: (_id, status) => { rows[0].status = status; },
+    });
+    const common = { runId: 'side', character: 'Mirella', message_index: 1002, level: 'info' };
+    sink({ ...common, stage: 'start', phase: 'after', context: { sideIds: ['one', 'two'] } });
+    sink({ ...common, stage: 'search-request', request: { query: 'Remember Aiko?', min_similarity: 0.6 } });
+    sink({ ...common, stage: 'search-result', phase: 'after', candidates: [{ id: 'one', n1: 'Bullet' }], found: 1 });
+    sink({ ...common, stage: 'side-match', memoryId: 'one', text: 'Original N2', matches: [{ fact_id: 'fact', similarity: 0.87 }] });
+    sink({ ...common, stage: 'candidate-complete', memoryId: 'one', action: 'boosted', fromBox: 'Side', toBox: 'In' });
+    sink({ ...common, stage: 'side-discarded', memoryId: 'two' });
+    sink({ ...common, stage: 'finish', phase: 'after', status: 'success' });
+    assert.match(rows[0].detail, /2 Side.*1 matching IDs/);
+    assert.match(rows[0].detail, /Native scores: 0.87/);
+    assert.match(rows[0].detail, /Boost saved/);
+    assert.match(rows[0].detail, /Sent to search:\nRemember Aiko\?/);
+    assert.match(rows[0].detail, /Minimum similarity: 0.6/);
+    assert.match(rows[0].detail, /Box: Side -> In/);
+    assert.match(rows[0].detail, /Box: Side -> Out/);
+    assert.doesNotMatch(rows[0].detail, /P\(used\)|Confidence|verified memories/);
+});
+
+test('pre-turn logs show retrieval scores, Out to Side and unchanged In memories', t => {
+    t.mock.method(console, 'info', () => {});
+    const row = {};
+    const sink = createMemoryReinforcementLogger({ appendOperationLog: () => 0,
+        updateOperationLog: (_id, patch) => Object.assign(row, patch), completeOperationLog: () => {} });
+    const common = { runId: 'before', character: 'Mirella', message_index: 1001, phase: 'before' };
+    sink({ ...common, stage: 'search-request', request: { query: 'Juliano: Remember Aiko?', min_similarity: 0.6 } });
+    sink({ ...common, stage: 'search-result', candidates: ['out', 'in'].map(id => ({ id, n1: id,
+        matches: [{ fact_id: id, similarity: 0.87 }] })), found: 2 });
+    sink({ ...common, stage: 'side-ready', sideCount: 1, inMemoryIds: ['in'], memories: [{ id: 'out', text: 'Aiko memory' }] });
+    sink({ ...common, stage: 'finish', status: 'success' });
+    assert.match(row.detail, /Sent to search:\nJuliano: Remember Aiko\?/);
+    assert.match(row.detail, /Native scores: 0.87/);
+    assert.match(row.detail, /Box: Out -> Side/);
+    assert.match(row.detail, /Box: In -> In/);
 });
 
 test('PATCH writes boost only, validates confirmation and never retries HTTP failures', async () => {

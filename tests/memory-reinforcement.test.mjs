@@ -1,298 +1,287 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeReinforcementConfig, decideMemoryUsage, planMemoryBoost } from '../memory/reinforcement-policy.js';
+import { normalizeReinforcementConfig, planMemoryBoost } from '../memory/reinforcement-policy.js';
 import { calculateSummaryRating, normalizeSummaryHalfLives } from '../memory/summary-rating.js';
 import { collectCharacterInterval, createMemoryReinforcement } from '../memory/reinforcement-runner.js';
-import { getCharacterSummary, saveCharacterSummary } from '../memory/character-summary.js';
+import { buildSummaryInjection, getCharacterSummary, saveCharacterSummary } from '../memory/character-summary.js';
 
-const settings = { namespace: 'rp', groupId: 'mirella', minRating: 0.5,
-    reinforcement: { enabled: true, minUsageProbability: 0.8, minConfidence: 0.8, candidateLimit: 25 } };
-const memory = (importance = 1) => ({ id: 'memory-one', text: 'The memory in her own words.',
-    importance, last_relevant_message_index: 1, boost: null });
-const positive = { verdict: 'used', usage_probability: 0.9, confidence: 0.85, model: 'Kev', evaluated_messages: 1 };
+const memory = (id = 'memory-one', importance = 1) => ({ id, text: `Memory ${id}`, importance,
+    last_relevant_message_index: 1, boost: null });
+const semantic = id => ({ id, n1: `Bullet ${id}`, matches: [{ fact_id: `fact-${id}`, similarity: 0.9 }] });
 
-test('used and both independent thresholds must pass, including boundary values', () => {
-    const thresholds = normalizeReinforcementConfig(settings.reinforcement);
-    assert.equal(decideMemoryUsage(positive, thresholds).accepted, true);
-    for (const changes of [{ verdict: 'same_topic' }, { usage_probability: 0.79 }, { confidence: 0.79 }]) {
-        assert.equal(decideMemoryUsage({ ...positive, ...changes }, thresholds).accepted, false);
-    }
-    assert.equal(decideMemoryUsage({ ...positive, confidence: 0.8, usage_probability: 0.8 }, thresholds).accepted, true);
-    assert.equal(normalizeReinforcementConfig().enabled, false);
-});
-
-test('importance sets the target while source and boost decay on their own reference indices', () => {
-    for (let importance = 1; importance <= 5; importance++) {
-        const candidate = memory(importance);
-        const plan = planMemoryBoost(candidate, 10001, settings);
-        assert.equal(plan.apply, true);
-        const result = calculateSummaryRating({ ...candidate, boost: plan.boost }, 10001, normalizeSummaryHalfLives());
-        assert(Math.abs(result.rating - (0.5 + 0.5 * importance / 5)) < 1e-12);
-        const later = calculateSummaryRating({ ...candidate, boost: plan.boost },
-            10001 + normalizeSummaryHalfLives()[importance], normalizeSummaryHalfLives());
-        assert(Math.abs(later.rating - result.rating / 2) < 1e-12);
-        assert.equal(candidate.last_relevant_message_index, 1);
-    }
-    assert.equal(planMemoryBoost({ ...memory(), boost: { value: 0.9, message_index: 10001 } }, 10001, settings).apply, false);
-    assert.equal(planMemoryBoost({ ...memory(), boost: { value: 0.9, message_index: 10000 } }, 10001, settings).apply, false);
-});
-
+/** Exercise both phases with exact source records, controlled semantic results and an in-memory remote store. */
 function fixture(overrides = {}) {
-    const character = { name: 'Mirella Veyr', avatar: 'mirella.png', summary: structuredClone(settings) };
-    const message = { name: 'Juliano', is_user: true, mes: 'I remember what happened.' };
-    const previous = { name: character.name, original_avatar: character.avatar, mes: 'Her previous reply.' };
-    const ctx = { chatMetadata: {}, chat: [...Array(999), previous, message],
-        chatId: 'chat', groupId: 'group', saveMetadata() {} };
-    const events = [];
-    const patches = [];
+    const character = { name: 'Mirella Veyr', avatar: 'm.png', summary: { enabled: true,
+        namespace: 'rp', groupId: 'mirella', minRating: 0.5, reinforcement: { enabled: true, minSimilarity: 0.6 } } };
+    const ctx = { chatMetadata: {}, chatId: 'chat', groupId: 'group', saveMetadata: async () => {},
+        chat: [...Array(999), { name: character.name, original_avatar: character.avatar, mes: 'Previous reply' },
+            { name: 'Juliano', is_user: true, mes: 'Remember Aiko?' }] };
+    const remote = new Map(['one', 'two', 'inside'].map(id => [id, memory(id, id === 'inside' ? 5 : 1)]));
+    remote.get('inside').last_relevant_message_index = 1001;
+    saveCharacterSummary(ctx, character, { allMemories: [...remote.values()].map(item => structuredClone(item)) });
     let current = ctx;
-    const candidate = memory();
-    saveCharacterSummary(ctx, character, { allMemories: [candidate] });
-    const engine = createMemoryReinforcement({
-        getContext: () => current, getCharacters: () => [character], onEvent: event => events.push(event),
-        findCandidates: async () => ({ candidates: [candidate], found: 1, meta: {} }),
-        checkUsage: async () => positive,
-        readMemory: async () => candidate,
-        patchBoost: async (_scope, _id, boost) => { patches.push(boost); return { ...candidate, boost }; },
-        ...overrides,
-    });
-    return { engine, character, message, ctx, events, patches, candidate, changeChat: next => { current = next; } };
+    const searches = [], patches = [], events = [];
+    const engine = createMemoryReinforcement({ getContext: () => current, getCharacters: () => [character],
+        onEvent: event => events.push(event),
+        findCandidates: async (scope, query, limit, options) => {
+            searches.push({ scope, query, limit, options });
+            return { candidates: query.includes('Juliano:') ? [semantic('one'), semantic('two'), semantic('inside')]
+                : [semantic('one'), semantic('inside'), semantic('unrelated')] };
+        },
+        readMemory: async (_scope, id) => structuredClone(remote.get(id)),
+        patchBoost: async (_scope, id, boost) => {
+            patches.push({ id, boost });
+            Object.assign(remote.get(id), { boost });
+            return structuredClone(remote.get(id));
+        }, ...overrides });
+    const reply = (text = 'Aiko mattered to me.') => {
+        const message = { name: character.name, original_avatar: character.avatar, mes: text };
+        ctx.chat.push(message);
+        return message;
+    };
+    return { character, ctx, engine, remote, searches, patches, events, reply, changeChat: next => { current = next; } };
 }
 
-test('interval includes every participant after the last own reply, not the previous reply itself', () => {
-    const character = { name: 'Mirella Veyr', avatar: 'mirella.png' };
-    const previous = { name: character.name, original_avatar: character.avatar, mes: 'Old response' };
-    const chat = [previous,
-        { name: 'Juliano', is_user: true, mes: 'Do you remember Aiko?' },
-        { name: 'Tio Klarus', mes: 'I remember the escape.' },
-        { name: 'GM', is_system: true, mes: 'System note' },
-        { name: 'GM', extra: { type: 'tool_response' }, mes: 'Dice result' },
-        { name: 'Juliano', is_user: true, mes: 'We should talk about her.' },
-        { name: 'Mirella Veyr', mes: 'OOC private test' }];
-    const interval = collectCharacterInterval(chat, character, message => message.mes.startsWith('OOC'));
-    assert.equal(interval.previousIndex, 1);
-    assert.equal(interval.messageIndex, 7);
-    assert.deepEqual(interval.entries.map(entry => entry.index), [2, 3, 6]);
-    assert.deepEqual(interval.messages.map(message => message.name), ['Juliano', 'Tio Klarus', 'Juliano']);
-    assert.deepEqual(interval.messages.map(message => message.role), ['user', 'assistant', 'user']);
-    assert.equal(collectCharacterInterval([previous], character).messages.length, 0);
-    assert.equal(collectCharacterInterval(chat.slice(1, 3), character).messages.length, 2,
-        'A first turn without an earlier reply uses all available RP messages');
-    const wrongAvatar = { ...previous, original_avatar: 'someone-else.png' };
-    assert.equal(collectCharacterInterval([wrongAvatar], character).messages.length, 1);
+test('similarity cutoff is optional, accepts zero/negative values and survives normalization', () => {
+    assert.equal(normalizeReinforcementConfig().minSimilarity, null);
+    assert.equal(normalizeReinforcementConfig({ minSimilarity: '' }).minSimilarity, null);
+    for (const value of [0, -0.5, 0.7]) assert.equal(normalizeReinforcementConfig({ minSimilarity: String(value) }).minSimilarity, value);
+    assert.equal(normalizeReinforcementConfig({ minSimilarity: 2 }).minSimilarity, 1);
+    assert.equal(normalizeReinforcementConfig({ minSimilarity: 'invalid' }).minSimilarity, null);
 });
 
-test('every candidate receives the same full interval concurrently; one failure does not discard other boosts', async () => {
-    let release;
-    let allStarted;
-    const gate = new Promise(resolve => { release = resolve; });
-    const started = new Promise(resolve => { allStarted = resolve; });
-    const received = [];
-    const candidates = [1, 2, 3].map(index => ({ ...memory(), id: `memory-${index}`, text: `Memory ${index}` }));
-    const patches = [];
-    let queried;
-    const f = fixture({
-        findCandidates: async (_scope, query) => { queried = query; return { candidates }; },
-        checkUsage: async (reference, messages) => {
-            received.push({ reference, messages });
-            if (received.length === 3) allStarted();
-            await gate;
-            if (reference === 'Memory 2') throw new Error('Verifier unavailable');
-            return { ...positive, evaluated_messages: messages.length };
-        },
-        readMemory: async (_scope, id) => structuredClone(candidates.find(memory => memory.id === id)),
-        patchBoost: async (_scope, id, boost) => {
-            patches.push(id);
-            return { ...candidates.find(memory => memory.id === id), boost };
-        },
-    });
-    f.ctx.chat.push({ name: 'Tio Klarus', mes: 'Aiko was with us.' },
-        { name: 'Juliano', is_user: true, mes: 'I will not forget her.' });
-    const pending = f.engine.beforeCharacter(f.character);
-    await started;
-    assert.equal(received.length, 3, 'All checks must start before any one is allowed to finish');
-    for (const { messages } of received) {
-        assert.deepEqual(messages.map(message => message.name), ['Juliano', 'Tio Klarus', 'Juliano']);
-        assert.equal(messages[0].content, f.message.mes);
+test('both automatic phases search speech without editing source messages', async () => {
+    const f = fixture();
+    f.ctx.chat.at(-1).mes = '*looks away* Remember *sighs* Aiko?';
+    const original = f.ctx.chat.at(-1).mes;
+    await f.engine.beforeCharacter(f.character);
+    assert.equal(f.searches[0].query, 'Juliano: Remember Aiko?');
+    assert.equal(f.ctx.chat.at(-1).mes, original);
+    const reply = f.reply('*touches collar* Aiko mattered to me.');
+    await f.engine.afterCharacter(reply);
+    assert.equal(f.searches[1].query, 'Aiko mattered to me.');
+    assert.equal(reply.mes, '*touches collar* Aiko mattered to me.');
+});
+
+test('action-only messages neither search nor reinforce memories', async () => {
+    const f = fixture();
+    f.ctx.chat.at(-1).mes = '*looks away*';
+    await f.engine.beforeCharacter(f.character);
+    assert.equal(f.searches.length, 0);
+    f.ctx.chat.at(-1).mes = 'Remember Aiko?';
+    await f.engine.beforeCharacter(f.character);
+    await f.engine.afterCharacter(f.reply('*stays silent*'));
+    assert.equal(f.searches.length, 1);
+    assert.equal(f.patches.length, 0);
+    assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+});
+
+test('boost target still uses importance and decays without changing the origin', () => {
+    for (let importance = 1; importance <= 5; importance++) {
+        const candidate = memory('test', importance);
+        const settings = { minRating: 0.5 };
+        const plan = planMemoryBoost(candidate, 10001, settings);
+        assert.equal(plan.apply, true);
+        const now = calculateSummaryRating({ ...candidate, boost: plan.boost }, 10001, normalizeSummaryHalfLives());
+        const later = calculateSummaryRating({ ...candidate, boost: plan.boost },
+            10001 + normalizeSummaryHalfLives()[importance], normalizeSummaryHalfLives());
+        assert(Math.abs(now.rating - (0.5 + 0.5 * importance / 5)) < 1e-12);
+        assert(Math.abs(later.rating - now.rating / 2) < 1e-12);
+        assert.equal(candidate.last_relevant_message_index, 1);
     }
-    assert.match(queried, /Tio Klarus: Aiko was with us/);
-    assert.match(queried, /Juliano: I will not forget her/);
-    release();
-    const result = await pending;
-    assert.equal(result.status, 'error');
-    assert.deepEqual(patches.sort(), ['memory-1', 'memory-3']);
-    assert.equal(f.events.at(-1).messageCount, 3);
-    assert.equal(typeof f.events.at(-1).durationMs, 'number');
 });
 
-test('caller cancellation and newly appended chat messages prevent writes from a stale interval', async () => {
+test('retrieval interval includes every participant after the last own reply, excluding tools and OOC', () => {
+    const character = { name: 'Mirella', avatar: 'm.png' };
+    const chat = [{ name: 'Mirella', original_avatar: 'm.png', mes: 'Previous' },
+        { name: 'Juliano', is_user: true, mes: 'A question' }, { name: 'Tio', mes: 'An answer' },
+        { mes: 'Dice', extra: { type: 'tool_response' } }, { mes: 'Hidden', is_system: true }, { mes: 'OOC' }];
+    const result = collectCharacterInterval(chat, character, item => item.mes === 'OOC');
+    assert.deepEqual(result.entries.map(item => item.index), [2, 3]);
+    assert.equal(result.previousIndex, 1);
+});
+
+test('before phase builds In plus Side without writing ratings, injecting duplicate In IDs or persisting Side', async () => {
+    const f = fixture();
+    const before = structuredClone(f.ctx.chatMetadata);
+    assert.equal((await f.engine.beforeCharacter(f.character)).status, 'ready');
+    assert.equal(f.patches.length, 0);
+    assert.deepEqual(f.ctx.chatMetadata, before);
+    const summary = getCharacterSummary(f.ctx, f.character);
+    assert.deepEqual(summary.sideMemories.map(item => item.id), ['one', 'two']);
+    assert.equal(summary.memories.length, 1);
+    const prompt = buildSummaryInjection(f.ctx, f.character).prompt;
+    assert.equal((prompt.match(/Memory inside/g) ?? []).length, 1);
+    assert.match(prompt, /Memory one/);
+    assert.match(prompt, /Memory two/);
+    assert.equal(f.searches[0].options.minSimilarity, 0.6);
+});
+
+test('after phase boosts only intersecting Side IDs at the reply index and clears the entire Side', async () => {
+    const f = fixture();
+    await f.engine.beforeCharacter(f.character);
+    const message = f.reply();
+    assert.equal((await f.engine.afterCharacter(message)).status, 'success');
+    assert.deepEqual(f.patches.map(item => item.id), ['one']);
+    assert.equal(f.patches[0].boost.message_index, 1002);
+    assert.equal(f.searches[1].query, message.mes);
+    assert.equal(f.searches[1].options.minSimilarity, 0.6);
+    const summary = getCharacterSummary(f.ctx, f.character);
+    assert.equal(summary.sideMemories.length, 0);
+    assert(summary.memories.some(item => item.id === 'one'));
+    assert(!summary.memories.some(item => item.id === 'two'));
+    assert.equal(f.events.filter(event => event.stage === 'side-match').length, 1);
+    await f.engine.afterCharacter(message);
+    assert.equal(f.patches.length, 1);
+});
+
+test('no matching IDs discards Side without any boost', async () => {
+    let count = 0;
+    const f = fixture({ findCandidates: async () => ({ candidates: ++count === 1 ? [semantic('one')] : [] }) });
+    await f.engine.beforeCharacter(f.character);
+    await f.engine.afterCharacter(f.reply());
+    assert.equal(f.patches.length, 0);
+    assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+    assert(f.events.some(event => event.stage === 'side-discarded'));
+});
+
+test('semantic failure before or after generation never boosts and always clears Side', async () => {
+    for (const failAt of [1, 2]) {
+        let count = 0;
+        const f = fixture({ findCandidates: async () => {
+            if (++count === failAt) throw new Error('Semantic backend offline');
+            return { candidates: [semantic('one')] };
+        } });
+        const pre = await f.engine.beforeCharacter(f.character);
+        if (failAt === 2) assert.equal((await f.engine.afterCharacter(f.reply())).status, 'error');
+        else assert.equal(pre.status, 'error');
+        assert.equal(f.patches.length, 0);
+        assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+    }
+});
+
+test('cancellation and edited source interval cannot inject or reinforce stale memories', async () => {
     for (const action of ['abort', 'append']) {
         let release;
-        let started;
-        const entered = new Promise(resolve => { started = resolve; });
-        const f = fixture({ checkUsage: async () => {
-            started();
-            return new Promise(resolve => { release = resolve; });
-        } });
+        const f = fixture({ findCandidates: () => new Promise(resolve => { release = resolve; }) });
         const controller = new AbortController();
         const pending = f.engine.beforeCharacter(f.character, { signal: controller.signal });
-        await entered;
         if (action === 'abort') controller.abort();
-        else f.ctx.chat.push({ name: 'Tio Klarus', mes: 'A new message.' });
-        release(positive);
-        const result = await pending;
-        assert.equal(result.status, 'stopped', action);
-        assert.equal(f.patches.length, 0, action);
+        else f.ctx.chat.push({ name: 'Tio', mes: 'New message' });
+        release({ candidates: [semantic('one')] });
+        assert.equal((await pending).status, 'stopped');
+        assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+        assert.equal(f.patches.length, 0);
     }
 });
 
-test('a pre-turn interval reinforces a memory outside the box before injection and logs the full trace', async () => {
-    const f = fixture();
-    let saves = 0;
-    f.ctx.saveMetadata = async () => { saves++; };
-    assert.equal(getCharacterSummary(f.ctx, f.character).memories.length, 0);
-    await f.engine.beforeCharacter(f.character);
-    assert.equal(f.patches.length, 1);
-    assert.equal(f.patches[0].message_index, 1001);
-    assert.equal(f.candidate.importance, 1);
-    assert.equal(f.candidate.last_relevant_message_index, 1);
-    assert.equal(getCharacterSummary(f.ctx, f.character).memories.length, 1);
-    assert.equal(getCharacterSummary(f.ctx, f.character).text, f.candidate.text);
-    assert.equal(f.events.at(-1).status, 'success');
-    assert.equal(saves, 2, 'Metadata must not save the entire chat for every candidate');
-    for (const stage of ['search-request', 'usage-result', 'boost-calculation', 'patch-request', 'patch-confirmed']) {
-        assert(f.events.some(event => event.stage === stage), stage);
-    }
-    const recall = f.events.find(event => event.stage === 'outside-memory-used');
-    assert(recall);
-    assert.equal(recall.text, f.candidate.text);
-    assert.equal(recall.result.verdict, 'used');
-    assert(recall.rating < recall.cutoff);
-    await f.engine.beforeCharacter(f.character);
-    assert.equal(f.patches.length, 1);
-    assert.equal(f.events.at(-1).stage, 'duplicate-skipped');
-    assert.equal(f.events.filter(event => event.stage === 'outside-memory-used').length, 1);
-});
-
-test('low confidence or disabled automation never patches', async () => {
-    const low = fixture({ checkUsage: async () => ({ ...positive, confidence: 0.7 }) });
-    await low.engine.beforeCharacter(low.character);
-    assert.equal(low.patches.length, 0);
-    assert.equal(low.events.some(event => event.stage === 'outside-memory-used'), false);
-    assert.equal(low.events.find(event => event.stage === 'usage-result').decision.accepted, false);
-    const off = fixture();
-    off.character.summary.reinforcement.enabled = false;
-    await off.engine.beforeCharacter(off.character);
-    assert.equal(off.events.length, 0);
-});
-
-test('confirmed use inside the box does not emit an outside-memory notification', async () => {
-    const f = fixture();
-    f.character.summary.minRating = 0;
-    await f.engine.beforeCharacter(f.character);
-    assert.equal(f.events.some(event => event.stage === 'outside-memory-used'), false);
-});
-
-test('a newer remote boost, an edited N2 or a stopped message cannot be overwritten', async () => {
-    const newer = fixture({ readMemory: async () => ({ ...memory(), boost: { value: 0.9, message_index: 1002 } }) });
-    await newer.engine.beforeCharacter(newer.character);
-    assert.equal(newer.patches.length, 0);
-    const edited = fixture({ readMemory: async () => ({ ...memory(), text: 'A revised N2.' }) });
-    await edited.engine.beforeCharacter(edited.character);
-    assert.equal(edited.patches.length, 0);
-    const stopped = fixture();
-    stopped.engine.ignoreMessage(stopped.message);
-    await stopped.engine.beforeCharacter(stopped.character);
-    assert.equal(stopped.events.length, 0);
-});
-
-test('uncertain PATCH is reconciled by reading, never retried', async () => {
-    let written;
-    let reads = 0;
-    let writes = 0;
-    const f = fixture({
-        readMemory: async () => { reads++; return { ...memory(), boost: written ?? null }; },
-        patchBoost: async (_scope, _id, boost) => { writes++; written = boost; throw new Error('Lost response'); },
-    });
-    await f.engine.beforeCharacter(f.character);
-    assert.equal(writes, 1);
-    assert.equal(reads, 2);
-    assert.equal(f.events.at(-1).status, 'success');
-    assert(f.events.some(event => event.stage === 'patch-unconfirmed'));
-    assert(f.events.some(event => event.stage === 'reconciliation-result'));
-});
-
-test('changing chats or stopping while verification runs prevents subsequent writes', async () => {
-    for (const action of ['chat', 'stop', 'edit']) {
-        let release;
-        let started;
-        const entered = new Promise(resolve => { started = resolve; });
-        const f = fixture({ checkUsage: async () => {
-            started();
-            return new Promise(resolve => { release = resolve; });
-        } });
-        const pending = f.engine.beforeCharacter(f.character);
-        await entered;
-        if (action === 'chat') f.changeChat({ chatMetadata: {}, chat: [], chatId: 'other' });
-        if (action === 'stop') f.engine.stop(f.character);
-        if (action === 'edit') f.message.mes = 'Edited reply';
-        release(positive);
-        await pending;
-        assert.equal(f.patches.length, 0, action);
-        assert.equal(f.events.at(-1).status, 'stopped', action);
-    }
-});
-
-test('duplicate in-flight calls await the same job and an unconfirmed write is never retried', async () => {
-    let active = 0;
-    let maxActive = 0;
-    let writes = 0;
-    const f = fixture({
-        checkUsage: async () => {
-            active++; maxActive = Math.max(maxActive, active);
-            await new Promise(resolve => setTimeout(resolve, 5));
-            active--; return positive;
-        },
-        patchBoost: async () => { writes++; throw new Error('Backend offline'); },
-    });
-    await Promise.all([f.engine.beforeCharacter(f.character), f.engine.beforeCharacter(f.character)]);
-    assert.equal(maxActive, 1);
-    assert.equal(writes, 1);
-    assert(f.events.filter(event => event.stage === 'finish').every(event => event.status === 'error'));
-    assert.match(f.engine.getStatus(f.character).lastError, /Unconfirmed boost/);
-});
-
-test('a persisted receipt prevents reprocessing after recreating the runner', async () => {
+test('stopped messages and intermediate tool cycles do not run the after phase', async () => {
     const f = fixture();
     await f.engine.beforeCharacter(f.character);
-    const events = [];
-    const restored = createMemoryReinforcement({ getContext: () => f.ctx,
-        getCharacters: () => [f.character], onEvent: event => events.push(event),
-        findCandidates: async () => { throw new Error('Must not query on replay'); } });
-    await restored.beforeCharacter(f.character);
-    assert.equal(events[0].stage, 'duplicate-skipped');
-});
-
-test('stop cancels work, and a metadata failure does not leave the queue running', async () => {
-    let release;
-    let entered;
-    const started = new Promise(resolve => { entered = resolve; });
-    const f = fixture({ checkUsage: async () => {
-        entered(); return new Promise(resolve => { release = resolve; });
-    } });
-    const first = f.engine.beforeCharacter(f.character);
-    await started;
-    const queued = f.engine.beforeCharacter(f.character);
-    await new Promise(resolve => setTimeout(resolve, 5));
-    f.engine.stop(f.character);
-    release(positive);
-    await Promise.all([first, queued]);
+    const tool = f.reply('Dice');
+    tool.extra = { type: 'tool_response' };
+    await f.engine.afterCharacter(tool);
+    assert.equal(f.searches.length, 1);
+    assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 2);
+    f.engine.ignoreMessage(tool);
+    assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+    await f.engine.afterCharacter(tool);
     assert.equal(f.patches.length, 0);
-    assert.equal(f.engine.getStatus(f.character).pending, 0);
-    const failed = fixture();
-    failed.ctx.saveMetadata = async () => { throw new Error('Cannot save chat'); };
+});
+
+test('duplicate concurrent preparation and completion calls share work rather than double boosting', async () => {
+    const f = fixture();
+    await Promise.all([f.engine.beforeCharacter(f.character), f.engine.beforeCharacter(f.character)]);
+    assert.equal(f.searches.length, 1);
+    const message = f.reply();
+    await Promise.all([f.engine.afterCharacter(message), f.engine.afterCharacter(message)]);
+    assert.equal(f.searches.length, 2);
+    assert.equal(f.patches.length, 1);
+});
+
+test('a failed PATCH is reconciled with GET, never sent twice', async () => {
+    let patchCalls = 0;
+    const f = fixture({ patchBoost: async (_scope, id, boost) => {
+        patchCalls++;
+        Object.assign(f.remote.get(id), { boost });
+        throw new Error('Lost response');
+    } });
+    await f.engine.beforeCharacter(f.character);
+    assert.equal((await f.engine.afterCharacter(f.reply())).status, 'success');
+    assert.equal(patchCalls, 1);
+    assert(getCharacterSummary(f.ctx, f.character).memories.some(item => item.id === 'one'));
+});
+
+test('configuration changes and changed injected N2 prevent a stale boost', async () => {
+    for (const action of ['config', 'text', 'stop']) {
+        const f = fixture();
+        await f.engine.beforeCharacter(f.character);
+        if (action === 'config') f.character.summary.reinforcement.minSimilarity = 0.8;
+        if (action === 'text') f.remote.get('one').text = 'Edited in the backend';
+        if (action === 'stop') f.engine.stop(f.character);
+        await f.engine.afterCharacter(f.reply());
+        assert.equal(f.patches.length, 0, action);
+        assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+    }
+});
+
+test('Side is isolated by chat and character scope and does not survive a new metadata object', async () => {
+    const f = fixture();
+    await f.engine.beforeCharacter(f.character);
+    const cloned = { ...f.ctx, chatMetadata: structuredClone(f.ctx.chatMetadata) };
+    assert.equal(getCharacterSummary(cloned, f.character).sideMemories.length, 0);
+    const other = { ...f.character, summary: { ...f.character.summary, groupId: 'other' } };
+    assert.equal(getCharacterSummary(f.ctx, other).sideMemories.length, 0);
+    f.changeChat(cloned);
+    const response = { name: f.character.name, mes: 'A response' };
+    cloned.chat = [...cloned.chat, response];
+    await f.engine.afterCharacter(response);
+    assert.equal(f.patches.length, 0);
+});
+
+test('one failed source lookup keeps other Side memories available and reports partial retrieval', async () => {
+    const f = fixture({ readMemory: async (_scope, id) => {
+        if (id === 'two') throw new Error('Memory unavailable');
+        return structuredClone(f.remote.get(id));
+    } });
+    await f.engine.beforeCharacter(f.character);
+    assert.deepEqual(getCharacterSummary(f.ctx, f.character).sideMemories.map(item => item.id), ['one']);
+    assert.match(f.engine.getStatus(f.character).lastError, /unavailable/);
+    assert.equal(f.patches.length, 0);
+});
+
+test('stopping or editing the generated response during the second search prevents any PATCH and clears Side', async () => {
+    for (const action of ['stop', 'edit', 'chat']) {
+        let release;
+        let calls = 0;
+        const f = fixture({ findCandidates: async () => ++calls === 1
+            ? { candidates: [semantic('one')] }
+            : new Promise(resolve => { release = resolve; }) });
+        await f.engine.beforeCharacter(f.character);
+        const message = f.reply();
+        const pending = f.engine.afterCharacter(message);
+        if (action === 'stop') f.engine.stop(f.character);
+        if (action === 'edit') message.mes = 'Edited response';
+        if (action === 'chat') f.changeChat({ ...f.ctx, chatMetadata: {} });
+        release({ candidates: [semantic('one')] });
+        assert.equal((await pending).status, 'stopped');
+        assert.equal(f.patches.length, 0);
+        assert.equal(getCharacterSummary(f.ctx, f.character).sideMemories.length, 0);
+    }
+});
+
+test('a newer remote boost is never lowered, and unconfirmed writes are not automatically retried', async () => {
+    const newer = fixture();
+    await newer.engine.beforeCharacter(newer.character);
+    newer.remote.get('one').boost = { value: 0.99, message_index: 1002 };
+    await newer.engine.afterCharacter(newer.reply());
+    assert.equal(newer.patches.length, 0);
+    let calls = 0;
+    const failed = fixture({ patchBoost: async () => { calls++; throw new Error('Write unconfirmed'); } });
     await failed.engine.beforeCharacter(failed.character);
-    assert.equal(failed.patches.length, 0);
-    assert.equal(failed.engine.getStatus(failed.character).running, false);
-    assert.equal(failed.events.at(-1).status, 'error');
+    const message = failed.reply();
+    assert.equal((await failed.engine.afterCharacter(message)).status, 'error');
+    await failed.engine.afterCharacter(message);
+    assert.equal(calls, 1);
+    assert.equal(getCharacterSummary(failed.ctx, failed.character).sideMemories.length, 0);
 });
